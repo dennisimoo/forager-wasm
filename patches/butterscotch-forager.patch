@@ -1,0 +1,880 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b44b96d..08776a5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -623,7 +623,7 @@ if(PLATFORM STREQUAL "cli" OR PLATFORM STREQUAL "vita" OR PLATFORM STREQUAL "swi
+                 "-sENVIRONMENT=web"
+                 "-sWASMFS=1"
+                 "-sEXPORTED_RUNTIME_METHODS=['HEAP8', 'HEAPU8', 'HEAPF32', 'ccall', 'cwrap', 'specialHTMLTargets', 'UTF8ToString', 'stringToNewUTF8', 'setValue', 'FS']"
+-                "-sEXPORTED_FUNCTIONS=['_malloc', '_free', '_startRunner', '_mountOpfs', '_parseDataWin', '_getGameName', '_getGameDisplayName', '_freeDataWin', '_onKeyDown', '_onKeyUp', '_onMouseDown', '_onMouseUp', '_onMouseMove', '_requestRunnerExit']"
++                "-sEXPORTED_FUNCTIONS=['_malloc', '_free', '_startRunner', '_mountOpfs', '_parseDataWin', '_getGameName', '_getGameDisplayName', '_freeDataWin', '_onKeyDown', '_onKeyUp', '_onMouseDown', '_onMouseUp', '_onMouseMove', '_requestRunnerExit', '_getRunnerFrameCount', '_getRunnerRoomIndex', '_dumpRunnerState', '_getRunnerCameraState']"
+                 "-sMIN_WEBGL_VERSION=2"
+                 "-sMAX_WEBGL_VERSION=2"
+                 "-sFULL_ES3=1"
+diff --git a/src/audio/miniaudio/ma_audio_system.c b/src/audio/miniaudio/ma_audio_system.c
+index 295d269..6c54b19 100644
+--- a/src/audio/miniaudio/ma_audio_system.c
++++ b/src/audio/miniaudio/ma_audio_system.c
+@@ -811,6 +811,7 @@ static void maSetGroupGain(AudioSystem* audio, int32_t groupIndex, float gain, u
+ }
+ 
+ static void maGroupLoad(AudioSystem* audio, int32_t groupIndex) {
++    if (groupIndex >= 0 && groupIndex < arrlen(audio->audioGroups)) return;
+     if (groupIndex > 0 && audio->dw->agrp.count > (uint32_t) groupIndex) {
+         AudioGroup* audioGroupEntry = &audio->dw->agrp.audioGroups[groupIndex];
+ 
+diff --git a/src/backends/web.c b/src/backends/web.c
+index a9f346b..781611c 100644
+--- a/src/backends/web.c
++++ b/src/backends/web.c
+@@ -99,6 +99,23 @@ int startRunner(int butterscotchArgsCount, char* butterscotchArgs[]) {
+     return ret;
+ }
+ 
++int getRunnerFrameCount() { return gRunner ? gRunner->frameCount : -1; }
++int getRunnerRoomIndex() { return gRunner ? gRunner->currentRoomIndex : -1; }
++void dumpRunnerState() { if (gRunner) Runner_dumpState(gRunner); }
++
++// A small diagnostic snapshot avoids dumping every GML variable when browser
++// input automation needs to follow a moving camera.
++const float* getRunnerCameraState() {
++    static float state[4];
++    GMLCamera* camera = gRunner ? Runner_getCameraForView(gRunner, 0) : nullptr;
++    if (!camera) return nullptr;
++    state[0] = camera->viewX;
++    state[1] = camera->viewY;
++    state[2] = (float) camera->viewWidth;
++    state[3] = (float) camera->viewHeight;
++    return state;
++}
++
+ void requestRunnerExit() {
+     gRequestedRunnerExit = true;
+ }
+@@ -319,4 +336,4 @@ uint32_t getDefaultWindowWidth(DataWin* dw) {
+ 
+ uint32_t getDefaultWindowHeight(DataWin* dw) {
+     return (dw != nullptr) ? dw->gen8.defaultWindowHeight : 0;
+-}
+\ No newline at end of file
++}
+diff --git a/src/data_win.c b/src/data_win.c
+index 5c609c9..c590a46 100644
+--- a/src/data_win.c
++++ b/src/data_win.c
+@@ -1884,6 +1884,8 @@ static void readRoomLayers(BinaryReader* reader, DataWin* dw, Room* room) {
+             }
+             case RoomLayerType_Tiles: {
+                 RoomLayerTilesData* tiles = (RoomLayerTilesData *)safeMalloc(sizeof(RoomLayerTilesData));
++                tiles->xOffset = 0;
++                tiles->yOffset = 0;
+                 tiles->backgroundIndex = BinaryReader_readInt32(reader);
+                 tiles->tilesX = BinaryReader_readUint32(reader);
+                 tiles->tilesY = BinaryReader_readUint32(reader);
+diff --git a/src/data_win.h b/src/data_win.h
+index 409caa6..055da63 100644
+--- a/src/data_win.h
++++ b/src/data_win.h
+@@ -660,6 +660,7 @@ typedef struct {
+     int32_t backgroundIndex; // tileset (BGND index)
+     uint32_t tilesX; // grid width in tiles
+     uint32_t tilesY; // grid height in tiles
++    float xOffset, yOffset; // runtime position within the owning layer
+     uint32_t* tileData; // flat array of tilesX * tilesY tile values (row-major)
+ } RoomLayerTilesData;
+ 
+diff --git a/src/gl/gl_renderer.c b/src/gl/gl_renderer.c
+index b19aece..1080269 100644
+--- a/src/gl/gl_renderer.c
++++ b/src/gl/gl_renderer.c
+@@ -679,6 +679,21 @@ static void glInit(Renderer* renderer, DataWin* dataWin) {
+         char* patchedVertexSource = nullptr;
+         char* patchedFragmentSource = nullptr;
+ 
++        /* Legacy GLSL ES 1.00 forbids the outline shader's uniform-bounded loop.
++         * WebGL 2 supports that loop in GLSL ES 3.00 without changing its math. */
++        if (modernGl->isGLES && modernGl->isGL3 && strcmp(shdr->name, "shdOutline") == 0) {
++            const char* vertexHeader = "#version 300 es\n#define attribute in\n#define varying out\n";
++            const char* fragmentHeader = "#version 300 es\nprecision mediump float;\nout vec4 bwFragColor;\n#define varying in\n#define texture2D texture\n#define gl_FragColor bwFragColor\n";
++            size_t vertexSize = strlen(vertexHeader) + strlen(vertexShaderSource) + 1;
++            size_t fragmentSize = strlen(fragmentHeader) + strlen(fragmentShaderSource) + 1;
++            patchedVertexSource = safeMalloc(vertexSize);
++            patchedFragmentSource = safeMalloc(fragmentSize);
++            snprintf(patchedVertexSource, vertexSize, "%s%s", vertexHeader, vertexShaderSource);
++            snprintf(patchedFragmentSource, fragmentSize, "%s%s", fragmentHeader, fragmentShaderSource);
++            vertexShaderSource = patchedVertexSource;
++            fragmentShaderSource = patchedFragmentSource;
++        }
++
+         if (!modernGl->isGLES && ver.major == 2 && ver.minor == 0) { // super opengl 2.0 fuckery go go
+             if (vertexShaderSource && strstr(vertexShaderSource, "#version 120")) {
+                 patchedVertexSource = safeStrdup(vertexShaderSource);
+@@ -2741,12 +2756,15 @@ static int32_t glCreateSpriteFromSurface(Renderer* renderer, int32_t surfaceID,
+     // Flush any pending draws before reading pixels
+     flushBatch(gl);
+ 
++    GLint previousFramebuffer = 0;
++    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFramebuffer);
+     glBindFramebuffer(GL_FRAMEBUFFER, gl->surfaces[surfaceID]);
+ 
+     uint8_t* pixels = (uint8_t *)safeMalloc((size_t) w * (size_t) h * 4);
+     if (pixels == nullptr) return -1;
+ 
+     glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
++    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)previousFramebuffer);
+ 
+     // Create a new GL texture from the captured pixels
+     GLuint newTexId;
+diff --git a/src/overlay_file_system.c b/src/overlay_file_system.c
+index 0e3d9ae..080d59a 100644
+--- a/src/overlay_file_system.c
++++ b/src/overlay_file_system.c
+@@ -63,10 +63,23 @@ static bool pathExists(const char* fullPath) {
+     return stat(fullPath, &st) == 0;
+ }
+ 
++// Treat absolute paths inside the bundle as overlay paths, so game writes
++// using working_directory still reach the persistent save directory.
++static char* normalizeOverlayPath(OverlayFileSystem* ofs, const char* path) {
++    char* normalized = normalizePath(path);
++    size_t bundleLength = strlen(ofs->bundlePath);
++    if (strncmp(normalized, ofs->bundlePath, bundleLength) == 0) {
++        char* relative = safeStrdup(normalized + bundleLength);
++        free(normalized);
++        return relative;
++    }
++    return normalized;
++}
++
+ // Returns a heap-allocated full path for reads. Absolute inputs pass through as-is.
+ // For relative inputs, savePath wins if the file exists there, else bundlePath.
+ static char* resolveForRead(OverlayFileSystem* ofs, const char* relativePath) {
+-    char* normalized = normalizePath(relativePath);
++    char* normalized = normalizeOverlayPath(ofs, relativePath);
+     if (isAbsolute(normalized)) return normalized;
+ 
+     // Check if the path is already resolved
+@@ -87,7 +100,7 @@ static char* resolveForRead(OverlayFileSystem* ofs, const char* relativePath) {
+ // Returns a heap-allocated full path for writes. Absolute inputs pass through as-is.
+ // For relative inputs, it will always be the save path.
+ static char* resolveForWrite(OverlayFileSystem* ofs, const char* relativePath) {
+-    char* normalized = normalizePath(relativePath);
++    char* normalized = normalizeOverlayPath(ofs, relativePath);
+     if (isAbsolute(normalized)) return normalized;
+ 
+     // Check if the path is already resolved
+diff --git a/src/runner.c b/src/runner.c
+index c2c2ee0..3b8e264 100644
+--- a/src/runner.c
++++ b/src/runner.c
+@@ -34,6 +34,12 @@ void Runner_freeRuntimeLayer(RuntimeLayer* runtimeLayer) {
+             free(el->spriteElement);
+             el->spriteElement = nullptr;
+         }
++        if (el->tilemapData != nullptr && el->tilemapDataOwned) {
++            free(el->tilemapData->tileData);
++            free(el->tilemapData);
++            el->tilemapData = nullptr;
++            el->tilemapDataOwned = false;
++        }
+         if (el->tileElement != nullptr && el->tileElementOwned) {
+             free(el->tileElement);
+             el->tileElement = nullptr;
+@@ -769,6 +775,8 @@ static void fireDrawSubtype(Runner* runner, Drawable* drawables, int32_t drawabl
+ 
+ void Runner_drawTileLayer(Runner* runner, RoomLayerTilesData* data, float layerOffsetX, float layerOffsetY) {
+     if (data == nullptr || data->tileData == nullptr) return;
++    layerOffsetX += data->xOffset;
++    layerOffsetY += data->yOffset;
+     if (0 > data->backgroundIndex) return;
+ 
+     DataWin* dw = runner->dataWin;
+@@ -1129,6 +1137,9 @@ void Runner_draw(Runner* runner) {
+                     RuntimeLayerElement* layerElement = &runtimeLayer->elements[j];
+                     if (layerElement->type == RuntimeLayerElementType_Background && layerElement->backgroundElement != nullptr) {
+                         renderBackgroundElement(runner, layerElement->backgroundElement, roomW, roomH, layerOffsetX, layerOffsetY);
++                    } else if (layerElement->type == RuntimeLayerElementType_Tilemap && layerElement->tilemapDataOwned) {
++                        if (layerElement->visible)
++                            Runner_drawTileLayer(runner, layerElement->tilemapData, layerOffsetX, layerOffsetY);
+                     } else if (layerElement->type == RuntimeLayerElementType_Tile && layerElement->tileElement != nullptr && layerElement->tileElementOwned) {
+                         if (!layerElement->visible) continue;
+                         RoomTile rt = *layerElement->tileElement;
+diff --git a/src/runner.h b/src/runner.h
+index 8877ffe..1e49ec5 100644
+--- a/src/runner.h
++++ b/src/runner.h
+@@ -243,6 +243,7 @@ typedef struct {
+     RuntimeSpriteElement* spriteElement; // owned; nullptr if type != Sprite
+     RoomTile* tileElement; // borrowed (legacyTiles) or owned (layer_tile_create); nullptr if type != Tile
+     bool tileElementOwned; // true if tileElement was heap-allocated and must be freed
++    bool tilemapDataOwned; // dynamic tilemaps are released with the layer
+     RoomLayerTilesData* tilemapData; // borrowed, points into the parsed RoomLayer; nullptr if type != Tilemap
+     int32_t instanceId; // only valid if type == Instance; the instance may have died since, so callers must check liveness
+ } RuntimeLayerElement;
+diff --git a/src/vm_builtins.c b/src/vm_builtins.c
+index 2a26c0c..4fa76b9 100644
+--- a/src/vm_builtins.c
++++ b/src/vm_builtins.c
+@@ -38,6 +38,9 @@
+ #include "base64.h"
+ #include "gettime.h"
+ #include "miniz.h"
++#if defined(ENABLE_MODERN_GL) || defined(ENABLE_LEGACY_GL)
++#include "image_decoder.h"
++#endif
+ 
+ #if defined(__GNUC__) || defined(__clang__)
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+@@ -3569,8 +3572,8 @@ static RValue builtin_game_get_speed(VMContext* ctx, MAYBE_UNUSED RValue* args,
+ static RValue builtin_game_set_speed(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+     if (2 > argCount) return RValue_makeUndefined();
+ 
+-    int32_t type = RValue_toInt32(args[0]);
+-    GMLReal speedValue = RValue_toReal(args[1]);
++    GMLReal speedValue = RValue_toReal(args[0]);
++    int32_t type = RValue_toInt32(args[1]);
+     GMLReal fps = (type == 0) ? speedValue : (speedValue > 0.0 ? (GMLReal) (1000000.0 / speedValue) : 0.0);
+ 
+     ctx->runner->gameSpeedOverride = fps;
+@@ -5205,19 +5208,28 @@ static RValue builtin_ds_list_add(VMContext* ctx, RValue* args, int32_t argCount
+ }
+ 
+ static RValue builtin_ds_list_set(VMContext* ctx, RValue* args, int32_t argCount) {
+-    REQUIRE_ARGC_AT_LEAST("ds_list_set", 1, RValue_makeUndefined());
+-    REQUIRE_ARGC_AT_MOST("ds_list_set", 2, RValue_makeUndefined());
+-    Runner* runner = ctx->runner;
++    REQUIRE_ARGC_AT_LEAST("ds_list_set", 3, RValue_makeUndefined());
++    REQUIRE_ARGC_AT_MOST("ds_list_set", 3, RValue_makeUndefined());
+     int32_t id = RValue_toInt32(args[0]);
+     int32_t pos = RValue_toInt32(args[1]);
+-    DsList* list = dsListGet(runner, id);
+-    if (list == nullptr) return RValue_makeUndefined();
+-    if (pos >= 0 && pos < arrlen(list->items)) {
+-        list->items[pos] = RValue_makeIndependent(args[2]);
+-    }
++    DsList* list = dsListGet(ctx->runner, id);
++    if (list == nullptr || pos < 0) return RValue_makeUndefined();
++    while (pos >= arrlen(list->items)) arrput(list->items, RValue_makeReal(0));
++    RValue_free(&list->items[pos]);
++    list->items[pos] = RValue_makeIndependent(args[2]);
+     return RValue_makeUndefined();
+ }
+ 
++static RValue builtin_ds_list_set_post(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("ds_list_set_post", 3, RValue_makeUndefined());
++    DsList* list = dsListGet(ctx->runner, RValue_toInt32(args[0]));
++    int32_t pos = RValue_toInt32(args[1]);
++    RValue previous = list != nullptr && pos >= 0 && pos < arrlen(list->items)
++        ? RValue_makeIndependent(list->items[pos]) : RValue_makeReal(0);
++    builtin_ds_list_set(ctx, args, argCount);
++    return previous;
++}
++
+ static RValue builtin_ds_list_insert(VMContext* ctx, RValue* args, int32_t argCount) {
+     Runner* runner = ctx->runner;
+     int32_t id = RValue_toInt32(args[0]);
+@@ -5322,7 +5334,13 @@ static RValue builtin_ds_list_find_value(VMContext* ctx, RValue* args, MAYBE_UNU
+     DsList* list = dsListGet(runner, id);
+     if (list == nullptr) return RValue_makeUndefined();
+     if (0 > pos || pos >= (int32_t) arrlen(list->items)) return RValue_makeUndefined();
+-    return RValue_makeIndependent(list->items[pos]);
++    RValue val = list->items[pos];
++    if (val.type == RVALUE_STRUCT && val.structInst != nullptr) {
++        RValue object = VM_structGetVariableByVarName(ctx, val.structInst, "Object", -1);
++        if (object.type != RVALUE_UNDEFINED) return object;
++        RValue_free(&object);
++    }
++    return RValue_makeIndependent(val);
+ }
+ 
+ static RValue builtin_ds_list_size(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+@@ -5341,6 +5359,13 @@ static RValue builtin_ds_list_find_index(VMContext* ctx, RValue* args, MAYBE_UNU
+     RValue needle = args[1];
+     for (int32_t i = 0; (int32_t) arrlen(list->items) > i; i++) {
+         RValue item = list->items[i];
++        // GML numeric values compare by value across integer, real and bool tags.
++        bool itemNumeric = item.type >= RVALUE_INT32 && item.type <= RVALUE_REAL;
++        bool needleNumeric = needle.type >= RVALUE_INT32 && needle.type <= RVALUE_REAL;
++        if (itemNumeric && needleNumeric) {
++            if (RValue_toReal(item) == RValue_toReal(needle)) return RValue_makeReal((GMLReal) i);
++            continue;
++        }
+         if (item.type != needle.type) continue;
+         switch (item.type) {
+             case RVALUE_REAL:
+@@ -5785,6 +5810,51 @@ static RValue builtin_ds_grid_set(VMContext* ctx, MAYBE_UNUSED RValue* args, MAY
+     return RValue_makeUndefined();
+ }
+ 
++static RValue builtin_ds_grid_set_post(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("ds_grid_set_post", 4, RValue_makeUndefined());
++    DsGrid* grid = dsGridGet(ctx->runner, RValue_toInt32(args[0]));
++    int32_t x = RValue_toInt32(args[1]), y = RValue_toInt32(args[2]);
++    if (!grid || x < 0 || y < 0 || x >= grid->width || y >= grid->height)
++        return RValue_makeIndependent(args[3]);
++    RValue previous = RValue_makeIndependent(grid->items[x + y * grid->width]);
++    builtin_ds_grid_set(ctx, args, argCount);
++    return previous;
++}
++
++static RValue builtin_ds_grid_clear(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("ds_grid_clear", 2, RValue_makeUndefined());
++    DsGrid* grid = dsGridGet(ctx->runner, RValue_toInt32(args[0]));
++    if (!grid) return RValue_makeUndefined();
++    size_t count = (size_t)grid->width * grid->height;
++    for (size_t i = 0; i < count; i++) {
++        RValue value = RValue_makeIndependent(args[1]);
++        RValue_free(&grid->items[i]);
++        grid->items[i] = value;
++    }
++    return RValue_makeUndefined();
++}
++
++static RValue builtin_ds_grid_set_region(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("ds_grid_set_region", 6, RValue_makeUndefined());
++    DsGrid* grid = dsGridGet(ctx->runner, RValue_toInt32(args[0]));
++    if (!grid) return RValue_makeUndefined();
++    int32_t x1 = RValue_toInt32(args[1]), y1 = RValue_toInt32(args[2]);
++    int32_t x2 = RValue_toInt32(args[3]), y2 = RValue_toInt32(args[4]);
++    if (x1 > x2) { int32_t t = x1; x1 = x2; x2 = t; }
++    if (y1 > y2) { int32_t t = y1; y1 = y2; y2 = t; }
++    if (x1 < 0) x1 = 0;
++    if (y1 < 0) y1 = 0;
++    if (x2 >= grid->width) x2 = grid->width - 1;
++    if (y2 >= grid->height) y2 = grid->height - 1;
++    for (int32_t y = y1; y <= y2; y++) for (int32_t x = x1; x <= x2; x++) {
++        RValue* cell = &grid->items[x + y * grid->width];
++        RValue value = RValue_makeIndependent(args[5]);
++        RValue_free(cell);
++        *cell = value;
++    }
++    return RValue_makeUndefined();
++}
++
+ static RValue builtin_ds_grid_get(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+     REQUIRE_ARGC_AT_MOST("ds_grid_get", 3, RValue_makeUndefined());
+ 
+@@ -5799,6 +5869,77 @@ static RValue builtin_ds_grid_get(VMContext* ctx, MAYBE_UNUSED RValue* args, MAY
+     return RValue_makeIndependent(grid->items[x + (y * grid->width)]);
+ }
+ 
++static RValue builtin_ds_grid_set_grid_region(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("ds_grid_set_grid_region", 8, RValue_makeUndefined());
++    DsGrid* dst = dsGridGet(ctx->runner, RValue_toInt32(args[0]));
++    DsGrid* src = dsGridGet(ctx->runner, RValue_toInt32(args[1]));
++    if (!src || !dst) return RValue_makeUndefined();
++    int32_t x1 = RValue_toInt32(args[2]), y1 = RValue_toInt32(args[3]);
++    int32_t x2 = RValue_toInt32(args[4]), y2 = RValue_toInt32(args[5]);
++    int32_t dx = RValue_toInt32(args[6]), dy = RValue_toInt32(args[7]);
++    if (x1 > x2) { int32_t t = x1; x1 = x2; x2 = t; }
++    if (y1 > y2) { int32_t t = y1; y1 = y2; y2 = t; }
++    // Reverse overlapping copies so source cells survive until they are read.
++    bool reverse = src == dst && x1 + y1 * src->width < dx + dy * dst->width;
++    int32_t step = reverse ? -1 : 1;
++    for (int32_t y = reverse ? y2 : y1; reverse ? y >= y1 : y <= y2; y += step) {
++        int32_t ty = dy + y - y1;
++        if (y < 0 || y >= src->height || ty < 0 || ty >= dst->height) continue;
++        for (int32_t x = reverse ? x2 : x1; reverse ? x >= x1 : x <= x2; x += step) {
++            int32_t tx = dx + x - x1;
++            if (x < 0 || x >= src->width || tx < 0 || tx >= dst->width) continue;
++            RValue value = RValue_makeIndependent(src->items[x + y * src->width]);
++            RValue* cell = &dst->items[tx + ty * dst->width];
++            RValue_free(cell);
++            *cell = value;
++        }
++    }
++    return RValue_makeUndefined();
++}
++
++static RValue builtin_ds_grid_get_sum(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("ds_grid_get_sum", 5, RValue_makeReal(0));
++    DsGrid* grid = dsGridGet(ctx->runner, RValue_toInt32(args[0]));
++    if (!grid || grid->width == 0 || grid->height == 0) return RValue_makeReal(0);
++    int32_t x1 = RValue_toInt32(args[1]), y1 = RValue_toInt32(args[2]);
++    int32_t x2 = RValue_toInt32(args[3]), y2 = RValue_toInt32(args[4]);
++    if (x1 > x2) { int32_t t = x1; x1 = x2; x2 = t; }
++    if (y1 > y2) { int32_t t = y1; y1 = y2; y2 = t; }
++    x1 = x1 < 0 ? 0 : x1 >= grid->width ? grid->width - 1 : x1;
++    x2 = x2 < 0 ? 0 : x2 >= grid->width ? grid->width - 1 : x2;
++    y1 = y1 < 0 ? 0 : y1 >= grid->height ? grid->height - 1 : y1;
++    y2 = y2 < 0 ? 0 : y2 >= grid->height ? grid->height - 1 : y2;
++    GMLReal sum = 0;
++    for (int32_t y = y1; y <= y2; y++) for (int32_t x = x1; x <= x2; x++) {
++        RValue value = grid->items[x + y * grid->width];
++        if (value.type != RVALUE_STRING) sum += RValue_toReal(value);
++    }
++    return RValue_makeReal(sum);
++}
++
++static RValue builtin_ds_grid_sort(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("ds_grid_sort", 3, RValue_makeUndefined());
++    DsGrid* grid = dsGridGet(ctx->runner, RValue_toInt32(args[0]));
++    int32_t column = RValue_toInt32(args[1]);
++    if (!grid || column < 0 || column >= grid->width || grid->height < 2) return RValue_makeUndefined();
++    bool ascending = RValue_toBool(args[2]);
++    size_t rowSize = (size_t)grid->width * sizeof(RValue);
++    RValue* row = (RValue*)safeMalloc(rowSize);
++    for (int32_t y = 1; y < grid->height; y++) {
++        memcpy(row, grid->items + y * grid->width, rowSize);
++        int32_t dest = y;
++        while (dest > 0) {
++            int cmp = arraySortCompareAsc(&grid->items[(dest - 1) * grid->width + column], &row[column]);
++            if (ascending ? cmp <= 0 : cmp > 0) break;
++            memmove(grid->items + dest * grid->width, grid->items + (dest - 1) * grid->width, rowSize);
++            dest--;
++        }
++        memcpy(grid->items + dest * grid->width, row, rowSize);
++    }
++    free(row);
++    return RValue_makeUndefined();
++}
++
+ static RValue builtin_ds_grid_add(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+     REQUIRE_ARGC_AT_MOST("ds_grid_add", 4, RValue_makeUndefined());
+ 
+@@ -6898,6 +7039,28 @@ static RValue builtin_array_set(MAYBE_UNUSED VMContext* ctx, RValue* args, MAYBE
+     return RValue_makeUndefined();
+ }
+ 
++static RValue builtin_array_set_2D(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("array_set_2D", 4, RValue_makeUndefined());
++    if (args[0].type != RVALUE_ARRAY || !args[0].array) return RValue_makeUndefined();
++    int32_t row = RValue_toInt32(args[1]), column = RValue_toInt32(args[2]);
++    if (row < 0 || column < 0) return RValue_makeUndefined();
++    GMLArray* array = args[0].array;
++    if (array->type == GML_LEGACY_ARRAY) {
++        if (column >= GML_LEGACY_ARRAY_STRIDE || row > (INT32_MAX - column - 1) / GML_LEGACY_ARRAY_STRIDE)
++            return RValue_makeUndefined();
++        GMLArray_set(array, row * GML_LEGACY_ARRAY_STRIDE + column, args[3]);
++    } else {
++        GMLArray_growTo(array, row + 1);
++        RValue* cell = GMLArray_slot(array, row);
++        if (cell->type != RVALUE_ARRAY || !cell->array) {
++            RValue_free(cell);
++            *cell = RValue_makeArray(GMLArray_create(ctx->dataWin, 0));
++        }
++        GMLArray_set(cell->array, column, args[3]);
++    }
++    return RValue_makeUndefined();
++}
++
+ // array_push(array, values...) - append one or more values to the end of the array (row 0). BC17+ arrays are mutable references; mutate in place.
+ static RValue builtin_array_push(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
+     REQUIRE_ARGC_AT_LEAST("array_push", 1, RValue_makeUndefined());
+@@ -7941,6 +8104,15 @@ static RValue builtin_audio_group_load(VMContext* ctx, RValue* args, MAYBE_UNUSE
+     return RValue_makeUndefined();
+ }
+ 
++static RValue builtin_audio_group_stop_all(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("audio_group_stop_all", 1, RValue_makeUndefined());
++    AudioSystem* audio = ctx->runner->audioSystem;
++    int32_t group = RValue_toInt32(args[0]);
++    for (uint32_t i = 0; i < ctx->dataWin->sond.count; i++)
++        if (AudioSystem_soundGroup(audio, i) == group) audio->vtable->stopSound(audio, i);
++    return RValue_makeUndefined();
++}
++
+ static RValue builtin_audio_group_set_gain(VMContext* ctx, RValue* args, int32_t argCount) {
+     REQUIRE_ARGC_AT_LEAST("audio_group_set_gain", 3, RValue_makeUndefined());
+     AudioSystem* audio = ctx->runner->audioSystem;
+@@ -8548,6 +8720,18 @@ static RValue builtin_file_text_open_read(VMContext* ctx, RValue* args, int32_t
+     return RValue_makeReal((GMLReal) slot);
+ }
+ 
++static RValue builtin_file_text_open_from_string(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("file_text_open_from_string", 1, RValue_makeReal(-1));
++    int32_t slot = findFreeTextFileSlot(ctx->runner);
++    if (slot < 0) return RValue_makeReal(-1);
++    OpenTextFile file = {0};
++    file.content = RValue_toString(args[0], ctx->dataWin);
++    file.contentLen = (int32_t)strlen(file.content);
++    file.isOpen = true;
++    ctx->runner->openTextFiles[slot] = file;
++    return RValue_makeReal(slot);
++}
++
+ static RValue builtin_file_text_open_write(VMContext* ctx, RValue* args, int32_t argCount) {
+     REQUIRE_ARGC_AT_LEAST("file_text_open_write", 1, RValue_makeReal(-1.0));
+     const char* path = (args[0].type == RVALUE_STRING ? args[0].string : "");
+@@ -10638,6 +10822,19 @@ static RValue builtin_buffer_read(MAYBE_UNUSED VMContext* ctx, RValue* args, MAY
+     return result;
+ }
+ 
++static RValue builtin_buffer_peek(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("buffer_peek", 3, RValue_makeReal(0));
++    GmlBuffer* buffer = gmlBufferGet(ctx->runner, RValue_toInt32(args[0]));
++    int32_t offset = RValue_toInt32(args[1]);
++    if (!buffer || offset < 0 || offset >= buffer->size) return RValue_makeReal(0);
++    int32_t previousPosition = buffer->position;
++    buffer->position = offset;
++    RValue readArgs[] = {args[0], args[2]};
++    RValue value = builtin_buffer_read(ctx, readArgs, 2);
++    buffer->position = previousPosition;
++    return value;
++}
++
+ static RValue builtin_buffer_seek(MAYBE_UNUSED VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+     Runner* runner = ctx->runner;
+     int32_t id = RValue_toInt32(args[0]);
+@@ -12846,9 +13043,73 @@ static RValue builtin_surface_get_texture(VMContext* ctx, RValue* args, MAYBE_UN
+ 
+ // Sprite functions
+ static RValue builtin_sprite_add(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+-    logStubbedFunction(ctx, "sprite_add");
+-    // Return 1, so that a sprite_exists check passes
+-    return RValue_makeInt32(1);
++    REQUIRE_ARGC_AT_LEAST("sprite_add", 6, RValue_makeInt32(-1));
++#if defined(ENABLE_MODERN_GL) || defined(ENABLE_LEGACY_GL)
++    Renderer* renderer = ctx->runner->renderer;
++    if (renderer == nullptr || renderer->vtable->surfaceSetPixels == nullptr ||
++        renderer->vtable->createSpriteFromSurface == nullptr) return RValue_makeInt32(-1);
++    // PNG files used by Forager's save slots and artwork contain one frame.
++    if (RValue_toInt32(args[1]) > 1) return RValue_makeInt32(-1);
++    char* path = RValue_toString(args[0], ctx->dataWin);
++    uint8_t* fileData = nullptr;
++    int32_t fileSize = 0;
++    FileSystem* fs = ctx->runner->fileSystem;
++    bool read = fs->vtable->readFileBinary(fs, path, &fileData, &fileSize);
++    free(path);
++    if (!read) return RValue_makeInt32(-1);
++    int w = 0, h = 0;
++    uint8_t* pixels = ImageDecoder_decodeToRgba(fileData, fileSize, false, &w, &h);
++    free(fileData);
++    if (pixels == nullptr) return RValue_makeInt32(-1);
++    int32_t surface = renderer->vtable->createSurface(renderer, w, h);
++    int32_t sprite = -1;
++    if (surface >= 0) {
++        if (renderer->vtable->surfaceSetPixels(renderer, surface, pixels)) {
++            sprite = renderer->vtable->createSpriteFromSurface(renderer, surface, 0, 0, w, h,
++                RValue_toBool(args[2]), RValue_toBool(args[3]), RValue_toInt32(args[4]), RValue_toInt32(args[5]));
++        }
++        renderer->vtable->surfaceFree(renderer, surface);
++    }
++    free(pixels);
++    return RValue_makeInt32(sprite);
++#else
++    return RValue_makeInt32(-1);
++#endif
++}
++
++// screen_save_part(filename, x, y, width, height)
++static RValue builtin_screen_save_part(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("screen_save_part", 5, RValue_makeBool(false));
++    Runner* runner = ctx->runner;
++    Renderer* renderer = runner->renderer;
++    int32_t surface = runner->applicationSurfaceId;
++    if (renderer == nullptr || renderer->vtable->surfaceGetPixels == nullptr ||
++        !Renderer_surfaceExists(renderer, surface)) return RValue_makeBool(false);
++    int32_t sw = (int32_t)Renderer_getSurfaceWidth(renderer, surface);
++    int32_t sh = (int32_t)Renderer_getSurfaceHeight(renderer, surface);
++    int32_t x = RValue_toInt32(args[1]), y = RValue_toInt32(args[2]);
++    int32_t w = RValue_toInt32(args[3]), h = RValue_toInt32(args[4]);
++    if (sw <= 0 || sh <= 0 || x < 0 || y < 0 || w <= 0 || h <= 0 ||
++        x > sw || y > sh || w > sw - x || h > sh - y) return RValue_makeBool(false);
++    uint8_t* pixels = (uint8_t*)safeMalloc((size_t)sw * sh * 4);
++    if (!renderer->vtable->surfaceGetPixels(renderer, surface, pixels)) {
++        free(pixels);
++        return RValue_makeBool(false);
++    }
++    uint8_t* cropped = (uint8_t*)safeMalloc((size_t)w * h * 4);
++    for (int32_t row = 0; row < h; row++) {
++        memcpy(cropped + (size_t)row * w * 4, pixels + ((size_t)(y + row) * sw + x) * 4, (size_t)w * 4);
++    }
++    free(pixels);
++    size_t pngSize = 0;
++    void* png = tdefl_write_image_to_png_file_in_memory(cropped, w, h, 4, &pngSize);
++    free(cropped);
++    if (png == nullptr) return RValue_makeBool(false);
++    char* path = RValue_toString(args[0], ctx->dataWin);
++    bool saved = runner->fileSystem->vtable->writeFileBinary(runner->fileSystem, path, png, pngSize);
++    free(path);
++    free(png);
++    return RValue_makeBool(saved);
+ }
+ 
+ static RValue builtin_sprite_exists(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+@@ -16536,6 +16797,39 @@ static RValue builtin_layer_background_destroy(VMContext* ctx, RValue* args, MAY
+ 
+ 
+ #if IS_WAD17_OR_HIGHER_ENABLED
++static RValue builtin_layer_tilemap_create(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("layer_tilemap_create", 6, RValue_makeReal(-1));
++    Runner* runner = ctx->runner;
++    RuntimeLayer* layer = Runner_findRuntimeLayerById(runner, resolveLayerIdArg(runner, args[0]));
++    int32_t width = RValue_toInt32(args[4]), height = RValue_toInt32(args[5]);
++    if (!layer || width < 0 || height < 0) return RValue_makeReal(-1);
++    RoomLayerTilesData* data = safeCalloc(1, sizeof(RoomLayerTilesData));
++    data->backgroundIndex = RValue_toInt32(args[3]);
++    data->tilesX = width;
++    data->tilesY = height;
++    data->xOffset = RValue_toReal(args[1]);
++    data->yOffset = RValue_toReal(args[2]);
++    data->tileData = safeCalloc((size_t)width * height, sizeof(uint32_t));
++    RuntimeLayerElement element = {0};
++    element.id = Runner_getNextLayerId(runner);
++    element.type = RuntimeLayerElementType_Tilemap;
++    element.visible = true;
++    element.alpha = 1;
++    element.blend = 0xFFFFFF;
++    element.tilemapData = data;
++    element.tilemapDataOwned = true;
++    arrput(layer->elements, element);
++    return RValue_makeReal(element.id);
++}
++
++static RValue builtin_layer_tilemap_exists(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("layer_tilemap_exists", 2, RValue_makeBool(false));
++    RuntimeLayer* owner = nullptr;
++    RuntimeLayerElement* element = Runner_findLayerElementById(ctx->runner, RValue_toInt32(args[1]), &owner);
++    return RValue_makeBool(element && owner && element->type == RuntimeLayerElementType_Tilemap
++        && (int32_t)owner->id == resolveLayerIdArg(ctx->runner, args[0]));
++}
++
+ static RValue builtin_layer_tilemap_get_id(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+     REQUIRE_ARGC_AT_LEAST("layer_tilemap_get_id", 1, RValue_makeReal(-1.0));
+     Runner* runner = ctx->runner;
+@@ -16617,15 +16911,16 @@ static RValue builtin_draw_tilemap(VMContext* ctx, RValue* args, MAYBE_UNUSED in
+     return RValue_makeUndefined();
+ }
+ 
+-// tilemap_x / tilemap_y set the owning runtime layer's draw offset for the tile layer identified by the tilemap element id.
++// Tilemap positions are independent of the owning layer's position.
+ static RValue builtin_tilemap_x(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+     REQUIRE_ARGC_AT_LEAST("tilemap_x", 2, RValue_makeUndefined());
+     Runner* runner = ctx->runner;
+     GMLReal x = RValue_toReal(args[1]);
+ 
+     RuntimeLayer* runtimeLayer = nullptr;
+-    if (findTilemapData(runner, RValue_toInt32(args[0]), &runtimeLayer) == nullptr) return RValue_makeUndefined();
+-    if (runtimeLayer != nullptr) runtimeLayer->xOffset = (float) x;
++    RoomLayerTilesData* data = findTilemapData(runner, RValue_toInt32(args[0]), &runtimeLayer);
++    if (!data) return RValue_makeUndefined();
++    data->xOffset = (float) x;
+     return RValue_makeUndefined();
+ }
+ 
+@@ -16635,8 +16930,9 @@ static RValue builtin_tilemap_y(VMContext* ctx, RValue* args, MAYBE_UNUSED int32
+     GMLReal y = RValue_toReal(args[1]);
+ 
+     RuntimeLayer* runtimeLayer = nullptr;
+-    if (findTilemapData(runner, RValue_toInt32(args[0]), &runtimeLayer) == nullptr) return RValue_makeUndefined();
+-    if (runtimeLayer != nullptr) runtimeLayer->yOffset = (float) y;
++    RoomLayerTilesData* data = findTilemapData(runner, RValue_toInt32(args[0]), &runtimeLayer);
++    if (!data) return RValue_makeUndefined();
++    data->yOffset = (float) y;
+     return RValue_makeUndefined();
+ }
+ 
+@@ -16645,8 +16941,9 @@ static RValue builtin_tilemap_get_x(VMContext* ctx, RValue* args, MAYBE_UNUSED i
+     Runner* runner = ctx->runner;
+ 
+     RuntimeLayer* runtimeLayer = nullptr;
+-    if (findTilemapData(runner, RValue_toInt32(args[0]), &runtimeLayer) == nullptr || runtimeLayer == nullptr) return RValue_makeReal(-1.0);
+-    return RValue_makeReal((GMLReal) runtimeLayer->xOffset);
++    RoomLayerTilesData* data = findTilemapData(runner, RValue_toInt32(args[0]), &runtimeLayer);
++    if (!data) return RValue_makeReal(-1.0);
++    return RValue_makeReal((GMLReal) data->xOffset);
+ }
+ 
+ static RValue builtin_tilemap_get_y(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+@@ -16654,8 +16951,9 @@ static RValue builtin_tilemap_get_y(VMContext* ctx, RValue* args, MAYBE_UNUSED i
+     Runner* runner = ctx->runner;
+ 
+     RuntimeLayer* runtimeLayer = nullptr;
+-    if (findTilemapData(runner, RValue_toInt32(args[0]), &runtimeLayer) == nullptr || runtimeLayer == nullptr) return RValue_makeReal(-1.0);
+-    return RValue_makeReal((GMLReal) runtimeLayer->yOffset);
++    RoomLayerTilesData* data = findTilemapData(runner, RValue_toInt32(args[0]), &runtimeLayer);
++    if (!data) return RValue_makeReal(-1.0);
++    return RValue_makeReal((GMLReal) data->yOffset);
+ }
+ 
+ static RValue builtin_tilemap_get_width(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+@@ -16736,8 +17034,8 @@ static int32_t tilemapGetCellIndexAtPixel(DataWin* dw, RoomLayerTilesData* data,
+     uint32_t tileH = tileset->gms2TileHeight;
+     if (tileW == 0 || tileH == 0) return -1;
+ 
+-    float offsetX = runtimeLayer->xOffset; // GameMaker-HTML5: m_x
+-    float offsetY = runtimeLayer->yOffset; // GameMaker-HTML5: m_y
++    float offsetX = runtimeLayer->xOffset + data->xOffset;
++    float offsetY = runtimeLayer->yOffset + data->yOffset;
+ 
+     GMLReal x = findX - (GMLReal) offsetX;
+     GMLReal y = findY - (GMLReal) offsetY;
+@@ -18606,7 +18904,7 @@ static void jsonEncodeReal(JsonWriter* writer, GMLReal value, bool useFloatMarke
+     JsonWriter_rawValue(writer, buf);
+ }
+ 
+-static void jsonEncodeValue(JsonWriter* writer, RValue val, bool useFloatMarkers, DataWin* dataWin) {
++static void jsonEncodeValue(JsonWriter* writer, RValue val, bool useFloatMarkers, VMContext* ctx) {
+     switch (val.type) {
+         case RVALUE_UNDEFINED:
+             JsonWriter_null(writer);
+@@ -18634,14 +18932,47 @@ static void jsonEncodeValue(JsonWriter* writer, RValue val, bool useFloatMarkers
+                 int32_t length = GMLArray_length1D(val.array);
+                 repeat(length, i) {
+                     RValue* slot = GMLArray_slot(val.array, i);
+-                    jsonEncodeValue(writer, slot != nullptr ? *slot : RValue_makeUndefined(), useFloatMarkers, dataWin);
++                    jsonEncodeValue(writer, slot != nullptr ? *slot : RValue_makeUndefined(), useFloatMarkers, ctx);
+                 }
+             }
+             JsonWriter_endArray(writer);
+             break;
+         }
++        case RVALUE_STRUCT: {
++            RValue kind = VM_structGetVariableByVarName(ctx, val.structInst, "ObjType", -1);
++            RValue object = VM_structGetVariableByVarName(ctx, val.structInst, "Object", -1);
++            int32_t type = RValue_toInt32(kind);
++            int32_t id = RValue_toInt32(object);
++            RValue_free(&kind);
++            RValue_free(&object);
++            if (type == DS_TYPE_LIST) {
++                DsList* list = dsListGet(ctx->runner, id);
++                JsonWriter_beginArray(writer);
++                if (list != nullptr) {
++                    repeat(arrlen(list->items), i) {
++                        jsonEncodeValue(writer, list->items[i], useFloatMarkers, ctx);
++                    }
++                }
++                JsonWriter_endArray(writer);
++            } else if (type == DS_TYPE_MAP) {
++                DsMapEntry** map = dsMapGet(ctx->runner, id);
++                JsonWriter_beginObject(writer);
++                if (map != nullptr) {
++                    repeat(shlen(*map), i) {
++                        JsonWriter_key(writer, (*map)[i].key);
++                        jsonEncodeValue(writer, (*map)[i].value, useFloatMarkers, ctx);
++                    }
++                }
++                JsonWriter_endObject(writer);
++            } else {
++                char* str = RValue_toString(val, ctx->dataWin);
++                JsonWriter_string(writer, str);
++                free(str);
++            }
++            break;
++        }
+         default: {
+-            char* str = RValue_toString(val, dataWin);
++            char* str = RValue_toString(val, ctx->dataWin);
+             JsonWriter_string(writer, str);
+             free(str);
+             break;
+@@ -18666,7 +18997,7 @@ static RValue builtin_json_encode(VMContext* ctx, RValue* args, int32_t argCount
+     if (mapPtr != nullptr && *mapPtr != nullptr) {
+         repeat(shlen(*mapPtr), i) {
+             JsonWriter_key(&writer, (*mapPtr)[i].key);
+-            jsonEncodeValue(&writer, (*mapPtr)[i].value, useFloatMarkers, ctx->dataWin);
++            jsonEncodeValue(&writer, (*mapPtr)[i].value, useFloatMarkers, ctx);
+         }
+     }
+ 
+@@ -18697,6 +19028,9 @@ static RValue jsonDecodeValue(VMContext* ctx, JsonValue* json) {
+             for (int i = 0; i < len; i++) {
+                 JsonValue* item = JsonReader_getArrayElement(json, i);
+                 RValue val = jsonDecodeValue(ctx, item);
++                if (item->type == JSON_ARRAY || item->type == JSON_OBJECT) {
++                    val = makeMapListContainer(ctx, RValue_toInt32(val), item->type == JSON_ARRAY ? DS_TYPE_LIST : DS_TYPE_MAP);
++                }
+                 DsList* list = dsListGet(ctx->runner, listId);
+                 if (list != NULL) {
+                     arrput(list->items, val);
+@@ -18714,6 +19048,9 @@ static RValue jsonDecodeValue(VMContext* ctx, JsonValue* json) {
+                 const char* key = JsonReader_getJsonKeyByIndex(json, i);
+                 JsonValue* valJson = JsonReader_getJsonValueByIndex(json, i);
+                 RValue val = jsonDecodeValue(ctx, valJson);
++                if (valJson->type == JSON_ARRAY || valJson->type == JSON_OBJECT) {
++                    val = makeMapListContainer(ctx, RValue_toInt32(val), valJson->type == JSON_ARRAY ? DS_TYPE_LIST : DS_TYPE_MAP);
++                }
+                 DsMapEntry** mapPtr = dsMapGet(ctx->runner, mapId);
+                 if (mapPtr != nullptr) {
+                     char* keyCopy = safeStrdup(key);
+@@ -19070,9 +19407,9 @@ static RValue fontAddSpriteImpl(VMContext* ctx, int32_t spriteIndex, uint16_t* c
+     uint32_t glyphCount = charCount;
+     if (glyphCount > sprite->textureCount) glyphCount = sprite->textureCount;
+ 
+-    // GM 2023.4 changed sprite-font glyph placement to subtract the source sprite's origin.
+-    // (See GameMaker-HTML5's commit a7c5b909209d5a28602fedfe2031965386a99921, this behavior can first be seen in 2023.4.0.113)
+-    bool spriteFontSubtractsOrigin = DataWin_isVersionAtLeast(dw, 2023, 4, 0, 0);
++    // Sprite fonts use the source sprite's origin, including native games made
++    // before 2023.4. The HTML5 change in a7c5b909 fixed a backend bug; it did not
++    // introduce a new GameMaker version rule.
+ 
+     // Compute emSize (max bounding height across all frames) and biggestShift
+     uint32_t maxHeight = 0;
+@@ -19125,8 +19462,9 @@ static RValue fontAddSpriteImpl(VMContext* ctx, int32_t spriteIndex, uint16_t* c
+         int32_t advanceWidth = proportional ? (int32_t) tpag->sourceWidth : (int32_t) tpag->boundingWidth;
+         glyph->shift = (int16_t) (advanceWidth + sep);
+ 
+-        // Horizontal offset: proportional fonts have none. Non-proportional uses the cell offset targetX, minus the sprite origin only on GM 2023.2+ (pre-2023.2 the origin cancels).
+-        int32_t xOff = (int32_t) tpag->targetX - (spriteFontSubtractsOrigin ? sprite->originX : 0);
++        // Proportional fonts discard horizontal padding; fixed-width fonts
++        // preserve the frame offset relative to its origin.
++        int32_t xOff = (int32_t) tpag->targetX - sprite->originX;
+         glyph->offset = proportional ? 0 : (int16_t) xOff;
+     }
+     }
+@@ -19172,7 +19510,7 @@ static RValue fontAddSpriteImpl(VMContext* ctx, int32_t spriteIndex, uint16_t* c
+     font->isSpriteFont = true;
+     font->spriteIndex = spriteIndex;
+     // Precompute the per-glyph Y origin adjustment (the X half is baked into glyph->offset above).
+-    font->spriteOriginYAdjust = spriteFontSubtractsOrigin ? (int16_t) sprite->originY : 0;
++    font->spriteOriginYAdjust = (int16_t) sprite->originY;
+     Font_buildGlyphLUT(font);
+ 
+     return RValue_makeReal((GMLReal) newFontIndex);
+@@ -23352,6 +23690,14 @@ void VMBuiltins_registerAll(VMContext* ctx) {
+     VM_registerBuiltin(ctx, "ds_list_copy", builtin_ds_list_copy);
+ 
+     // ds_grid
++    VM_registerBuiltin(ctx, "ds_list_set_post", builtin_ds_list_set_post);
++    VM_registerBuiltin(ctx, "ds_grid_set_post", builtin_ds_grid_set_post);
++    VM_registerBuiltin(ctx, "ds_grid_clear", builtin_ds_grid_clear);
++    VM_registerBuiltin(ctx, "ds_grid_set_region", builtin_ds_grid_set_region);
++    VM_registerBuiltin(ctx, "ds_grid_set_grid_region", builtin_ds_grid_set_grid_region);
++    VM_registerBuiltin(ctx, "ds_grid_get_sum", builtin_ds_grid_get_sum);
++    VM_registerBuiltin(ctx, "ds_grid_sort", builtin_ds_grid_sort);
++    VM_registerBuiltin(ctx, "file_text_open_from_string", builtin_file_text_open_from_string);
+     VM_registerBuiltin(ctx, "ds_grid_create", builtin_ds_grid_create);
+     VM_registerBuiltin(ctx, "ds_grid_destroy", builtin_ds_grid_destroy);
+     VM_registerBuiltin(ctx, "ds_grid_width", builtin_ds_grid_width);
+@@ -23417,6 +23763,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
+     VM_registerBuiltin(ctx, "array_height_2d", builtin_array_height_2d);
+     VM_registerBuiltin(ctx, "array_get", builtin_array_get);
+     VM_registerBuiltin(ctx, "array_set", builtin_array_set);
++    VM_registerBuiltin(ctx, "array_set_2D", builtin_array_set_2D);
+     VM_registerBuiltin(ctx, "array_push", builtin_array_push);
+     VM_registerBuiltin(ctx, "array_pop", builtin_array_pop);
+     VM_registerBuiltin(ctx, "array_concat", builtin_array_concat);
+@@ -23461,6 +23808,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
+     VM_registerBuiltin(ctx, "audio_master_gain", builtin_audio_master_gain);
+     VM_registerBuiltin(ctx, "audio_set_master_gain", builtin_audio_set_master_gain);
+     VM_registerBuiltin(ctx, "audio_group_load", builtin_audio_group_load);
++    VM_registerBuiltin(ctx, "audio_group_stop_all", builtin_audio_group_stop_all);
+     VM_registerBuiltin(ctx, "audio_group_set_gain", builtin_audio_group_set_gain);
+     VM_registerBuiltin(ctx, "audio_group_is_loaded", builtin_audio_group_is_loaded);
+     if (!isGMS2) {
+@@ -23675,6 +24023,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
+     VM_registerBuiltin(ctx, "buffer_compress", builtin_buffer_compress);
+     VM_registerBuiltin(ctx, "buffer_decompress", builtin_buffer_decompress);
+     VM_registerBuiltin(ctx, "buffer_read", builtin_buffer_read);
++    VM_registerBuiltin(ctx, "buffer_peek", builtin_buffer_peek);
+     VM_registerBuiltin(ctx, "buffer_seek", builtin_buffer_seek);
+     VM_registerBuiltin(ctx, "buffer_tell", builtin_buffer_tell);
+     VM_registerBuiltin(ctx, "buffer_get_size", builtin_buffer_get_size);
+@@ -23840,6 +24189,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
+ 
+     // Sprite info
+     VM_registerBuiltin(ctx, "sprite_add", builtin_sprite_add);
++    VM_registerBuiltin(ctx, "screen_save_part", builtin_screen_save_part);
+     VM_registerBuiltin(ctx, "sprite_exists", builtin_sprite_exists);
+     VM_registerBuiltin(ctx, "sprite_get_width", builtin_sprite_get_width);
+     VM_registerBuiltin(ctx, "sprite_get_height", builtin_sprite_get_height);
+@@ -23997,6 +24347,8 @@ void VMBuiltins_registerAll(VMContext* ctx) {
+     VM_registerBuiltin(ctx, "layer_tile_visible", builtin_layer_tile_visible);
+ #if IS_WAD17_OR_HIGHER_ENABLED
+     VM_registerBuiltin(ctx, "layer_get_id_at_depth", builtin_layer_get_id_at_depth);
++    VM_registerBuiltin(ctx, "layer_tilemap_create", builtin_layer_tilemap_create);
++    VM_registerBuiltin(ctx, "layer_tilemap_exists", builtin_layer_tilemap_exists);
+     VM_registerBuiltin(ctx, "layer_tilemap_get_id", builtin_layer_tilemap_get_id);
+     VM_registerBuiltin(ctx, "draw_tile", builtin_draw_tile);
+     VM_registerBuiltin(ctx, "draw_tilemap", builtin_draw_tilemap);

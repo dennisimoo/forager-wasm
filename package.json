@@ -1,0 +1,18 @@
+{
+  "name": "forager-wasm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/serve.mjs",
+    "build:wasm": "bash scripts/build-wasm.sh",
+    "upload:game": "wrangler r2 object put forager-wasm-assets/assets/game.unx --file public/assets/game.unx --content-type application/octet-stream --remote",
+    "deploy": "wrangler deploy",
+    "check": "prettier --check public/index.html src/worker.js scripts/serve.mjs README.md wrangler.jsonc package.json",
+    "format": "prettier --write public/index.html src/worker.js scripts/serve.mjs README.md wrangler.jsonc package.json"
+  },
+  "devDependencies": {
+    "prettier": "3.9.9",
+    "wrangler": "4.149.0"
+  }
+}

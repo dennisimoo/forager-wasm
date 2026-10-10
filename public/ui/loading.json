@@ -1,0 +1,22 @@
+{
+  "version": "d15ee1c3c321de30e615cfb808d29618ef2721d05af76e8560a425aa1a720d8e",
+  "bytes": {
+    "butterscotch.wasm": 1836326,
+    "assets/game.unx": 81444192,
+    "assets/options.ini": 110,
+    "assets/icon.png": 5183,
+    "assets/audiogroup1.dat": 25142035,
+    "assets/data.txt": 9288,
+    "assets/local/french.json": 59535,
+    "assets/local/chinese.json": 51602,
+    "assets/local/german.json": 55096,
+    "assets/local/turkish.json": 55259,
+    "assets/local/russian.json": 76672,
+    "assets/local/english.json": 53562,
+    "assets/local/japanese.json": 60558,
+    "assets/local/spanish.json": 55533,
+    "assets/local/korean.json": 60089,
+    "assets/local/thai.json": 94052,
+    "assets/local/portuguese.json": 56573
+  }
+}
