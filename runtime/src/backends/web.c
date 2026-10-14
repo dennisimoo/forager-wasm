@@ -12,7 +12,8 @@
 
 enum {
     INPUTTYPE_KEY,
-    INPUTTYPE_MOUSE_BUTTON
+    INPUTTYPE_MOUSE_BUTTON,
+    INPUTTYPE_MOUSE_WHEEL
 } typedef InputType;
 
 struct {
@@ -175,6 +176,10 @@ void onMouseDown(int button) {
     arrput(gInputQueue, ((InputEntry) { INPUTTYPE_MOUSE_BUTTON, button, true }));
 }
 
+void onMouseWheel(double yoffset) {
+    if (yoffset != 0) arrput(gInputQueue, ((InputEntry) { INPUTTYPE_MOUSE_WHEEL, yoffset > 0 ? 1 : -1, false }));
+}
+
 void onMouseMove(double x, double y) {
     gMouseX = x;
     gMouseY = y;
@@ -245,6 +250,10 @@ bool platformHandleEvents(void) {
                 } else {
                     RunnerKeyboard_onKeyUp(gRunner->keyboard, entry.key);
                 }
+                break;
+            }
+            case INPUTTYPE_MOUSE_WHEEL: {
+                RunnerMouse_onWheel(gRunner->mouse, entry.key);
                 break;
             }
             case INPUTTYPE_MOUSE_BUTTON: {

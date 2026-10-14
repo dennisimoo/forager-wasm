@@ -1,0 +1,25 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 08776a5..fcac59a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -626 +626 @@ if(PLATFORM STREQUAL "cli" OR PLATFORM STREQUAL "vita" OR PLATFORM STREQUAL "swi
+-                "-sEXPORTED_FUNCTIONS=['_malloc', '_free', '_startRunner', '_mountOpfs', '_parseDataWin', '_getGameName', '_getGameDisplayName', '_freeDataWin', '_onKeyDown', '_onKeyUp', '_onMouseDown', '_onMouseUp', '_onMouseMove', '_requestRunnerExit', '_getRunnerFrameCount', '_getRunnerRoomIndex', '_dumpRunnerState', '_getRunnerCameraState']"
++                "-sEXPORTED_FUNCTIONS=['_malloc', '_free', '_startRunner', '_mountOpfs', '_parseDataWin', '_getGameName', '_getGameDisplayName', '_freeDataWin', '_onKeyDown', '_onKeyUp', '_onMouseDown', '_onMouseUp', '_onMouseMove', '_onMouseWheel', '_requestRunnerExit', '_getRunnerFrameCount', '_getRunnerRoomIndex', '_dumpRunnerState', '_getRunnerCameraState']"
+diff --git a/src/backends/web.c b/src/backends/web.c
+index 2b3411a..64ead29 100644
+--- a/src/backends/web.c
++++ b/src/backends/web.c
+@@ -15 +15,2 @@ enum {
+-    INPUTTYPE_MOUSE_BUTTON
++    INPUTTYPE_MOUSE_BUTTON,
++    INPUTTYPE_MOUSE_WHEEL
+@@ -177,0 +179,4 @@ void onMouseDown(int button) {
++void onMouseWheel(double yoffset) {
++    if (yoffset != 0) arrput(gInputQueue, ((InputEntry) { INPUTTYPE_MOUSE_WHEEL, yoffset > 0 ? 1 : -1, false }));
++}
++
+@@ -249,0 +255,4 @@ bool platformHandleEvents(void) {
++            case INPUTTYPE_MOUSE_WHEEL: {
++                RunnerMouse_onWheel(gRunner->mouse, entry.key);
++                break;
++            }
