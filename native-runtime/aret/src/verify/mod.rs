@@ -1,0 +1,173 @@
+//! Verification harness (roadmap §8): the closed loop that makes ARET
+//! *measurable*. This first level implements §8.2 level 1 — **recompilability**:
+//! emit C for each function, compile it with a real C compiler, and report the
+//! fraction that recompiles. That fraction is the first form of the north-star
+//! metric (§0.3); higher levels (differential execution, SMT equivalence) build
+//! on this harness.
+//!
+//! Compilation is done by piping the emitted C to `cc -x c - -c` (no temp files
+//! or linking needed), so a function with undefined callees still compiles via
+//! forward declarations.
+
+use crate::analysis::Function;
+use crate::emit;
+use crate::ir;
+use crate::loader::Program;
+use crate::ssa;
+use std::fmt::Write as _;
+use std::io::Write as _;
+use std::process::{Command, Stdio};
+
+pub struct Report {
+    pub total: usize,
+    pub compiled: usize,
+    /// (function name, first compiler error line) for a sample of failures.
+    pub failures: Vec<(String, String)>,
+    pub cc: String,
+}
+
+impl Report {
+    pub fn render(&self) -> String {
+        let mut s = String::new();
+        let pct = if self.total == 0 {
+            0.0
+        } else {
+            100.0 * self.compiled as f64 / self.total as f64
+        };
+        let _ = writeln!(s, "ARET verification — recompilability (level 1)");
+        let _ = writeln!(s, "  compiler:   {}", self.cc);
+        let _ = writeln!(
+            s,
+            "  recompiled: {}/{} functions ({:.1}%)",
+            self.compiled, self.total, pct
+        );
+        if !self.failures.is_empty() {
+            let _ = writeln!(s, "  sample failures:");
+            for (name, err) in self.failures.iter().take(10) {
+                let _ = writeln!(s, "    {}: {}", name, err);
+            }
+        }
+        s
+    }
+}
+
+/// Pick a C compiler: $CC, else cc, else gcc.
+fn pick_cc() -> String {
+    std::env::var("CC").unwrap_or_else(|_| "cc".to_string())
+}
+
+/// Try to compile a C translation unit; returns the first error line on failure.
+fn try_compile(cc: &str, src: &str) -> Result<(), String> {
+    let mut child = match Command::new(cc)
+        // -fno-builtin: our recovered libc calls (e.g. `v = free()`) must not
+        // clash with the compiler's builtin prototypes.
+        .args(["-x", "c", "-", "-c", "-w", "-fno-builtin", "-o", "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return Err(format!("cannot run {}: {}", cc, e)),
+    };
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        if let Err(e) = stdin.write_all(src.as_bytes()) {
+            return Err(format!("write failed: {}", e));
+        }
+    } // stdin dropped here -> EOF
+    let out = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => return Err(format!("wait failed: {}", e)),
+    };
+    if out.status.success() {
+        Ok(())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let first = err
+            .lines()
+            .find(|l| l.contains("error"))
+            .or_else(|| err.lines().next())
+            .unwrap_or("unknown error")
+            .trim()
+            .to_string();
+        Err(first)
+    }
+}
+
+/// Run the recompilability check over `funcs` (capped at `limit`).
+/// Validate LLVM IR by piping it to `llvm-as`; returns the first error line on
+/// failure. This is the LLVM analogue of `try_compile` (recompilability for the
+/// LLVM backend instead of the C backend).
+fn try_llvm_as(ir: &str) -> Result<(), String> {
+    let mut child = match Command::new("llvm-as")
+        .args(["-", "-o", "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return Err(format!("cannot run llvm-as: {}", e)),
+    };
+    if let Err(e) = child.stdin.take().unwrap().write_all(ir.as_bytes()) {
+        return Err(format!("write failed: {}", e));
+    }
+    let out = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => return Err(format!("wait failed: {}", e)),
+    };
+    if out.status.success() {
+        Ok(())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(err
+            .lines()
+            .find(|l| l.contains("error"))
+            .or_else(|| err.lines().next())
+            .unwrap_or("unknown error")
+            .trim()
+            .to_string())
+    }
+}
+
+pub fn run(prog: &Program, funcs: &[&Function], limit: usize, backend: &str) -> Report {
+    use rayon::prelude::*;
+    let llvm = backend.eq_ignore_ascii_case("llvm");
+    let cc = if llvm { "llvm-as".to_string() } else { pick_cc() };
+    let slice = &funcs[..limit.min(funcs.len())];
+
+    // Each function is lowered and checked independently (separate subprocesses),
+    // so run them in parallel.
+    let results: Vec<Result<(), (String, String)>> = slice
+        .par_iter()
+        .map(|f| {
+            let mut irf = ir::build::build_ir(prog, f);
+            crate::opt::frame::promote_stack_slots(&mut irf);
+            ssa::to_ssa(&mut irf);
+            crate::opt::optimize(&mut irf);
+            if llvm {
+                let ir = emit::llvm::emit_unit(std::slice::from_ref(&irf));
+                try_llvm_as(&ir).map_err(|e| (f.name.clone(), e))
+            } else {
+                let src = emit::structured::emit_unit(std::slice::from_ref(&irf));
+                try_compile(&cc, &src).map_err(|e| (f.name.clone(), e))
+            }
+        })
+        .collect();
+
+    let total = results.len();
+    let compiled = results.iter().filter(|r| r.is_ok()).count();
+    let failures: Vec<(String, String)> = results
+        .into_iter()
+        .filter_map(|r| r.err())
+        .take(20)
+        .collect();
+
+    Report {
+        total,
+        compiled,
+        failures,
+        cc,
+    }
+}

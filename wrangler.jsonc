@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "forager-wasm",
+  "name": "forager-wasm-4-1-9",
   "main": "src/worker.js",
   "compatibility_date": "2026-10-09",
   "assets": {
@@ -11,7 +11,7 @@
   "r2_buckets": [
     {
       "binding": "GAME_ASSETS",
-      "bucket_name": "forager-wasm-assets",
+      "bucket_name": "forager-wasm-4-1-9-assets",
     },
   ],
 }

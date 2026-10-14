@@ -6,3 +6,6 @@ build/
 .dev.vars
 *.log
 .DS_Store
+
+public/native-build/diagnostic-O1.wasm
+public/web-game/data.win

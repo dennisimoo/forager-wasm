@@ -1,1 +1,4 @@
 /assets/game.unx
+
+/native-build/diagnostic-O1.wasm
+/web-game/data.win

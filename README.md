@@ -1,82 +1,62 @@
-# Forager WASM
+# Forager 4.1.9 WASM
 
 <p align="center"><img src="public/ui/logo.png" alt="Forager" width="380"></p>
 
-**[Play Forager](https://forager-wasm.4dennisk.workers.dev)**
+An experimental browser port of **Forager 4.1.9**, the newer version being worked on in this repository. Its native game code is translated into WebAssembly with [ARET](https://github.com/aciderix/Automatic-reverse-engineering-toolkit), with browser graphics, audio, input, and save storage.
 
-Run **Forager 2.0.0** in a browser using a modified [Butterscotch](https://github.com/ButterscotchRunner/Butterscotch) WebAssembly runner.
+**This build is laggy and unfinished.** Expect slow loading, stutters, high resource use, and bugs. It has not reached 60 FPS. The best local Classic-world measurement was about **16 FPS at 1920×1080** on a machine using software graphics. Performance on a hardware GPU has not been verified.
 
-The game starts automatically behind a blue loading screen with the original logo, a progress bar, and download percentage. No game installation is needed on the player's computer.
+This branch, `codex/forager-4.1.9`, contains the newer build. [`main`](https://github.com/dennisimoo/forager-wasm/tree/main) keeps the older **2.0.0** port and its [existing playable site](https://forager-wasm.4dennisk.workers.dev).
+
+## What works so far
+
+- Intro, main menu, and Classic-world startup.
+- Movement, harvesting berries and stone, collecting drops, and visible inventory counts.
+- Placing a furnace.
+- Reloading the same saved world, position, XP, and inventory after a complete browser restart.
+- Fullscreen, native 1920×1080 output, and cached game downloads.
+- Audio scheduling without gaps in the captured test. Sound quality on player hardware still needs checking.
+
+Completing crafting recipes, skills, island expansion, and later progression have not been verified. Online networking is disabled. Some native timing features are unsupported, and other compatibility bugs may remain. These checks do not prove the full game works.
 
 ## Run locally
 
-Requires Node.js 22 or newer. The game data and compiled WASM runner are included.
+Requires Node.js 22 or newer and a current Chrome browser with WebAssembly JSPI and WebGL 2 support.
 
 ```sh
-git clone https://github.com/dennisimoo/forager-wasm.git
+git clone --branch codex/forager-4.1.9 https://github.com/dennisimoo/forager-wasm.git
 cd forager-wasm
 npm ci
 npm run dev
 ```
 
-Open **http://localhost:8767** in current Chrome or Firefox. The server supplies the isolation headers required by the runner; opening the HTML file directly will not work.
+Open **http://localhost:8767**. The game starts automatically. Click or press a key to enable audio. Use WASD to move, the left mouse button to harvest or interact, and Esc for the inventory/menu. The bottom-right button toggles fullscreen.
 
-| Action               | Control           |
-| -------------------- | ----------------- |
-| Move                 | WASD              |
-| Harvest and interact | Left mouse button |
-| Inventory and menu   | Esc               |
+The compiled WASM module and game data are included as compressed files in `artifacts/`. Starting the server unpacks them and checks their hashes. No game compilation is needed to run this build.
 
-Downloaded game files are cached in the browser and reused on reload. Rebuilding the runner refreshes the cache version automatically.
+Downloads are cached and reused on the same site. Saves stay in that browser's storage for that origin. Clearing site data, using private browsing, or changing the hostname can remove or separate saves. Saves from the older port are not verified as compatible with this version.
 
-Saves stay in the browser's storage for that site. Changing domains, clearing site data, or using a different browser gives you separate saves.
+## Deploy this branch
 
-## Deploy to Cloudflare
-
-The Worker serves the launcher and WASM runner. R2 stores `assets/game.unx`, which exceeds Cloudflare's 25 MiB static-file limit. The complete file is also included in this GitHub repository.
-
-Sign into a Cloudflare account with R2 enabled, then run:
+This branch uses a separate Worker, **`forager-wasm-4-1-9`**, and a separate R2 bucket. It does not replace the older site's Worker.
 
 ```sh
 npx wrangler login
-npx wrangler r2 bucket create forager-wasm-assets
+npx wrangler r2 bucket create forager-wasm-4-1-9-assets
 npm run upload:game
 npm run deploy
 ```
 
-Wrangler prints the permanent `workers.dev` URL. Share that URL; the local server and temporary tunnel are no longer needed. You can attach a custom domain in Cloudflare afterward.
+R2 serves the WASM module and `data.win`, which exceed Cloudflare's static-file size limit. The Worker serves the remaining files and required isolation headers through the same origin. Upload the two large files again whenever their contents change, then deploy the updated launcher and cache manifest.
 
-For later updates, run `npm run deploy`. Run `npm run upload:game` again only when the game data changes. Keep the same hostname to preserve players' browser saves.
+Pushing this branch does not deploy the site. Share the URL printed by Wrangler after deployment.
 
-## What is included
+## Source and verification
 
-```text
-public/       Launcher, compiled WASM, original game assets
-src/          Cloudflare Worker
-scripts/      Local server and WASM build script
-runtime/      Complete modified Butterscotch source
-patches/      Runtime changes against the upstream base commit
-```
+`public/` contains the browser runtime, shader translations, game assets, and vendored WASI shim. `native-runtime/aret/` contains the modified translator and native runtime source; `native-runtime/aret-base.txt` records the upstream base commit. The changes to tracked upstream files are also in `patches/aret-forager.patch`.
 
-The Worker streams the large game file from R2 and serves all files through the same origin with `COOP`, `COEP`, and `CORP` headers.
+The precompiled module contains 168 optimized native code chunks. Regenerating it requires the original executable, Emscripten, and the translation/build pipeline; this branch is packaged for running the current build, not as a one-command native rebuild.
 
-## Rebuild the runner
+`verification/` contains the completion audit, native API checks, audio measurements, performance comparison, and inventory/building screenshots. Full playability and 60 FPS remain incomplete.
 
-The checked-in build uses **Emscripten 6.0.12**. Install that version with [emsdk](https://github.com/emscripten-core/emsdk), activate its environment, then run:
-
-```sh
-source /path/to/emsdk/emsdk_env.sh
-npm run build:wasm
-```
-
-This compiles `runtime/`, updates the files in `public/`, and refreshes the loading-size manifest. No decompilation step is needed: the runner executes the original GameMaker VM bytecode.
-
-## Status
-
-This is a community test build. Browser checks confirmed fresh Classic-game startup, movement, harvesting, inventory, audio output, saved-slot thumbnails, and persistent save/reload. Runtime fixes also address recipe lists and HUD text alignment. Full building/crafting progression and every late-game feature have not been verified. Actual Chromebook and MacBook hardware testing remains outstanding.
-
-## Credits
-
-Forager belongs to its original creators. Game assets retain their original rights.
-
-The modified Butterscotch runner and launcher/hosting code use **GNU AGPL v3**. See [LICENSE](LICENSE) and [third-party notices](THIRD_PARTY_NOTICES.md). Complete runner source is included in `runtime/`.
+Forager and its game assets belong to their original creators. Dependency notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The older Butterscotch source remains in `runtime/` from main.

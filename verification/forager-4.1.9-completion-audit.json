@@ -1,0 +1,117 @@
+{
+  "observed_at": "2026-10-13T07:42:34.571058+00:00",
+  "achieved": false,
+  "goal_scope": "Fully playable original Forager 4.1.9 browser build",
+  "frames": 5402,
+  "blocker": "Actual 1080p world rendering remains below 60 FPS on the software-GPU host. Crafting, later progression, and performance on user hardware remain unverified.",
+  "requirements": [
+    {
+      "requirement": "browser WebAssembly without Wine or whole-system emulation",
+      "status": "verified",
+      "evidence": "Original native translation reaches Classic world without Wine. Current compiler/build/link provenance is captured."
+    },
+    {
+      "requirement": "startup",
+      "status": "verified",
+      "evidence": "Fresh native runs reach menu and Classic room8 without the old compression callback failure."
+    },
+    {
+      "requirement": "rendering",
+      "status": "partial",
+      "evidence": "Original 1920x1080 world renders correctly. Trace samples: primary SwiftShader5.596FPS, Mesa Vulkan llvmpipe11.796FPS; both software renderers. Neither establishes60FPS. Original GPU shaders and native controls preserved."
+    },
+    {
+      "requirement": "input",
+      "status": "partial",
+      "evidence": "Native keyboard/mouse controls reach Classic world and inventory; all gameplay controls are not verified."
+    },
+    {
+      "requirement": "harvesting",
+      "status": "verified",
+      "evidence": "Original Classic world harvested a berry bush and gray stone rock and produced item drops and XP. Evidence: forager-full-stone-destroyed-after.png."
+    },
+    {
+      "requirement": "inventory",
+      "status": "verified",
+      "evidence": "Actual collected inventory displays berry4 and stone4. Both item counts survived a full browser restart. Evidence: forager-collected-inventory.png and forager-restored-inventory.png."
+    },
+    {
+      "requirement": "crafting",
+      "status": "unverified",
+      "evidence": "No end-to-end Forager 4.1.9 gameplay proof; old 2.0 verification does not establish this requirement"
+    },
+    {
+      "requirement": "progression",
+      "status": "partial",
+      "evidence": "Actual harvesting increased XP from0 to13. Level-up, skills, new islands and late-game progression unverified."
+    },
+    {
+      "requirement": "audio",
+      "status": "partial",
+      "evidence": "Actual native game PCM captured for10.07seconds,75chunks,44100Hz stereo,zero scheduled gaps,nonzero samples,no clipping. Evidence: forager-actual-game-audio-analysis.json and WAV. User hardware listening quality unverified."
+    },
+    {
+      "requirement": "persistent saves",
+      "status": "verified",
+      "evidence": "The native executable working directory maps to the same durable save tree as AppData. The original native game reloaded its Classic world, position, XP5/80 and berry4/stone4 after browser process restart. OPFS checkpoint6294bytes, native Data.cin2264bytes and zone869bytes. Progress since the original autosave is not guaranteed on abrupt close."
+    }
+  ],
+  "gap_inventory": "forager-browser-compatibility-gap-inventory.json",
+  "native_build": {
+    "optimized_chunks": 168,
+    "wasm_sha256": "330b40f9b110dc5ac8c968d7e6c73c0e7bcdfd31386eea5529da5a40872dcc91",
+    "wasm_bytes": 217941111,
+    "browser_native_probes": "forager-full-native-probes.json"
+  },
+  "public_url": "https://hall-tops-spiritual-gis.trycloudflare.com/diagnostic.html",
+  "time_window": "forager-two-hour-work-window.json",
+  "software_gpu_samples": [
+    {
+      "backend": "SwiftShader, GPU compositor",
+      "fps": 5.596026820960454,
+      "seconds": 10.0071,
+      "native_resolution": [
+        1920,
+        1080
+      ]
+    },
+    {
+      "backend": "Mesa llvmpipe, Vulkan readback compositor",
+      "fps": 11.795517703293841,
+      "seconds": 10.0038,
+      "native_resolution": [
+        1920,
+        1080
+      ]
+    },
+    {
+      "backend": "Mesa llvmpipe, OpenGL GPU compositor",
+      "fps": 14.8944890390733,
+      "seconds": 10.0037,
+      "native_resolution": [
+        1920,
+        1080
+      ]
+    }
+  ],
+  "async_frame_experiment": {
+    "retained": false,
+    "original_fps": 15.892689362902537,
+    "asynchronous_fps": 15.98098263065999,
+    "restored_fps": 16.07877601567847,
+    "reason": "Bounded asynchronous GPU fence removed the synchronous completion wait without improving actual frame rate. Original presentation restored."
+  },
+  "building": {
+    "status": "verified",
+    "evidence": "Actual furnace instance placed and visible in Classic world; forager-furnace-placed-world.png."
+  },
+  "services": {
+    "server": "forager-browser-server.service",
+    "tunnel": "forager-cloudflared.service",
+    "url": "https://hall-tops-spiritual-gis.trycloudflare.com/diagnostic.html",
+    "http_status": 200
+  },
+  "ui_fix": "Fullscreen control shifted108CSSpixels from right edge to avoid covering the original native toolbar menu.",
+  "finished_at": "2026-10-13T07:46:09.594192+00:00",
+  "time_limit_reached": true
+}

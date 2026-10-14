@@ -1,0 +1,3277 @@
+diff --git a/runtime/aret_hle/aret_crt.c b/runtime/aret_hle/aret_crt.c
+index b3bf316..2935fa8 100644
+--- a/runtime/aret_hle/aret_crt.c
++++ b/runtime/aret_hle/aret_crt.c
+@@ -127,22 +127,60 @@ uint32_t aret_rand(uint32_t esp)   { (void)esp; aret_rand_seed = aret_rand_seed
+ uint32_t aret_srand(uint32_t esp)  { aret_rand_seed = AU(0); return 0; }
+ /* _controlfp(new, mask) -> the (new) control word. The msvcrt FP control word in its
+  * platform-independent encoding; the process default is 0x0008001f (all exceptions
+- * masked, 53-bit precision, round-to-nearest) — measured from Wine. Stateful: set
++ * masked, extended precision, round-to-nearest) — measured from Wine. Stateful: set
+  * updates (cur & ~mask)|(new & mask) and returns it; a query (mask 0) returns the
+  * current word. Matches Wine's observable values. (The actual FP rounding ARET uses
+- * is the host default; a program that SETS a non-default rounding and relies on it is
+- * the same bounded x87 limitation as a custom fldcw — rare.) */
++ * is the host default for arithmetic; SSE integer conversions observe the shared
++ * MXCSR rounding/exception masks below. Custom x87 arithmetic remains bounded.) */
+ static uint32_t aret_fp_cw = 0x0008001fu;
++extern uint32_t __aret_mxcsr;
++extern unsigned short __x87rt_cw;
++extern int __x87rt_rc;
++static void aret_fp_update_sse(uint32_t mask) {
++    uint32_t rounding_mask = (mask & 0x300u) << 5;
++    unsigned x87_rounding_mask=(mask&0x300u)<<2;
++    __x87rt_cw=(__x87rt_cw&~x87_rounding_mask)|((aret_fp_cw&mask&0x300u)<<2);
++    __x87rt_rc=(__x87rt_cw>>10)&3;
++    if(mask&0x30000u){unsigned precision=(aret_fp_cw&0x30000u)==0x10000u?2:(aret_fp_cw&0x30000u)==0x20000u?0:3;__x87rt_cw=(__x87rt_cw&~0x300u)|(precision<<8);}
++    __aret_mxcsr = (__aret_mxcsr & ~rounding_mask) | ((aret_fp_cw & mask & 0x300u) << 5);
++    static const uint32_t exception_bits[6] = { 0x10u, 0x80000u, 0x8u, 0x4u, 0x2u, 0x1u };
++    for (unsigned i = 0; i < 6; i++) {
++        if (mask & exception_bits[i]) {
++            uint32_t bit = 1u << (i + 7);
++            __x87rt_cw=(__x87rt_cw&~(1u<<i))|((aret_fp_cw&exception_bits[i])?(1u<<i):0);
++            __aret_mxcsr = (__aret_mxcsr & ~bit) | ((aret_fp_cw & exception_bits[i]) ? bit : 0);
++        }
++    }
++}
++
++/* FLDCW/FLDENV and translated CRT code also write the physical x87 state. */
++static void aret_fp_refresh_x87(void) {
++    uint32_t word=(uint32_t)(__x87rt_cw&0xc00u)>>2;
++    static const uint32_t masks[6]={0x10u,0x80000u,8u,4u,2u,1u};
++    for(unsigned i=0;i<6;i++)if(__x87rt_cw&(1u<<i))word|=masks[i];
++    unsigned precision=(__x87rt_cw>>8)&3;
++    if(precision==2)word|=0x10000u;else if(precision==0)word|=0x20000u;
++    aret_fp_cw=(aret_fp_cw&~0xb031fu)|word;
++}
++
++#ifdef __wasm__
++uint32_t aret_browser_fp_control_get(void) { aret_fp_refresh_x87();return aret_fp_cw; }
++void aret_browser_fp_control_set(uint32_t value) { aret_fp_cw=value;aret_fp_update_sse(0xb031fu); }
++#endif
+ uint32_t aret_controlfp(uint32_t esp) {
++    aret_fp_refresh_x87();
+     uint32_t neu = AU(0), mask = AU(1);
+     aret_fp_cw = (aret_fp_cw & ~mask) | (neu & mask);
++    aret_fp_update_sse(mask);
+     return aret_fp_cw;
+ }
+ /* _controlfp_s(&cur, new, mask): the secure form — writes the control word through
+  * the first arg (if non-NULL) and returns 0 (success). */
+ uint32_t aret_controlfp_s(uint32_t esp) {
++    aret_fp_refresh_x87();
+     uint32_t out = AU(0), neu = AU(1), mask = AU(2);
+     aret_fp_cw = (aret_fp_cw & ~mask) | (neu & mask);
++    aret_fp_update_sse(mask);
+     if (out) *(uint32_t *)(uintptr_t)out = aret_fp_cw;
+     return 0;
+ }
+@@ -722,7 +760,22 @@ uint32_t aret_time(uint32_t esp) {
+     if (AU(0)) *(int32_t *)AP(0) = t;   /* optional time_t* out-param */
+     return (uint32_t)t;
+ }
+-uint32_t aret_clock(uint32_t esp) { (void)esp; return (uint32_t)clock(); }
++/* MSVCRT clock() measures elapsed wall time since CRT initialization, in
++ * milliseconds, rather than the host libc's CPU-time ticks. */
++static struct timespec aret_clock_epoch;
++static int aret_clock_ready;
++__attribute__((constructor)) static void aret_clock_init(void) {
++    aret_clock_ready = clock_gettime(CLOCK_MONOTONIC, &aret_clock_epoch) == 0;
++}
++uint32_t aret_clock(uint32_t esp) {
++    (void)esp;
++    struct timespec now;
++    if (!aret_clock_ready || clock_gettime(CLOCK_MONOTONIC, &now) != 0) return (uint32_t)-1;
++    int64_t ns = (int64_t)(now.tv_sec - aret_clock_epoch.tv_sec) * 1000000000
++        + now.tv_nsec - aret_clock_epoch.tv_nsec;
++    int64_t ms = ns / 1000000;
++    return ms < 0 || ms > INT32_MAX ? (uint32_t)-1 : (uint32_t)ms;
++}
+ 
+ /* localeconv: both msvcrt and glibc put `char *decimal_point` first in `struct
+  * lconv`, which is all number formatting (Lua's lua_number2str) reads. Forward to
+diff --git a/runtime/aret_hle/aret_hle.c b/runtime/aret_hle/aret_hle.c
+index 723c9ae..33ef43f 100644
+--- a/runtime/aret_hle/aret_hle.c
++++ b/runtime/aret_hle/aret_hle.c
+@@ -173,14 +173,22 @@ uint32_t aret_ReadConsoleA(uint32_t esp) {
+ 
+ uint32_t aret_GetLastError(uint32_t esp) { (void)esp; return g_last_error; }
+ uint32_t aret_SetLastError(uint32_t esp) { g_last_error = arg(esp, 0); return 0; }
++#ifdef __wasm__
++__attribute__((import_module("forager_browser"), import_name("graphics_call")))
++extern uint32_t aret_browser_graphics_call(uint32_t method, uint32_t esp);
++#endif
+ 
+ uint32_t aret_Sleep(uint32_t esp) {
++#ifdef __wasm__
++    return aret_browser_graphics_call(0x40005u, esp);
++#else
+     /* With cooperative threads live, Sleep blocks on the deterministic virtual clock
+      * (letting other fibers run); aret_fiber_sleep returns 0 when no threads exist,
+      * so a single-threaded program keeps the exact real usleep it had before. */
+     uint32_t ms = arg(esp, 0);
+     if (!aret_fiber_sleep(ms)) usleep((useconds_t)ms * 1000u);
+     return 0;
++#endif
+ }
+ 
+ uint32_t aret_GetCurrentProcessId(uint32_t esp) { (void)esp; return (uint32_t)getpid(); }
+@@ -458,6 +466,11 @@ static void free_dynfile(uint32_t file) {
+ #define ARET_NPOPEN 32
+ static struct { uint32_t file; FILE *host; } aret_popen_tab[ARET_NPOPEN];
+ uint32_t aret_popen(uint32_t esp) {
++#ifdef __wasm__
++    (void)esp;
++    aret_unmodelled("popen: WebAssembly cannot launch a host subprocess");
++    return 0;
++#else
+     const char *cmd = (const char *)(uintptr_t)arg(esp, 0);
+     const char *mode = (const char *)(uintptr_t)arg(esp, 1);
+     if (!cmd) return 0;
+@@ -469,8 +482,14 @@ uint32_t aret_popen(uint32_t esp) {
+     for (int i = 0; i < ARET_NPOPEN; i++)
+         if (!aret_popen_tab[i].host) { aret_popen_tab[i].file = f; aret_popen_tab[i].host = hf; break; }
+     return f;
++#endif
+ }
+ uint32_t aret_pclose(uint32_t esp) {
++#ifdef __wasm__
++    (void)esp;
++    aret_unmodelled("pclose: WebAssembly cannot reap a host subprocess");
++    return (uint32_t)-1;
++#else
+     uint32_t file = arg(esp, 0);
+     for (int i = 0; i < ARET_NPOPEN; i++) {
+         if (aret_popen_tab[i].host && aret_popen_tab[i].file == file) {
+@@ -482,6 +501,7 @@ uint32_t aret_pclose(uint32_t esp) {
+         }
+     }
+     return (uint32_t)-1;                          /* not one of ours */
++#endif
+ }
+ /* (system() lives in aret_crt.c — it forwards to the host shell too.) */
+ /* _pipe(int fds[2], unsigned size, int textmode) -> 0 / -1. Real anonymous pipe. */
+@@ -1112,7 +1132,19 @@ uint32_t aret_freopen(uint32_t esp) {
+ uint32_t aret_tmpfile(uint32_t esp) {
+     (void)esp;
+     char tmpl[] = "/tmp/aretXXXXXX";
++#ifdef __wasm__
++    int fd = -1;
++    static const char alphabet[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
++    for (int attempt = 0; attempt < 32; attempt++) {
++        unsigned char random[6];
++        if (getentropy(random, sizeof random) != 0) return 0;
++        for (int i = 0; i < 6; i++) tmpl[9 + i] = alphabet[random[i] % 62];
++        fd = open(tmpl, O_RDWR | O_CREAT | O_EXCL, 0600);
++        if (fd >= 0 || errno != EEXIST) break;
++    }
++#else
+     int fd = mkstemp(tmpl);
++#endif
+     if (fd < 0) return 0;
+     unlink(tmpl);                                 /* anonymous: removed on close/exit */
+     uint32_t f = alloc_dynfile(fd);
+@@ -2052,10 +2084,12 @@ uint32_t aret_CloseHandle(uint32_t esp) {
+     }
+     return close((int)h) == 0 ? 1 : 0;
+ }
+-#else /* __wasm__: no file mapping; a HANDLE is always an fd. */
++#else /* __wasm__: file descriptors and browser-owned waitable handles. */
++extern uint32_t aret_browser_event_call(uint32_t method, uint32_t esp);
+ uint32_t aret_CloseHandle(uint32_t esp) {
+     uint32_t h = arg(esp, 0);
+-    if ((h & 0xFF000000u) == 0x70000000u) return 1;      /* thread handle: reference only */
++    if ((h & 0xFF000000u) == 0x6e000000u) return aret_browser_event_call(0x30007u, esp);
++    if ((h & 0xFF000000u) == 0x70000000u) return aret_browser_graphics_call(0x40004u, esp);
+     return close((int)h) == 0 ? 1 : 0;
+ }
+ #endif
+@@ -3222,10 +3256,15 @@ int __aret_x87_ret_valid;
+ /* The runtime x87 stack model (fallback for depth-bailed functions). ONE shared
+  * definition — it is the physical FPU stack, so a value one runtime-mode function
+  * leaves in st(0) is visible to its runtime-mode caller across chunk boundaries. */
++uint64_t __aret_sse_regs[32];
++uint32_t __aret_mxcsr = 0x1f80u;
+ long double __x87rt_s[16];
+ int __x87rt_p;
+ int __x87rt_rc;
+ unsigned short __x87rt_sw;
++unsigned short __x87rt_cw=0x37f,__x87rt_tags=0xffff,__x87rt_opcode,__x87rt_cs,__x87rt_ds;
++unsigned __x87rt_top;
++uint32_t __x87rt_ip,__x87rt_dp;
+ 
+ /* Runtime x87 stack under/overflow. The guard itself is old and SOUND (§0: an
+  * inconsistent stack traps rather than reading a stale slot); what was missing is
+@@ -3316,13 +3355,58 @@ uint32_t aret_GetProcAddress(uint32_t esp) {
+     if (name == 0 || (name >> 16) == 0) return 0;   /* NULL or ordinal -> not found (sound) */
+     return aret_shim_synth_va((const char *)(uintptr_t)name);
+ }
+-uint32_t aret_LoadLibraryA(uint32_t esp) { (void)esp; return 0x10000000u; }
+-/* LoadLibraryExA(name, hFile, flags): like LoadLibraryA, return a non-NULL fake
+- * handle. The msvcrt delay-load glue probes for kernel32.dll/etc.; a NULL here
+- * makes it fall back to a disk search that builds a path from a NULL name and
+- * crashes. The actual symbols are already intercepted as imports/shims. */
+-uint32_t aret_LoadLibraryExA(uint32_t esp) { (void)esp; return 0x10000000u; }
+-uint32_t aret_LoadLibraryExW(uint32_t esp) { (void)esp; return 0x10000000u; }
++uint32_t aret_load_library(const char *name) {
++#ifdef __wasm__
++    /* The browser cannot load a host DLL. These modules have HLE backends;
++     * others are available only when their exports were statically lifted.
++     * Keep the existing shared compatibility-module handle. */
++    static const char *const backends[] = {
++        "kernel32.dll", "kernelbase.dll", "ntdll.dll", "user32.dll",
++        "gdi32.dll", "gdiplus.dll", "advapi32.dll", "ole32.dll",
++        "oleaut32.dll", "shell32.dll", "shlwapi.dll", "msvcrt.dll",
++        "ucrtbase.dll", "winmm.dll", "ws2_32.dll", "version.dll",
++        "imm32.dll", "comctl32.dll", "comdlg32.dll", "bcrypt.dll",
++    };
++    if (!name || !*name) { g_last_error = 87u; return 0; }
++    const char *base = name;
++    for (const char *p = name; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;
++    char module[256]; size_t length = strlen(base);
++    if (!length || length + 5 >= sizeof module) { g_last_error = 126u; return 0; }
++    for (size_t i = 0; i <= length; i++) module[i] = (char)tolower((unsigned char)base[i]);
++    if (!strchr(module, '.')) strcat(module, ".dll");
++    for (size_t i = 0; i < sizeof backends / sizeof *backends; i++)
++        if (!strcmp(module, backends[i])) return 0x10000000u;
++    const char *dll, *fn; uint32_t va;
++    for (int i = 0; aret_lifted_export_iter(i, &dll, &fn, &va); i++) {
++        size_t j = 0;
++        while (module[j] && dll[j] && module[j] == (char)tolower((unsigned char)dll[j])) j++;
++        if (!module[j] && !dll[j]) return 0x10000000u;
++    }
++    g_last_error = 126u; /* ERROR_MOD_NOT_FOUND */
++    return 0;
++#else
++    (void)name; return 0x10000000u;
++#endif
++}
++uint32_t aret_load_library_wide(const uint16_t *name) {
++#ifdef __wasm__
++    if (!name) return aret_load_library(NULL);
++    const uint16_t *base = name;
++    for (const uint16_t *p = name; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;
++    char module[256]; size_t i = 0;
++    for (; base[i]; i++) {
++        if (i + 1 >= sizeof module || base[i] > 127) { g_last_error = 126u; return 0; }
++        module[i] = (char)base[i];
++    }
++    module[i] = 0;
++    return aret_load_library(module);
++#else
++    (void)name; return 0x10000000u;
++#endif
++}
++uint32_t aret_LoadLibraryA(uint32_t esp) { return aret_load_library((const char *)(uintptr_t)arg(esp, 0)); }
++uint32_t aret_LoadLibraryExA(uint32_t esp) { return aret_LoadLibraryA(esp); }
++uint32_t aret_LoadLibraryExW(uint32_t esp) { return aret_load_library_wide((const uint16_t *)(uintptr_t)arg(esp, 0)); }
+ uint32_t aret_FreeLibrary(uint32_t esp) { (void)esp; return 1; }
+ /* The process top-level unhandled-exception filter (SetUnhandledExceptionFilter
+  * installs it, UnhandledExceptionFilter runs it). Stateful: the setter returns the
+@@ -3475,6 +3559,35 @@ static const uint8_t *aret_find_versioninfo(void) {
+     }
+     return NULL;
+ }
++/* The browser filesystem has no Windows system DLLs. Report a real file
++ * lookup failure for an absent version-info source, allowing callers to use
++ * their own GetVersionEx path. Existing files need an external PE resource
++ * reader; do not substitute the main executable's version for another file. */
++static uint32_t aret_version_file_w(uint32_t esp) {
++    const uint16_t *wide = (const uint16_t *)(uintptr_t)arg(esp, 0);
++    if (!wide) { g_last_error = 87; return 0; }
++    char name[1024], path[2048]; size_t i = 0;
++    for (; wide[i] && i < sizeof(name)-1; i++) {
++        if (wide[i] > 127) aret_unmodelled("version info: non-ASCII file path");
++        name[i] = (char)wide[i];
++    }
++    if (wide[i]) { g_last_error = 206; return 0; }
++    name[i] = 0; translate_path(name, path, sizeof(path));
++    struct stat st;
++    if (stat(path, &st) != 0) {
++        g_last_error = errno == ENOTDIR ? 3 : errno == EACCES ? 5 : 2;
++        return 0;
++    }
++    aret_unmodelled("version info: external file resource reader");
++    return 0;
++}
++uint32_t aret_GetFileVersionInfoSizeW(uint32_t esp) {
++    if (arg(esp, 1)) *(uint32_t *)(uintptr_t)arg(esp, 1) = 0;
++    return aret_version_file_w(esp);
++}
++uint32_t aret_GetFileVersionInfoW(uint32_t esp) {
++    return aret_version_file_w(esp);
++}
+ uint32_t aret_GetFileVersionInfoSizeA(uint32_t esp) {
+     if (arg(esp, 1)) *(uint32_t *)(uintptr_t)arg(esp, 1) = 0; /* lpdwHandle */
+     const uint8_t *vi = aret_find_versioninfo();
+@@ -3945,6 +4058,11 @@ static uint8_t aret_teb[0x1000];
+ static uint8_t aret_peb[0x1000];
+ static uint8_t aret_procparams[0x400]; /* RTL_USER_PROCESS_PARAMETERS + slack */
+ static int aret_teb_ready = 0;
++#ifdef __wasm__
++static uint32_t aret_browser_fiber;
++static uint8_t *aret_browser_teb;
++uint32_t aret_browser_current_index(void) { return aret_browser_fiber; }
++#endif
+ 
+ /* The real shared-machine-stack bounds, published by the emitted entry
+  * (aret_main.c) before it runs the program. StackBase = highest address (top),
+@@ -3991,6 +4109,9 @@ static void aret_teb_init(void) {
+ 
+ uint32_t __aret_fs(void) {
+     aret_teb_init();
++#ifdef __wasm__
++    if (aret_browser_teb) return (uint32_t)(uintptr_t)aret_browser_teb;
++#endif
+     return (uint32_t)(uintptr_t)aret_teb;
+ }
+ 
+@@ -4359,7 +4480,7 @@ static uint32_t aret_seh_dispatch_search(uint32_t esp, uint32_t recp, uint32_t f
+      * — everything is 32-bit here (the recompiled program is -m32). MEASURED to be the
+      * same slot for v4, whose frame ALSO has an `xpointers` field at +20 that Wine leaves
+      * untouched — so the obvious-looking field is the wrong one. */
+-    static uint32_t xp[2];
++    uint32_t xp[2];
+     xp[0] = recp; xp[1] = ctxp /* ContextRecord */;
+     *(uint32_t *)(uintptr_t)(framep - 4) = (uint32_t)(uintptr_t)xp;
+     for (int lvl = (int)frame[3]; lvl != end; ) {
+@@ -5053,3 +5174,112 @@ __attribute__((constructor)) static void aret_hw_fault_install(void) {
+     sigaction(SIGFPE, &sa, NULL);
+ }
+ #endif /* !__wasm__ */
++
++#ifdef __wasm__
++/* The browser scheduler owns C-stack suspension. These snapshots own runtime
++ * state that otherwise lives in globals while one translated thread executes. */
++extern uint32_t aret_browser_fp_control_get(void);
++extern void aret_browser_fp_control_set(uint32_t value);
++struct aret_browser_context {
++    uint8_t *teb;
++    uint32_t last_error, fp_control, mxcsr;
++    int error_number;
++    uint64_t sse_regs[32];
++    long double x87_return, x87_stack[16];
++    int x87_valid, x87_depth, x87_round;
++    unsigned short x87_status,x87_control,x87_tags,x87_opcode,x87_cs,x87_ds;
++    unsigned x87_top; uint32_t x87_ip,x87_dp;
++    uint32_t seh_frame, seh_handler, seh_ebp;
++    int seh_cxx;
++    struct aret_gnu_frame gnu_frames[256];
++    int gnu_depth, gnu_rethrown;
++    uint32_t gnu_lp, gnu_obj, gnu_sel, gnu_ebp, gnu_esp;
++    uint32_t exc_obj, exc_type, exc_dtor, caught_base, caught_dtor;
++};
++static struct aret_browser_context *aret_browser_contexts[ARET_TLS_FIBERS];
++
++uint32_t aret_browser_context_create(uint32_t index, uint32_t stack_base, uint32_t stack_limit) {
++    if (!index || index >= ARET_TLS_FIBERS || aret_browser_contexts[index] || stack_base <= stack_limit)
++        aret_unmodelled("invalid browser thread context creation");
++    aret_teb_init();
++    struct aret_browser_context *context = calloc(1, sizeof *context);
++    uint8_t *teb = calloc(1, sizeof aret_teb);
++    if (!context || !teb) { free(context); free(teb); return 0; }
++    context->teb = teb;
++    context->fp_control = 0x0008001fu;
++    context->mxcsr = 0x1f80u;
++    context->x87_control=0x37f;context->x87_tags=0xffff;
++    uint32_t *t = (uint32_t *)teb;
++    t[0] = UINT32_MAX;
++    t[0x04 / 4] = stack_base;
++    t[0x08 / 4] = stack_limit;
++    t[0x18 / 4] = (uint32_t)(uintptr_t)teb;
++    t[0x20 / 4] = (uint32_t)getpid();
++    t[0x24 / 4] = (uint32_t)getpid() + index;
++    t[0x30 / 4] = (uint32_t)(uintptr_t)aret_peb;
++    memset(aret_tls[index], 0, sizeof aret_tls[index]);
++    aret_browser_contexts[index] = context;
++    return 1;
++}
++void aret_browser_context_save(uint32_t index) {
++    if (index >= ARET_TLS_FIBERS || index != aret_browser_fiber)
++        aret_unmodelled("saving inactive browser thread context");
++    struct aret_browser_context *c = aret_browser_contexts[index];
++    if (!c && !index) {
++        c = calloc(1, sizeof *c);
++        if (!c) aret_unmodelled("browser main context allocation failed");
++        c->teb = (uint8_t *)(uintptr_t)__aret_fs();
++        aret_browser_contexts[index] = c;
++    }
++    if (!c) aret_unmodelled("missing browser thread context");
++    c->last_error = g_last_error; c->error_number = errno;
++    c->fp_control = aret_browser_fp_control_get();
++    c->mxcsr = __aret_mxcsr;
++    c->x87_return = __aret_x87_ret; c->x87_valid = __aret_x87_ret_valid;
++    memcpy(c->sse_regs, __aret_sse_regs, sizeof c->sse_regs);
++    memcpy(c->x87_stack, __x87rt_s, sizeof c->x87_stack);
++    c->x87_depth = __x87rt_p; c->x87_round = __x87rt_rc; c->x87_status = __x87rt_sw;
++    c->x87_control=__x87rt_cw;c->x87_tags=__x87rt_tags;c->x87_opcode=__x87rt_opcode;c->x87_top=__x87rt_top;c->x87_ip=__x87rt_ip;c->x87_dp=__x87rt_dp;c->x87_cs=__x87rt_cs;c->x87_ds=__x87rt_ds;
++    c->seh_frame = g_seh_frame; c->seh_handler = g_seh_handler_va;
++    c->seh_ebp = g_seh_ebp; c->seh_cxx = g_seh_is_cxx;
++    memcpy(c->gnu_frames, g_gnu_eh, sizeof c->gnu_frames);
++    c->gnu_depth = g_gnu_eh_n; c->gnu_rethrown = g_gnu_rethrown;
++    c->gnu_lp = g_gnu_run_lp; c->gnu_obj = g_gnu_run_obj; c->gnu_sel = g_gnu_run_sel;
++    c->gnu_ebp = g_gnu_run_ebp; c->gnu_esp = g_gnu_run_esp;
++    c->exc_obj = g_gnu_exc_obj; c->exc_type = g_gnu_exc_tinfo; c->exc_dtor = g_gnu_cur_dtor;
++    c->caught_base = g_gnu_caught_base; c->caught_dtor = g_gnu_caught_dtor;
++}
++void aret_browser_context_restore(uint32_t index) {
++    if (index >= ARET_TLS_FIBERS || !aret_browser_contexts[index])
++        aret_unmodelled("restoring missing browser thread context");
++    struct aret_browser_context *c = aret_browser_contexts[index];
++    aret_browser_fiber = index; aret_browser_teb = c->teb;
++    g_last_error = c->last_error; errno = c->error_number;
++    aret_browser_fp_control_set(c->fp_control);
++    __aret_mxcsr = c->mxcsr;
++    __aret_x87_ret = c->x87_return; __aret_x87_ret_valid = c->x87_valid;
++    memcpy(__aret_sse_regs, c->sse_regs, sizeof c->sse_regs);
++    memcpy(__x87rt_s, c->x87_stack, sizeof c->x87_stack);
++    __x87rt_p = c->x87_depth; __x87rt_rc = c->x87_round; __x87rt_sw = c->x87_status;
++    __x87rt_cw=c->x87_control;__x87rt_tags=c->x87_tags;__x87rt_opcode=c->x87_opcode;__x87rt_top=c->x87_top;__x87rt_ip=c->x87_ip;__x87rt_dp=c->x87_dp;__x87rt_cs=c->x87_cs;__x87rt_ds=c->x87_ds;
++    g_seh_frame = c->seh_frame; g_seh_handler_va = c->seh_handler;
++    g_seh_ebp = c->seh_ebp; g_seh_is_cxx = c->seh_cxx;
++    memcpy(g_gnu_eh, c->gnu_frames, sizeof c->gnu_frames);
++    g_gnu_eh_n = c->gnu_depth; g_gnu_rethrown = c->gnu_rethrown;
++    g_gnu_run_lp = c->gnu_lp; g_gnu_run_obj = c->gnu_obj; g_gnu_run_sel = c->gnu_sel;
++    g_gnu_run_ebp = c->gnu_ebp; g_gnu_run_esp = c->gnu_esp;
++    g_gnu_exc_obj = c->exc_obj; g_gnu_exc_tinfo = c->exc_type; g_gnu_cur_dtor = c->exc_dtor;
++    g_gnu_caught_base = c->caught_base; g_gnu_caught_dtor = c->caught_dtor;
++}
++void aret_browser_context_destroy(uint32_t index) {
++    if (!index || index >= ARET_TLS_FIBERS || index == aret_browser_fiber || !aret_browser_contexts[index])
++        aret_unmodelled("destroying active or missing browser thread context");
++    free(aret_browser_contexts[index]->teb);
++    free(aret_browser_contexts[index]);
++    aret_browser_contexts[index] = NULL;
++    memset(aret_tls[index], 0, sizeof aret_tls[index]);
++}
++uint32_t aret_browser_thread_entry(uint32_t start, uint32_t esp) {
++    return (uint32_t)aret_call(start, esp, 0, 0, 0, 0, 0, 0, 0);
++}
++#endif
+diff --git a/runtime/aret_hle/aret_hle.h b/runtime/aret_hle/aret_hle.h
+index 15a3042..eda37ca 100644
+--- a/runtime/aret_hle/aret_hle.h
++++ b/runtime/aret_hle/aret_hle.h
+@@ -107,6 +107,9 @@ int aret_hle_shim_lookup(const char *fn, uint32_t (**shim)(uint32_t), uint16_t *
+ /* Resolve an API name to a callable synthetic VA routed to its HLE shim (GetProcAddress
+  * / delay-load share this). 0 if the API is not modelled. Defined in aret_win32.c. */
+ uint32_t aret_shim_synth_va(const char *fn);
++/* Load only a compatibility backend or a DLL already lifted into the image. */
++uint32_t aret_load_library(const char *name);
++uint32_t aret_load_library_wide(const uint16_t *name);
+ /* Also generated in aret_dispatch.c: the named exports of every LIFTED DLL, with the
+  * VA they were rebased to. DLL lifting binds what the app imports STATICALLY (the
+  * loader patches the IAT slot); this is the other direction — reaching lifted code by
+diff --git a/runtime/aret_hle/aret_win32.c b/runtime/aret_hle/aret_win32.c
+index 1c88848..9c3b1ee 100644
+--- a/runtime/aret_hle/aret_win32.c
++++ b/runtime/aret_hle/aret_win32.c
+@@ -32,9 +32,9 @@
+ #include <sys/statvfs.h>   /* no filesystem statvfs under wasm32-wasi */
+ #include <ucontext.h>      /* cooperative threads (fibers) — no ucontext in WASM */
+ #include <sys/resource.h>  /* getrusage — process/thread CPU times */
++#include <pwd.h>           /* host account database is unavailable in WASM */
+ #endif
+ #include <sys/ioctl.h>
+-#include <pwd.h>          /* GetUserName reads the passwd database, as Wine does */
+ #ifndef __wasm__
+ #include <sys/socket.h>   /* Winsock (ws2_32) maps to the host's real BSD sockets */
+ #include <netinet/in.h>
+@@ -160,7 +160,17 @@ uint32_t aret_SystemTimeToFileTime(uint32_t esp) {
+ /* ------------------------------------------------------------------ */
+ 
+ /* A stable non-zero thread id (single-threaded model: the process id serves). */
+-uint32_t aret_GetCurrentThreadId(uint32_t esp) { (void)esp; return (uint32_t)getpid(); }
++#ifdef __wasm__
++extern uint32_t aret_browser_current_index(void);
++#endif
++uint32_t aret_GetCurrentThreadId(uint32_t esp) {
++    (void)esp;
++#ifdef __wasm__
++    return (uint32_t)getpid() + aret_browser_current_index();
++#else
++    return (uint32_t)getpid();
++#endif
++}
+ 
+ uint32_t aret_GetEnvironmentVariableA(uint32_t esp) {
+     const char *name = WCS(0);
+@@ -1749,10 +1759,10 @@ static uint32_t u32_xlate_n(uint32_t src, uint32_t dst, uint32_t n, const uint8_
+     for (uint32_t i = 0; i < n; i++) d[i] = tab[s[i]];
+     return 1;
+ }
+-uint32_t aret_CharToOemA(uint32_t esp)  { return u32_xlate_z(WP(0), WP(1), u32_ansi_to_oem); }
+-uint32_t aret_OemToCharA(uint32_t esp)  { return u32_xlate_z(WP(0), WP(1), u32_oem_to_ansi); }
+-uint32_t aret_CharToOemBuffA(uint32_t esp) { return u32_xlate_n(WP(0), WP(1), WP(2), u32_ansi_to_oem); }
+-uint32_t aret_OemToCharBuffA(uint32_t esp) { return u32_xlate_n(WP(0), WP(1), WP(2), u32_oem_to_ansi); }
++uint32_t aret_CharToOemA(uint32_t esp)  { return u32_xlate_z(WU(0), WU(1), u32_ansi_to_oem); }
++uint32_t aret_OemToCharA(uint32_t esp)  { return u32_xlate_z(WU(0), WU(1), u32_oem_to_ansi); }
++uint32_t aret_CharToOemBuffA(uint32_t esp) { return u32_xlate_n(WU(0), WU(1), WU(2), u32_ansi_to_oem); }
++uint32_t aret_OemToCharBuffA(uint32_t esp) { return u32_xlate_n(WU(0), WU(1), WU(2), u32_oem_to_ansi); }
+ 
+ /* System error message table — the exact strings Wine's FormatMessage(FROM_SYSTEM)
+  * produces (extracted verbatim, our oracle), each ending ".\r\n". Covers the common
+@@ -2073,8 +2083,9 @@ uint32_t aret_MulDiv(uint32_t esp) {
+ uint32_t aret_GetUserDefaultLangID(uint32_t esp)       { (void)esp; return 0x0409; }
+ uint32_t aret_GetSystemDefaultLangID(uint32_t esp)     { (void)esp; return 0x0409; }
+ uint32_t aret_GetSystemDefaultUILanguage(uint32_t esp) { (void)esp; return 0x0409; }
+-/* LoadLibraryW — same non-NULL pseudo-module handle as LoadLibraryA. */
+-uint32_t aret_LoadLibraryW(uint32_t esp) { (void)esp; return 0x10000000u; }
++uint32_t aret_LoadLibraryW(uint32_t esp) {
++    return aret_load_library_wide((const uint16_t *)WP(0));
++}
+ /* SleepEx(ms, alertable) -> 0 (no APC/IO completion modelled). Yields like Sleep. */
+ uint32_t aret_SleepEx(uint32_t esp) {
+     uint32_t ms = WU(0);
+@@ -3208,39 +3219,101 @@ uint32_t aret_ReleaseSemaphore(uint32_t esp) {
+ /* Current fiber index (0 = main / no threads) — used by per-fiber TLS in aret_hle.c. */
+ int aret_current_fiber(void) { return g_cur; }
+ #else  /* __wasm__ : no ucontext. Threads are a sound abort, never a fake. */
++__attribute__((import_module("forager_browser"), import_name("graphics_call")))
++extern uint32_t aret_browser_graphics_call(uint32_t method, uint32_t esp);
++/* Networking is deliberately disabled in this browser build. The original
++ * game handles a failed session and remains responsible for its offline path. */
++uint32_t aret_InternetGetConnectedState(uint32_t esp) {
++    if (WU(1)) { g_last_error = 87; return 0; }
++    uint32_t flags = WU(0);
++    if (flags) *(uint32_t *)(uintptr_t)flags = 0x20; /* INTERNET_CONNECTION_OFFLINE */
++    return 0;
++}
++uint32_t aret_InternetOpenA(uint32_t esp) {
++    (void)esp;
++    g_last_error = 12026; /* ERROR_INTERNET_OFFLINE */
++    return 0;
++}
++
++/* High precision waitable timers are unavailable in this browser build.
++ * Creation fails; waits on the null handle follow existing WAIT_FAILED logic.
++ * The original engine subsequently polls its real performance counter. */
++uint32_t aret_CreateWaitableTimerW(uint32_t esp) {
++    (void)esp; g_last_error = 50; /* ERROR_NOT_SUPPORTED */
++    return 0;
++}
++uint32_t aret_SetWaitableTimer(uint32_t esp) {
++    if (WU(0)) aret_unmodelled("browser waitable timer: unknown non-null handle");
++    g_last_error = 6; /* ERROR_INVALID_HANDLE */
++    return 0;
++}
++
++/* Windows desktop composition timing is disabled; retain engine defaults. */
++uint32_t aret_DwmGetCompositionTimingInfo(uint32_t esp) {
++    (void)esp; return 0x80004001u; /* E_NOTIMPL */
++}
++
++uint32_t aret_browser_event_call(uint32_t method, uint32_t esp) {
++    uint32_t result = aret_browser_graphics_call(method, esp);
++    g_last_error = aret_browser_graphics_call(0x300ffu, 0);
++    return result;
++}
+ int aret_fiber_sleep(uint32_t ms) { (void)ms; return 0; }
+-int aret_current_fiber(void) { return 0; }
+-uint32_t aret_CreateEventA(uint32_t esp) { (void)esp; return 0x101; }
+-uint32_t aret_CreateEventW(uint32_t esp) { (void)esp; return 0x101; }
+-uint32_t aret_SetEvent(uint32_t esp) { (void)esp; return 1; }
+-uint32_t aret_ResetEvent(uint32_t esp) { (void)esp; return 1; }
+-uint32_t aret_CreateMutexA(uint32_t esp) { (void)esp; return 0x100; }
+-uint32_t aret_CreateMutexW(uint32_t esp) { (void)esp; return 0x100; }
+-uint32_t aret_OpenMutexA(uint32_t esp) { (void)esp; return 0x100; }
+-uint32_t aret_OpenMutexW(uint32_t esp) { (void)esp; return 0x100; }
+-uint32_t aret_ReleaseMutex(uint32_t esp) { (void)esp; return 1; }
+-uint32_t aret_CreateSemaphoreA(uint32_t esp) { (void)esp; return 0x102; }
+-uint32_t aret_CreateSemaphoreW(uint32_t esp) { (void)esp; return 0x102; }
+-uint32_t aret_OpenSemaphoreA(uint32_t esp) { (void)esp; return 0x102; }
+-uint32_t aret_OpenSemaphoreW(uint32_t esp) { (void)esp; return 0x102; }
+-uint32_t aret_ReleaseSemaphore(uint32_t esp) { (void)esp; return 1; }
++int aret_current_fiber(void) { return (int)aret_browser_current_index(); }
++uint32_t aret_CreateEventA(uint32_t esp) { return aret_browser_event_call(0x30000u, esp); }
++uint32_t aret_CreateEventW(uint32_t esp) { return aret_browser_event_call(0x30001u, esp); }
++uint32_t aret_CreateEventExA(uint32_t esp) { return aret_browser_event_call(0x30002u, esp); }
++uint32_t aret_CreateEventExW(uint32_t esp) { return aret_browser_event_call(0x30003u, esp); }
++uint32_t aret_SetEvent(uint32_t esp) { return aret_browser_event_call(0x30004u, esp); }
++uint32_t aret_ResetEvent(uint32_t esp) { return aret_browser_event_call(0x30005u, esp); }
++uint32_t aret_CreateMutexA(uint32_t esp) { (void)esp; aret_unmodelled("browser CreateMutexA"); return 0; }
++uint32_t aret_CreateMutexW(uint32_t esp) { (void)esp; aret_unmodelled("browser CreateMutexW"); return 0; }
++uint32_t aret_OpenMutexA(uint32_t esp) { (void)esp; aret_unmodelled("browser OpenMutexA"); return 0; }
++uint32_t aret_OpenMutexW(uint32_t esp) { (void)esp; aret_unmodelled("browser OpenMutexW"); return 0; }
++uint32_t aret_ReleaseMutex(uint32_t esp) { (void)esp; aret_unmodelled("browser ReleaseMutex"); return 0; }
++uint32_t aret_CreateSemaphoreA(uint32_t esp) { (void)esp; aret_unmodelled("browser CreateSemaphoreA"); return 0; }
++uint32_t aret_CreateSemaphoreW(uint32_t esp) { (void)esp; aret_unmodelled("browser CreateSemaphoreW"); return 0; }
++uint32_t aret_OpenSemaphoreA(uint32_t esp) { (void)esp; aret_unmodelled("browser OpenSemaphoreA"); return 0; }
++uint32_t aret_OpenSemaphoreW(uint32_t esp) { (void)esp; aret_unmodelled("browser OpenSemaphoreW"); return 0; }
++uint32_t aret_ReleaseSemaphore(uint32_t esp) { (void)esp; aret_unmodelled("browser ReleaseSemaphore"); return 0; }
+ uint32_t aret_beginthreadex(uint32_t esp) { (void)esp; aret_unmodelled("_beginthreadex: WASM has no ucontext"); return 0; }
+ uint32_t aret_beginthread(uint32_t esp) { (void)esp; aret_unmodelled("_beginthread: WASM has no ucontext"); return 0; }
+-/* No threads under WASM → CriticalSection is a correct no-op (never contended). */
+-uint32_t aret_InitializeCriticalSection(uint32_t esp) { (void)esp; return 0; }
+-uint32_t aret_InitializeCriticalSectionAndSpinCount(uint32_t esp) { (void)esp; return 1; }
+-uint32_t aret_InitializeCriticalSectionEx(uint32_t esp) { (void)esp; return 1; }
+-uint32_t aret_DeleteCriticalSection(uint32_t esp) { (void)esp; return 0; }
+-uint32_t aret_EnterCriticalSection(uint32_t esp) { (void)esp; return 0; }
+-uint32_t aret_TryEnterCriticalSection(uint32_t esp) { (void)esp; return 1; }
+-uint32_t aret_LeaveCriticalSection(uint32_t esp) { (void)esp; return 0; }
+-uint32_t aret_CreateThread(uint32_t esp) { (void)esp; aret_unmodelled("CreateThread: WASM has no ucontext (Asyncify pending)"); return 0; }
+-uint32_t aret_ResumeThread(uint32_t esp) { (void)esp; return (uint32_t)-1; }
++uint32_t aret_InitializeCriticalSection(uint32_t esp) { return aret_browser_graphics_call(0x40100u, esp); }
++uint32_t aret_InitializeCriticalSectionAndSpinCount(uint32_t esp) { return aret_browser_graphics_call(0x40101u, esp); }
++uint32_t aret_InitializeCriticalSectionEx(uint32_t esp) { return aret_browser_graphics_call(0x40102u, esp); }
++uint32_t aret_DeleteCriticalSection(uint32_t esp) { return aret_browser_graphics_call(0x40103u, esp); }
++uint32_t aret_EnterCriticalSection(uint32_t esp) { return aret_browser_graphics_call(0x40104u, esp); }
++uint32_t aret_TryEnterCriticalSection(uint32_t esp) { return aret_browser_graphics_call(0x40105u, esp); }
++uint32_t aret_LeaveCriticalSection(uint32_t esp) { return aret_browser_graphics_call(0x40106u, esp); }
++uint32_t aret_CreateThread(uint32_t esp) {
++    uint32_t handle = aret_browser_graphics_call(0x40000u, esp);
++    if (!handle) g_last_error = 8u;
++    return handle;
++}
++uint32_t aret_ResumeThread(uint32_t esp) { return aret_browser_graphics_call(0x40001u, esp); }
++uint32_t aret_SetThreadPriority(uint32_t esp) {
++    uint32_t result = aret_browser_graphics_call(0x40006u, esp);
++    if (!result) g_last_error = aret_browser_graphics_call(0x400ffu, 0);
++    return result;
++}
++uint32_t aret_GetThreadPriority(uint32_t esp) {
++    uint32_t result = aret_browser_graphics_call(0x40007u, esp);
++    if (result == 0x7fffffffu) g_last_error = aret_browser_graphics_call(0x400ffu, 0);
++    return result;
++}
+ uint32_t aret_SuspendThread(uint32_t esp) { (void)esp; return (uint32_t)-1; }
+-uint32_t aret_ExitThread(uint32_t esp) { return aret_ExitProcess(esp); }
+-uint32_t aret_GetExitCodeThread(uint32_t esp) { uint32_t *o = (uint32_t *)WP(1); if (o) *o = 0; return 0; }
+-uint32_t aret_WaitForSingleObject(uint32_t esp) { (void)esp; return 0; }
+-uint32_t aret_WaitForMultipleObjects(uint32_t esp) { (void)esp; return 0; }
++uint32_t aret_ExitThread(uint32_t esp) { return aret_browser_graphics_call(0x40002u, esp); }
++uint32_t aret_GetExitCodeThread(uint32_t esp) { return aret_browser_graphics_call(0x40003u, esp); }
++uint32_t aret_WaitForSingleObject(uint32_t esp) { return aret_browser_event_call(0x30006u, esp); }
++uint32_t aret_WaitForSingleObjectEx(uint32_t esp) {
++    if (WU(2)) aret_unmodelled("alertable browser event wait");
++    return aret_WaitForSingleObject(esp);
++}
++uint32_t aret_WaitForMultipleObjects(uint32_t esp) {
++    (void)esp;
++    aret_unmodelled("browser wait on multiple objects");
++    return UINT32_MAX;
++}
+ /* WASM has no fibers, so there are no thread/kernel-object handles to resolve: only
+  * host fds exist. DuplicateHandle degrades to dup() (the process pseudo-handle -1 has
+  * no fd; hand it back unchanged). */
+@@ -3403,6 +3476,48 @@ uint32_t aret_SysStringByteLen(uint32_t esp) {
+     return b ? *(uint32_t *)(uintptr_t)(b - 4) : 0;
+ }
+ 
++/* GDI+ startup/shutdown own initialization tokens. Image and drawing APIs
++ * remain separate implementations; this does not imply they are available. */
++struct u32_gdiplus_context {
++    struct u32_gdiplus_context *next;
++    uint32_t debug_callback, suppress_external_codecs;
++};
++static struct u32_gdiplus_context *g_u32_gdiplus_contexts;
++uint32_t aret_GdiplusStartup(uint32_t esp) {
++    uint32_t *token = (uint32_t *)WP(0);
++    const uint32_t *input = (const uint32_t *)WP(1);
++    if (!token || !input) return 2; /* InvalidParameter */
++    *token = 0;
++    if (input[0] != 1) return 17; /* UnsupportedGdiplusVersion */
++    if (input[2]) {
++        /* Notification hooks require an event integration that is not present. */
++        aret_unmodelled("GdiplusStartup: notification hooks");
++        return 0;
++    }
++    struct u32_gdiplus_context *ctx = malloc(sizeof(*ctx));
++    if (!ctx) return 3; /* OutOfMemory */
++    ctx->debug_callback = input[1];
++    ctx->suppress_external_codecs = input[3];
++    ctx->next = g_u32_gdiplus_contexts;
++    g_u32_gdiplus_contexts = ctx;
++    *token = (uint32_t)(uintptr_t)ctx;
++    return 0; /* Ok: initialization context exists; unknown APIs still abort. */
++}
++uint32_t aret_GdiplusShutdown(uint32_t esp) {
++    uint32_t token = WU(0);
++    struct u32_gdiplus_context **link = &g_u32_gdiplus_contexts;
++    while (*link) {
++        struct u32_gdiplus_context *ctx = *link;
++        if ((uint32_t)(uintptr_t)ctx == token) {
++            *link = ctx->next;
++            free(ctx);
++            return 0;
++        }
++        link = &ctx->next;
++    }
++    return 0; /* The public function is void. */
++}
++
+ /* ---- ole32 minimal (thin: init + task allocator, no object model) ----------
+  * CoInitialize(Ex) returns S_OK on the first init of a thread and S_FALSE (1) on
+  * a nested one — the contract callers check; CoUninitialize unwinds it. The task
+@@ -3810,8 +3925,17 @@ uint32_t aret_LoadStringA(uint32_t esp) {
+  * GetDiskFreeSpace), not a guess: display-dependent raw values are tested by
+  * invariant, never bit-compared to Wine (doc 72 §4.5). */
+ #define U32_DESKTOP  0x00010000u
+-#define U32_SCREEN_W 1024
+-#define U32_SCREEN_H 768
++static int u32_screen_w = 1024;
++static int u32_screen_h = 768;
++#define U32_SCREEN_W u32_screen_w
++#define U32_SCREEN_H u32_screen_h
++
++/* Configure the host display before creating any native windows. */
++void aret_browser_set_display(int width, int height) {
++    if (width <= 0 || height <= 0) return;
++    u32_screen_w = width;
++    u32_screen_h = height;
++}
+ 
+ #define U32_MAX_CLASSES 64
+ /* A registered window class. The full WNDCLASS(EX) fields are kept so GetClassInfo
+@@ -4007,6 +4131,8 @@ uint32_t aret_RegLoadMUIStringA(uint32_t esp) { (void)esp; return 2u; }
+ uint32_t aret_AllocConsole(uint32_t esp)  { (void)esp; return 1; }
+ uint32_t aret_AttachConsole(uint32_t esp) { (void)esp; g_last_error = 6u /*ERROR_INVALID_HANDLE*/; return 0; }
+ uint32_t aret_FreeConsole(uint32_t esp)   { (void)esp; return 1; }
++/* The headless console has streams but no window associated with this process. */
++uint32_t aret_GetConsoleWindow(uint32_t esp) { (void)esp; return 0; }
+ /* PeekConsoleInputW(h, buf, len, *numRead): no input pending -> 0 records read, TRUE. */
+ uint32_t aret_PeekConsoleInputW(uint32_t esp) { uint32_t *n = (uint32_t *)WP(3); if (n) *n = 0; return 1; }
+ uint32_t aret_PeekConsoleInputA(uint32_t esp) { return aret_PeekConsoleInputW(esp); }
+@@ -4408,6 +4534,39 @@ static void u32_fire_cbt_createwnd(uint32_t esp, int i, uint32_t hinst, uint32_t
+     free(cs);
+ }
+ 
++/* Input state belongs to the existing USER32 message queue. Physical state
++ * changes on delivery; GetKeyState changes when a message is removed. */
++static uint8_t u32_physical_keys[256], u32_queued_keys[256], u32_key_presses[256];
++static int32_t u32_cursor_x, u32_cursor_y;
++static uint8_t u32_key_value(const uint8_t *keys, unsigned vk) {
++    if (vk == 16) return keys[160] | keys[161];
++    if (vk == 17) return keys[162] | keys[163];
++    if (vk == 18) return keys[164] | keys[165];
++    return vk < 256 ? keys[vk] : 0;
++}
++static void u32_key_change(uint8_t *keys, unsigned vk, int down) {
++    if (vk >= 256) return;
++    unsigned toggle = keys[vk] & 1;
++    if (down && !(keys[vk] & 128) && (vk == 20 || vk == 144 || vk == 145)) toggle ^= 1;
++    keys[vk] = toggle | (down ? 128 : 0);
++}
++static void u32_consume_input(uint32_t msg, uint32_t vk, uint32_t lp) {
++    if (msg == 0x100 || msg == 0x101 || msg == 0x104 || msg == 0x105) {
++        if (vk == 16) vk = ((lp >> 16) & 255) == 54 ? 161 : 160;
++        else if (vk == 17) vk = (lp & 0x1000000) ? 163 : 162;
++        else if (vk == 18) vk = (lp & 0x1000000) ? 165 : 164;
++        u32_key_change(u32_queued_keys, vk, msg == 0x100 || msg == 0x104);
++    } else if (msg >= 0x201 && msg <= 0x208) {
++        unsigned button = msg <= 0x202 ? 1 : msg >= 0x204 && msg <= 0x205 ? 2 : msg >= 0x207 ? 4 : 0;
++        if (button) u32_key_change(u32_queued_keys, button, msg == 0x201 || msg == 0x204 || msg == 0x207);
++    }
++}
++static void u32_browser_input_pump(void) {
++#ifdef __wasm__
++    (void)aret_browser_graphics_call(0x40200u, 0);
++#endif
++}
++
+ static int  u32_q_empty(void) { return g_u32_qh == g_u32_qt; }
+ static int  u32_q_push(uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp) {
+     int nt = (g_u32_qt + 1) % U32_MAX_MSG;
+@@ -4415,7 +4574,7 @@ static int  u32_q_push(uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp) {
+     g_u32_q[g_u32_qt].hwnd = hwnd; g_u32_q[g_u32_qt].message = msg;
+     g_u32_q[g_u32_qt].wParam = wp; g_u32_q[g_u32_qt].lParam = lp;
+     g_u32_q[g_u32_qt].time = (uint32_t)(mono_ns() / 1000000ull);
+-    g_u32_q[g_u32_qt].ptx = 0; g_u32_q[g_u32_qt].pty = 0;
++    g_u32_q[g_u32_qt].ptx = u32_cursor_x; g_u32_q[g_u32_qt].pty = u32_cursor_y;
+     g_u32_qt = nt; return 1;
+ }
+ /* Copy the queue head into a guest MSG (7 dwords), optionally removing it. */
+@@ -4425,7 +4584,10 @@ static void u32_q_peek_copy(uint32_t *m, int remove) {
+         m[2] = g_u32_q[g_u32_qh].wParam; m[3] = g_u32_q[g_u32_qh].lParam;
+         m[4] = g_u32_q[g_u32_qh].time;   m[5] = g_u32_q[g_u32_qh].ptx; m[6] = g_u32_q[g_u32_qh].pty;
+     }
+-    if (remove) g_u32_qh = (g_u32_qh + 1) % U32_MAX_MSG;
++    if (remove) {
++        u32_consume_input(g_u32_q[g_u32_qh].message, g_u32_q[g_u32_qh].wParam, g_u32_q[g_u32_qh].lParam);
++        g_u32_qh = (g_u32_qh + 1) % U32_MAX_MSG;
++    }
+ }
+ static void u32_fill_quit(uint32_t *m) {
+     if (!m) return;
+@@ -4562,18 +4724,18 @@ static uint32_t u32_get_class_info(uint32_t cref, uint32_t out, uint32_t clsname
+ /* The A form widens a string class name into a temp so the shared wide registry
+  * lookup applies; an atom (< 0x10000) passes through unchanged. */
+ static uint32_t u32_get_class_info_a(uint32_t esp, int is_ex) {
+-    uint32_t cref = WP(1), out = WP(2);
++    uint32_t cref = WU(1), out = WU(2);
+     uint16_t wtmp[128];
+     if (cref >= 0x10000u) {
+         u32_a2w((const char *)(uintptr_t)cref, wtmp, 128);
+         cref = (uint32_t)(uintptr_t)wtmp;
+     }
+-    return u32_get_class_info(cref, out, WP(1), is_ex);
++    return u32_get_class_info(cref, out, WU(1), is_ex);
+ }
+ uint32_t aret_GetClassInfoA(uint32_t esp)   { return u32_get_class_info_a(esp, 0); }
+ uint32_t aret_GetClassInfoExA(uint32_t esp) { return u32_get_class_info_a(esp, 1); }
+-uint32_t aret_GetClassInfoW(uint32_t esp)   { return u32_get_class_info(WP(1), WP(2), WP(1), 0); }
+-uint32_t aret_GetClassInfoExW(uint32_t esp) { return u32_get_class_info(WP(1), WP(2), WP(1), 1); }
++uint32_t aret_GetClassInfoW(uint32_t esp)   { return u32_get_class_info(WU(1), WU(2), WU(1), 0); }
++uint32_t aret_GetClassInfoExW(uint32_t esp) { return u32_get_class_info(WU(1), WU(2), WU(1), 1); }
+ /* UnregisterClassW(lpClassName, hInstance) -> BOOL. */
+ uint32_t aret_UnregisterClassW(uint32_t esp) {
+     uint32_t cref = WU(0);
+@@ -4794,6 +4956,7 @@ uint32_t aret_DispatchMessageW(uint32_t esp) {
+ uint32_t aret_TranslateMessage(uint32_t esp) { (void)esp; return 0; }
+ /* PeekMessageW(lpMsg, hwnd, min, max, wRemoveMsg) -> BOOL. Non-blocking. */
+ uint32_t aret_PeekMessageW(uint32_t esp) {
++    u32_browser_input_pump();
+     uint32_t *m = (uint32_t *)WP(0);
+     uint32_t remove = WU(4);
+ #ifdef ARET_HAVE_SDL
+@@ -4948,6 +5111,7 @@ uint32_t aret_MoveWindow(uint32_t esp) {
+     g_u32_win[i].w = WI(3); g_u32_win[i].h = WI(4);
+     return 1;
+ }
++static uint32_t u32_activate_window(uint32_t esp, uint32_t hwnd);
+ /* ShowWindow(HWND, nCmdShow) -> BOOL (nonzero = was previously visible). SW_HIDE=0
+  * hides; any other command shows (minimise/maximise are still "visible" here). */
+ uint32_t aret_ShowWindow(uint32_t esp) {
+@@ -4955,6 +5119,11 @@ uint32_t aret_ShowWindow(uint32_t esp) {
+     if (i < 0) return 0;
+     int was = g_u32_win[i].visible;
+     g_u32_win[i].visible = (WU(1) == 0 /* SW_HIDE */) ? 0 : 1;
++    if (!g_u32_win[i].parent && !(g_u32_win[i].style & 0x40000000u /* WS_CHILD */)) {
++        unsigned command = WU(1);
++        if (command == 1 || command == 2 || command == 3 || command == 5 || command == 9 || command == 10)
++            u32_activate_window(esp, WU(0));
++    }
+     /* Becoming visible invalidates the whole window -> owes a WM_PAINT (erase). */
+     if (g_u32_win[i].visible && !was && g_u32_win[i].parent == 0
+         && !(g_u32_win[i].style & 0x40000000u /* WS_CHILD */)) {
+@@ -5012,7 +5181,9 @@ uint32_t aret_ReleaseCapture(uint32_t esp) { (void)esp; g_u32_capture = 0; retur
+  * uninitialised memory). */
+ uint32_t aret_GetCursorPos(uint32_t esp) {
+     int32_t *p = (int32_t *)WP(0);
+-    if (p) { p[0] = 0; p[1] = 0; }
++    u32_browser_input_pump();
++    if (!p) return 0;
++    p[0] = u32_cursor_x; p[1] = u32_cursor_y;
+     return 1;
+ }
+ /* GetProcessVersion(pid): the Windows version a process expects (major<<16|minor).
+@@ -6168,7 +6339,9 @@ uint32_t aret_StrCatChainW(uint32_t esp) {
+ uint32_t aret_GetThreadDesktop(uint32_t esp) {
+     uint32_t tid = WU(0);
+     if (tid == (uint32_t)getpid()) return U32_DESKTOP_H;      /* the main thread */
++#ifndef __wasm__
+     if (tid >= 0x1000u && tid < 0x1000u + (uint32_t)g_nfiber) return U32_DESKTOP_H;
++#endif
+     g_last_error = 87u;                                       /* ERROR_INVALID_PARAMETER */
+     return 0;
+ }
+@@ -6542,8 +6715,13 @@ uint32_t aret_GetProcessMemoryInfo(uint32_t esp) {
+     uint8_t *pmc = (uint8_t *)WP(1); uint32_t cb = WU(2);
+     if (!pmc || cb < 40) { g_last_error = 87u; return 0; }   /* ERROR_INVALID_PARAMETER */
+     long rss = 0;
++#ifdef __wasm__
++    /* The WASM process's committed address space is its linear memory. */
++    rss = (long)__builtin_wasm_memory_size(0) * 65536;
++#else
+     struct rusage ru;
+     if (getrusage(RUSAGE_SELF, &ru) == 0) rss = ru.ru_maxrss * 1024;   /* ru_maxrss is KB */
++#endif
+     memset(pmc, 0, cb);
+     uint32_t ws = (uint32_t)rss;
+     memcpy(pmc + 0, &cb, 4);                        /* cb (restore, memset cleared it) */
+@@ -8971,9 +9149,33 @@ static const struct { const char *dll, *fn; uint32_t (*shim)(uint32_t); uint16_t
+     { NULL, NULL, NULL, 0 }
+ };
+ #define DELAY_VA_BASE 0x7EDA0000u
+-#define DELAY_VA_MAX  256
+-static struct { uint32_t va; uint32_t (*shim)(uint32_t); uint16_t pop; } g_delay_res[DELAY_VA_MAX];
++#define DELAY_VA_MAX  512
++static struct { uint32_t va; uint32_t (*shim)(uint32_t); uint16_t pop; uint32_t browser_method; } g_delay_res[DELAY_VA_MAX];
+ static int g_delay_res_n;
++#ifdef __wasm__
++__attribute__((import_module("forager_browser"), import_name("graphics_call")))
++extern uint32_t aret_browser_graphics_call(uint32_t method, uint32_t esp);
++
++
++/* COM methods use the same callable-VA and stdcall owner as other HLE methods. */
++__attribute__((visibility("default")))
++uint32_t aret_browser_method_va(uint32_t method, uint32_t pop) {
++    if (!method || pop > UINT16_MAX) aret_unmodelled("invalid browser COM method");
++    for (int i = 0; i < g_delay_res_n; i++)
++        if (g_delay_res[i].browser_method == method && g_delay_res[i].pop == pop)
++            return g_delay_res[i].va;
++    if (g_delay_res_n >= DELAY_VA_MAX) aret_unmodelled("browser COM method table exhausted");
++    int i = g_delay_res_n++;
++    g_delay_res[i].va = DELAY_VA_BASE + (uint32_t)i;
++    g_delay_res[i].pop = (uint16_t)pop;
++    g_delay_res[i].browser_method = method;
++    return g_delay_res[i].va;
++}
++
++uint32_t aret_D3D11CreateDevice(uint32_t esp) {
++    return aret_browser_graphics_call(0x10000u, esp);
++}
++#endif
+ /* Resolve an API NAME to a callable synthetic VA routed to its HLE shim — the same
+  * mechanism the delay-load resolver uses (aret_call dispatches the VA through
+  * aret_delay_dispatch; __aret_callee_pop reads its pop from aret_delay_pop). Returns 0
+@@ -8997,7 +9199,15 @@ uint32_t aret_shim_synth_va(const char *fn) {
+ /* Dispatch a resolved delay VA (called by aret_call on a static-table miss). */
+ int aret_delay_dispatch(uint32_t va, uint32_t esp, uint64_t *out) {
+     for (int i = 0; i < g_delay_res_n; i++)
+-        if (g_delay_res[i].va == va) { *out = g_delay_res[i].shim(esp + 4); return 1; }
++        if (g_delay_res[i].va == va) {
++#ifdef __wasm__
++            if (g_delay_res[i].browser_method) {
++                *out = aret_browser_graphics_call(g_delay_res[i].browser_method, esp + 4);
++                return 1;
++            }
++#endif
++            *out = g_delay_res[i].shim(esp + 4); return 1;
++        }
+     return 0;
+ }
+ /* Stdcall pop for a resolved delay VA (called by __aret_callee_pop). */
+@@ -9038,6 +9248,74 @@ static int u32_iid_eq(const uint8_t *iid, uint32_t d1) {
+     if (!iid) return 0;
+     return *(const uint32_t *)iid == d1 && memcmp(iid + 4, tail, 12) == 0;
+ }
++/* Free-threaded marshaler identity and lifetime. Actual stream marshaling
++ * remains explicit unsupported behavior until its IMarshal methods are needed.
++ * Forager requests a nonaggregated instance during audio-object construction. */
++struct u32_ftm { uint32_t vtable, refs; };
++static uint32_t u32_ftm_qi(uint32_t esp) {
++    struct u32_ftm *self = (struct u32_ftm *)(uintptr_t)WU(0);
++    const uint8_t *iid = (const uint8_t *)(uintptr_t)WU(1);
++    uint32_t *out = (uint32_t *)(uintptr_t)WU(2);
++    if (!out) return 0x80004003u; /* E_POINTER */
++    *out = 0;
++    if (!u32_iid_eq(iid, 0) && !u32_iid_eq(iid, 3)) return 0x80004002u;
++    *out = (uint32_t)(uintptr_t)self;
++    return (++self->refs, 0u);
++}
++static uint32_t u32_ftm_addref(uint32_t esp) {
++    return ++((struct u32_ftm *)(uintptr_t)WU(0))->refs;
++}
++static uint32_t u32_ftm_release(uint32_t esp) {
++    struct u32_ftm *self = (struct u32_ftm *)(uintptr_t)WU(0);
++    uint32_t refs = --self->refs;
++    if (!refs) free(self);
++    return refs;
++}
++#define FTM_UNMODELLED(method) \
++    static uint32_t u32_ftm_##method(uint32_t esp) { \
++        (void)esp; aret_unmodelled("IMarshal::" #method); return 0; \
++    }
++FTM_UNMODELLED(GetUnmarshalClass)
++FTM_UNMODELLED(GetMarshalSizeMax)
++FTM_UNMODELLED(MarshalInterface)
++FTM_UNMODELLED(UnmarshalInterface)
++FTM_UNMODELLED(ReleaseMarshalData)
++FTM_UNMODELLED(DisconnectObject)
++#undef FTM_UNMODELLED
++uint32_t aret_CoCreateFreeThreadedMarshaler(uint32_t esp) {
++    uint32_t *out = (uint32_t *)(uintptr_t)WU(1);
++    if (!out) return 0x80004003u;
++    *out = 0;
++    if (WU(0)) {
++        aret_unmodelled("CoCreateFreeThreadedMarshaler: aggregation");
++        return 0;
++    }
++    static uint32_t vtable[9];
++    if (!vtable[0]) {
++        static const struct { uint32_t (*fn)(uint32_t); uint16_t pop; } methods[] = {
++            {u32_ftm_qi,12}, {u32_ftm_addref,4}, {u32_ftm_release,4},
++            {u32_ftm_GetUnmarshalClass,28}, {u32_ftm_GetMarshalSizeMax,28},
++            {u32_ftm_MarshalInterface,28}, {u32_ftm_UnmarshalInterface,16},
++            {u32_ftm_ReleaseMarshalData,8}, {u32_ftm_DisconnectObject,8}
++        };
++        if (g_delay_res_n + 9 > DELAY_VA_MAX) return 0x8007000eu;
++        for (int i = 0; i < 9; i++) {
++            uint32_t va = DELAY_VA_BASE + (uint32_t)g_delay_res_n;
++            g_delay_res[g_delay_res_n].va = va;
++            g_delay_res[g_delay_res_n].shim = methods[i].fn;
++            g_delay_res[g_delay_res_n].pop = methods[i].pop;
++            g_delay_res_n++;
++            vtable[i] = va;
++        }
++    }
++    struct u32_ftm *self = malloc(sizeof(*self));
++    if (!self) return 0x8007000eu; /* E_OUTOFMEMORY */
++    self->vtable = (uint32_t)(uintptr_t)vtable;
++    self->refs = 1;
++    *out = (uint32_t)(uintptr_t)self;
++    return 0;
++}
++
+ static uint32_t u32_im_qi(uint32_t esp) {
+     uint32_t self = WU(0);
+     const uint8_t *iid = (const uint8_t *)(uintptr_t)WU(1);
+@@ -9567,6 +9845,15 @@ uint32_t aret_CoCreateInstance(uint32_t esp) {
+     if (!ppv) return 0x80004003u;                     /* E_POINTER */
+     *(uint32_t *)(uintptr_t)ppv = 0;                  /* COM: clear on every path */
+ 
++#ifdef __wasm__
++    /* Browser audio output supplies the MMDeviceEnumerator platform service. */
++    static const uint8_t browser_mmdevice_clsid[16] = {
++        0x95,0x03,0xde,0xbc,0x2f,0xe5,0x7c,0x46,0x8e,0x3d,0xc4,0x57,0x92,0x91,0x69,0x2e
++    };
++    if (u32_guid_eq((const uint8_t *)(uintptr_t)rclsid, browser_mmdevice_clsid))
++        return aret_browser_graphics_call(0x20000u, esp);
++#endif
++
+     /* mlang: served by an HLE object (leaf service; Wine's builtin is a relay stub). */
+     if ((ctx & 0x3u) && u32_guid_eq((const uint8_t *)(uintptr_t)rclsid, CLSID_CMultiLanguage_b)) {
+         const uint8_t *iid = (const uint8_t *)(uintptr_t)riid;
+@@ -10849,9 +11136,26 @@ static uint32_t u32_set_focus(uint32_t esp, uint32_t neu) {
+ }
+ uint32_t aret_SetFocus(uint32_t esp) { return u32_set_focus(esp, WU(0)); }
+ uint32_t aret_GetFocus(uint32_t esp)         { (void)esp; return g_u32_focus; }
+-uint32_t aret_SetActiveWindow(uint32_t esp)  { uint32_t p = g_u32_active; g_u32_active = WU(0); return p; }
++static uint32_t u32_activate_window(uint32_t esp, uint32_t hwnd) {
++    if (hwnd && u32_win_idx(hwnd) < 0) return 0;
++    uint32_t previous = g_u32_active;
++    if (previous != hwnd) {
++        g_u32_active = hwnd;
++        uint32_t proc = u32_win_wndproc(previous);
++        if (proc) u32_call_wndproc(esp, proc, previous, 0x0006u /*WM_ACTIVATE*/, 0, hwnd);
++        proc = u32_win_wndproc(hwnd);
++        if (proc) u32_call_wndproc(esp, proc, hwnd, 0x0006u /*WM_ACTIVATE*/, 1, previous);
++    }
++    u32_set_focus(esp, hwnd);
++    return previous;
++}
++uint32_t aret_SetActiveWindow(uint32_t esp)  { return u32_activate_window(esp, WU(0)); }
+ uint32_t aret_GetActiveWindow(uint32_t esp)  { (void)esp; return g_u32_active; }
+-uint32_t aret_SetForegroundWindow(uint32_t esp) { return u32_win_idx(WU(0)) >= 0 ? 1u : 0u; }
++uint32_t aret_SetForegroundWindow(uint32_t esp) {
++    if (u32_win_idx(WU(0)) < 0) return 0;
++    u32_activate_window(esp, WU(0));
++    return 1;
++}
+ uint32_t aret_GetForegroundWindow(uint32_t esp) { (void)esp; return g_u32_active; }
+ uint32_t aret_BringWindowToTop(uint32_t esp)    { return u32_win_idx(WU(0)) >= 0 ? 1u : 0u; }
+ 
+@@ -11762,15 +12066,71 @@ uint32_t aret_StrCmpNIW(uint32_t esp) { return (uint32_t)u32_wcsicmp_n((const ui
+ uint32_t aret_MonitorFromWindow(uint32_t esp) { (void)esp; return 0x00010001u; }
+ uint32_t aret_MonitorFromRect(uint32_t esp)   { (void)esp; return 0x00010001u; }
+ uint32_t aret_MonitorFromPoint(uint32_t esp)  { (void)esp; return 0x00010001u; }
+-uint32_t aret_GetMonitorInfoW(uint32_t esp) {
++static const char u32_display_name[] = "\\\\.\\DISPLAY1";
++static uint32_t u32_monitor_info(uint32_t esp, int wide) {
+     uint32_t *mi = (uint32_t *)WP(1);           /* MONITORINFO: cbSize, rcMonitor[4], rcWork[4], dwFlags */
+-    if (!mi) return 0;
+-    mi[1] = 0; mi[2] = 0; mi[3] = 1024; mi[4] = 768;     /* rcMonitor */
+-    mi[5] = 0; mi[6] = 0; mi[7] = 1024; mi[8] = 768;     /* rcWork */
++    if (!mi || mi[0] < 40) { g_last_error = 87u; return 0; }
++    mi[1] = 0; mi[2] = 0; mi[3] = U32_SCREEN_W; mi[4] = U32_SCREEN_H;
++    mi[5] = 0; mi[6] = 0; mi[7] = U32_SCREEN_W; mi[8] = U32_SCREEN_H;
+     mi[9] = 1;                                           /* MONITORINFOF_PRIMARY */
++    if (mi[0] >= (wide ? 104u : 72u)) {
++        memset(mi + 10, 0, wide ? 64 : 32);
++        for (size_t i = 0; u32_display_name[i]; i++) {
++            if (wide) ((uint16_t *)(mi + 10))[i] = (uint8_t)u32_display_name[i];
++            else ((char *)(mi + 10))[i] = u32_display_name[i];
++        }
++    }
++    return 1;
++}
++uint32_t aret_GetMonitorInfoW(uint32_t esp) { return u32_monitor_info(esp, 1); }
++uint32_t aret_GetMonitorInfoA(uint32_t esp) { return u32_monitor_info(esp, 0); }
++
++typedef struct {
++    uint16_t device[32], spec_version, driver_version, size, driver_extra;
++    uint32_t fields;
++    int32_t position_x, position_y;
++    uint32_t orientation, fixed_output;
++    uint16_t color, duplex, y_resolution, tt_option, collate, form[32], log_pixels;
++    uint32_t bits_per_pixel, width, height, flags, frequency, icm_method, icm_intent;
++    uint32_t media_type, dither_type, reserved1, reserved2, panning_width, panning_height;
++} U32_DEVMODEW;
++_Static_assert(sizeof(U32_DEVMODEW) == 220, "DEVMODEW layout");
++
++/* One logical 32-bit display mode, shared with monitor and screen geometry. */
++uint32_t aret_EnumDisplaySettingsW(uint32_t esp) {
++    const uint16_t *device = (const uint16_t *)WP(0);
++    uint32_t mode = WU(1);
++    U32_DEVMODEW *out = (U32_DEVMODEW *)WP(2);
++    if (!out || out->size < sizeof *out) { g_last_error = 87u; return 0; }
++    if (device && *device) {
++        size_t i = 0;
++        while (u32_display_name[i] && device[i] && device[i] < 128 &&
++            tolower((unsigned char)u32_display_name[i]) == tolower((unsigned char)device[i])) i++;
++        if (u32_display_name[i] || device[i]) return 0;
++    }
++    if (mode != 0 && mode != UINT32_MAX && mode != UINT32_MAX - 1) return 0;
++    memset(out, 0, sizeof *out);
++    for (size_t i = 0; u32_display_name[i]; i++) out->device[i] = (uint8_t)u32_display_name[i];
++    out->spec_version = 0x0401;
++    out->size = sizeof *out;
++    out->fields = 0x005c0000u; /* DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY */
++    out->bits_per_pixel = 32;
++    out->width = U32_SCREEN_W; out->height = U32_SCREEN_H;
++    out->frequency = 60;
++    return 1;
++}
++/* The window model uses a single 96-DPI coordinate space. System-aware
++ * rendering therefore uses the same physical pixels, without virtualization. */
++static uint32_t g_u32_system_dpi_aware;
++uint32_t aret_SetProcessDPIAware(uint32_t esp) {
++    (void)esp;
++    g_u32_system_dpi_aware = 1;
+     return 1;
+ }
+-uint32_t aret_GetMonitorInfoA(uint32_t esp) { return aret_GetMonitorInfoW(esp); }
++uint32_t aret_IsProcessDPIAware(uint32_t esp) {
++    (void)esp;
++    return g_u32_system_dpi_aware;
++}
+ /* GetDpiForWindow(hwnd) -> 96 (our fixed logical DPI, matches GetDeviceCaps LOGPIXELS). */
+ uint32_t aret_GetDpiForWindow(uint32_t esp) { (void)esp; return 96; }
+ 
+@@ -12552,9 +12912,59 @@ uint32_t aret_IsBadCodePtr(uint32_t esp)   { return (uint32_t)(WU(0) == 0); }
+ uint32_t aret_IsBadStringPtrA(uint32_t esp){ return (uint32_t)(WU(0) == 0); }
+ uint32_t aret_IsBadStringPtrW(uint32_t esp){ return (uint32_t)(WU(0) == 0); }
+ 
+-/* Input state: headless -> no keys/buttons pressed, cursor at origin. */
+-uint32_t aret_GetKeyState(uint32_t esp)      { (void)esp; return 0; }
+-uint32_t aret_GetAsyncKeyState(uint32_t esp) { (void)esp; return 0; }
++/* Physical input is updated by the browser bridge; queued state advances when messages are removed. */
++uint32_t aret_GetKeyState(uint32_t esp) {
++    u32_browser_input_pump();
++    unsigned value = u32_key_value(u32_queued_keys, WU(0));
++    return (uint32_t)(int32_t)(int16_t)(((value & 128) ? 0x8000 : 0) | (value & 1));
++}
++uint32_t aret_GetAsyncKeyState(uint32_t esp) {
++    u32_browser_input_pump();
++    unsigned vk = WU(0); if (vk >= 256) return 0;
++    unsigned pressed = u32_key_value(u32_key_presses, vk) != 0;
++    u32_key_presses[vk] = 0;
++    if (vk >= 16 && vk <= 18) { unsigned side = 160 + (vk - 16) * 2; u32_key_presses[side] = u32_key_presses[side+1] = 0; }
++    return (uint32_t)(int32_t)(int16_t)(((u32_key_value(u32_physical_keys, vk) & 128) ? 0x8000 : 0) | pressed);
++}
++uint32_t aret_SetCursorPos(uint32_t esp) {
++    u32_cursor_x = WI(0); u32_cursor_y = WI(1); return 1;
++}
++/* Called only while the browser owns an active native continuation. */
++uint32_t aret_browser_input_event(uint32_t kind, uint32_t code, int32_t x, int32_t y, uint32_t flags) {
++    uint32_t hwnd = g_u32_capture ? g_u32_capture : g_u32_focus ? g_u32_focus : g_u32_active;
++    int wi = u32_win_idx(hwnd);
++    if (wi < 0) for (int i = 0; i < U32_MAX_WIN; i++) if (g_u32_win[i].used && g_u32_win[i].visible && !g_u32_win[i].parent) { wi = i; hwnd = i + 1; break; }
++    if (wi < 0) return 0;
++    uint32_t msg, wp = 0, lp = ((uint32_t)x & 65535) | ((uint32_t)y << 16);
++    unsigned down = flags & 1;
++    if (kind == 0) {
++        if (code >= 256) return 0;
++        unsigned previous = u32_physical_keys[code] & 128;
++        unsigned alt = (u32_key_value(u32_physical_keys,18) & 128) || code == 164 || code == 165;
++        wp = code >= 160 && code <= 165 ? 16 + (code - 160) / 2 : code;
++        msg = alt ? (down ? 0x104 : 0x105) : (down ? 0x100 : 0x101);
++        lp = 1 | ((uint32_t)x << 16) | ((flags & 2) ? 0x1000000 : 0) | (alt ? 0x20000000 : 0) | (previous ? 0x40000000 : 0) | (!down ? 0x80000000 : 0);
++    } else if (kind == 1) msg = 0x200;
++    else if (kind == 2) {
++        if (code != 1 && code != 2 && code != 4) return 0;
++        msg = code == 1 ? (down ? 0x201 : 0x202) : code == 2 ? (down ? 0x204 : 0x205) : (down ? 0x207 : 0x208);
++    } else if (kind == 4) { msg = 0x20a; wp = code << 16; lp = ((uint32_t)(x + g_u32_win[wi].x) & 65535) | ((uint32_t)(y + g_u32_win[wi].y) << 16); }
++    else if (kind == 5) { msg = 0x102; wp = code; lp = 1; }
++    else return 0;
++    if (kind == 1 || kind == 2 || kind == 4) {
++        unsigned left = kind == 2 && code == 1 ? down : (u32_physical_keys[1] & 128) != 0;
++        unsigned right = kind == 2 && code == 2 ? down : (u32_physical_keys[2] & 128) != 0;
++        unsigned middle = kind == 2 && code == 4 ? down : (u32_physical_keys[4] & 128) != 0;
++        wp |= left | (right << 1) | (middle << 4) | ((u32_key_value(u32_physical_keys,16) & 128) ? 4 : 0) | ((u32_key_value(u32_physical_keys,17) & 128) ? 8 : 0);
++    }
++    if (kind == 1 || kind == 2 || kind == 4) { u32_cursor_x=x+g_u32_win[wi].x; u32_cursor_y=y+g_u32_win[wi].y; }
++    if (!u32_q_push(hwnd,msg,wp,lp)) return 0;
++    if (kind == 0 || kind == 2) {
++        if (down && !(u32_physical_keys[code] & 128)) u32_key_presses[code] = 128;
++        u32_key_change(u32_physical_keys,code,down);
++    }
++    return 1;
++}
+ uint32_t aret_GetMessagePos(uint32_t esp)    { (void)esp; return 0; }
+ uint32_t aret_GetMessageTime(uint32_t esp)   { (void)esp; return (uint32_t)(mono_ns() / 1000000ull); }
+ /* GetWindowThreadProcessId(hwnd, *pid) -> tid. Single-process/thread model. */
+diff --git a/src/analysis/mod.rs b/src/analysis/mod.rs
+index d7e2398..0460769 100644
+--- a/src/analysis/mod.rs
++++ b/src/analysis/mod.rs
+@@ -227,9 +227,16 @@ pub fn auto_main_entry(prog: &Program) -> Option<u64> {
+ /// `prologue_scan` is set, also recover functions reached only indirectly by
+ /// scanning executable sections for function prologues.
+ pub fn analyze(prog: &Program, disasm: &Disassembler, prologue_scan: bool) -> AnalysisResult {
+-    let (global, entries, jump_tables, prologue_only, cxx_conts) =
++    let (global, entries, jump_tables, prologue_only, mut cxx_conts) =
+         global_decode(prog, disasm, prologue_scan);
+     let instruction_count = global.len();
++    // Address tables can contain return sites after indirect calls, rather than
++    // callable function entries. Keep their standalone recovery, but let the
++    // caller collect its ordinary return path. Explicit seeds and direct-call
++    // targets still establish real function boundaries.
++    let mut confirmed: BTreeSet<u64> = prog.seed_functions().into_iter().collect();
++    confirmed.extend(global.values().filter(|insn| insn.flow == Flow::Call).filter_map(|insn| insn.target));
++    cxx_conts.extend(indirect_call_continuations(&global, &entries, &confirmed));
+ 
+     // Hot/cold splitting (gcc `-freorder-blocks-and-partition`) emits the cold
+     // path as a companion symbol `foo.cold` in `.text.unlikely`. It is part of
+@@ -269,6 +276,17 @@ pub fn analyze(prog: &Program, disasm: &Disassembler, prologue_scan: bool) -> An
+     }
+ }
+ 
++fn indirect_call_continuations(
++    global: &BTreeMap<u64, Insn>,
++    entries: &BTreeSet<u64>,
++    confirmed: &BTreeSet<u64>,
++) -> BTreeSet<u64> {
++    global.values().filter(|insn| insn.flow == Flow::Call && insn.target.is_none())
++        .map(Insn::next_addr)
++        .filter(|next| entries.contains(next) && !confirmed.contains(next))
++        .collect()
++}
++
+ /// Phase A — decode every reachable instruction once, collecting the set of
+ /// function entry points (entry + direct/indirect-target call sites).
+ /// A high-confidence guess that `addr` begins a function, by its opening bytes.
+@@ -296,6 +314,12 @@ fn looks_like_func_start(prog: &Program, addr: u64, allow_leaf: bool) -> bool {
+     known_prologue_bytes(&code, allow_leaf) || is_x87_leaf_thunk(prog, addr)
+ }
+ 
++/// Heuristic candidates must not begin inside an instruction already decoded
++/// from reachable code. An exact-key check misses addresses in its operand bytes.
++fn inside_decoded_instruction(global: &BTreeMap<u64, Insn>, addr: u64) -> bool {
++    global.range(..addr).next_back().is_some_and(|(_, insn)| insn.next_addr() > addr)
++}
++
+ /// A lone address-taken code pointer whose target is a **frame-pointer-omitted**
+ /// (FPO) function opens with a non-standard prologue (`push imm`, `cmp [mem],imm`,
+ /// …) that `looks_like_func_start` rejects — yet the stored pointer already proves
+@@ -328,17 +352,30 @@ fn preceded_by_terminator(prog: &Program, global: &BTreeMap<u64, Insn>, addr: u6
+     // such a run, so neither (A) (the terminator is not *adjacent*) nor (B) (the adjacent
+     // byte is a nop, not int3/ret) fires. Skip a *bounded* nop run (at most an alignment
+     // pad, so <= 15 bytes) and require a **proven terminator** (a recovered `ret`/`jmp`,
+-    // or `int3`/`ret` padding) just before it. NOP is a single-byte instruction, so
+-    // skipping it cannot desync. Only proven terminators are accepted here — a `call`
++    // or `int3`/`ret` padding) just before it. Decode only inert padding that ends
++    // exactly at the candidate. Only proven terminators are accepted here — a `call`
+     // (might return) or bare alignment (might be an intra-function loop-head pad) are
+     // NOT boundaries: an earlier version accepted those and force-split a real libstdc++
+     // function at a loop head → an infinite loop (a miscompile). Terminator-proven only.
+-    let mut n = 1u64;
+-    while n <= 15 && prog.read_from(addr - n).and_then(|b| b.first().copied()) == Some(0x90) {
+-        if boundary_at(prog, global, addr - n) {
+-            return true;
+-        }
+-        n += 1;
++    let disasm = Disassembler::new(prog.bitness);
++    for n in 1..=15u64.min(addr) {
++        let start = addr - n;
++        if !boundary_at(prog, global, start) { continue; }
++        let mut at = start;
++        while at < addr {
++            let Some(insn) = disasm.decode_at(prog, at) else { break; };
++            let r = &insn.raw;
++            // MSVC also pads with multi-byte NOPs and identity LEAs such as
++            // lea esp,[esp+0]. Accept only padding following a proven terminator.
++            let identity_lea = prog.bitness.bits() == 32
++                && r.mnemonic() == iced_x86::Mnemonic::Lea
++                && r.op0_register() == r.memory_base()
++                && r.memory_index() == iced_x86::Register::None
++                && r.memory_displacement64() == 0;
++            if r.mnemonic() != iced_x86::Mnemonic::Nop && !identity_lea { break; }
++            at = insn.next_addr();
++        }
++        if at == addr { return true; }
+     }
+     false
+ }
+@@ -533,7 +570,8 @@ fn imm_code_ptrs(insn: &iced_x86::Instruction) -> Vec<u64> {
+ /// target is a bare `ret` thunk — not a recognisable prologue, reached by no
+ /// direct call, so otherwise invisible to recovery. Indexed forms (`[base+idx*s]`,
+ /// jump tables) are excluded by requiring no index and a memory base of None.
+-fn abs_indirect_slot(insn: &iced_x86::Instruction) -> Option<u64> {
++/// Known import slots are excluded: their unresolved values are RVAs or ordinals.
++fn abs_indirect_slot(prog: &Program, insn: &iced_x86::Instruction) -> Option<u64> {
+     use iced_x86::{FlowControl, Register};
+     if !matches!(insn.flow_control(), FlowControl::IndirectCall | FlowControl::IndirectBranch) {
+         return None;
+@@ -544,7 +582,10 @@ fn abs_indirect_slot(insn: &iced_x86::Instruction) -> Option<u64> {
+         && insn.memory_base() == Register::None
+         && insn.memory_index() == Register::None
+     {
+-        Some(insn.memory_displacement64())
++        let slot = insn.memory_displacement64();
++        // An unresolved PE import holds an RVA, not a callable virtual address.
++        // That number can accidentally land inside this image's code section.
++        (prog.import_name(slot).is_none()).then_some(slot)
+     } else {
+         None
+     }
+@@ -935,7 +976,8 @@ fn global_decode(
+     if prologue_scan {
+         let mut extra: VecDeque<u64> = VecDeque::new();
+         for p in prog.prologue_seeds() {
+-            if !global.contains_key(&p) && prog.is_executable(p) && entries.insert(p) {
++            if !global.contains_key(&p) && !inside_decoded_instruction(&global, p)
++                && prog.is_executable(p) && entries.insert(p) {
+                 prologue_only.insert(p);
+                 extra.push_back(p);
+             }
+@@ -984,7 +1026,25 @@ fn global_decode(
+             for sec in &prog.sections {
+                 let d = &sec.data;
+                 let nwords = d.len() / ptr;
++                // Embedded data in .text is eligible, but decoded instruction
++                // bytes are not data words. A switch-table displacement can be
++                // aligned and point just after a ret; treating that operand as
++                // a callback would decode the table itself as executable code.
++                let mut code_words = vec![false; if sec.executable { nwords } else { 0 }];
++                if sec.executable {
++                    for (&va, insn) in global.range(sec.address..sec.address + d.len() as u64) {
++                        let first = ((va - sec.address) as usize) / ptr;
++                        if first >= nwords { continue; }
++                        let end = (insn.next_addr() - sec.address) as usize;
++                        let last = end.saturating_sub(1) / ptr;
++                        for w in first..=last.min(nwords.saturating_sub(1)) {
++                            code_words[w] = true;
++                        }
++                    }
++                }
+                 let word = |w: usize| -> u64 {
++                    if code_words.get(w).copied().unwrap_or(false)
++                        || prog.import_name(sec.address + (w * ptr) as u64).is_some() { return 0; }
+                     let o = w * ptr;
+                     match ptr {
+                         8 => u64::from_le_bytes(d[o..o + 8].try_into().unwrap()),
+@@ -1105,7 +1165,7 @@ fn global_decode(
+             // (`mov [g], imm`) is the runtime function pointer the static
+             // `abs_indirect_slot` read misses when the slot lives in writable data.
+             let icall_slots: BTreeSet<u64> =
+-                global.values().filter_map(|i| abs_indirect_slot(&i.raw)).collect();
++                global.values().filter_map(|i| abs_indirect_slot(prog, &i.raw)).collect();
+             for insn in global.values() {
+                 for v in imm_code_ptrs(&insn.raw) {
+                     // Code immediates: a by-value callback — allow the leaf shape.
+@@ -1113,15 +1173,18 @@ fn global_decode(
+                         cands.insert(v);
+                     }
+                 }
+-                // A code pointer placed on the stack as an argument (`push imm32` /
+-                // `mov [esp+d], imm32`) is a callback passed by value — e.g.
+-                // `atexit(_dtoa_lock_cleanup)`, `qsort(…, cmp)`. The argument
+-                // position proves it is a function, whatever prologue the callee
+-                // has, so accept it without the prologue heuristic. (A resolved
+-                // jump-table target caught this way is pruned after the fixpoint.)
++                // A stack argument may be a callback, but its numeric value may
++                // also be a scalar that happens to lie in .text (Forager passes
++                // the colour 0x40a0ff this way). Require a function-start witness
++                // before decoding an unclaimed target; argument position alone
++                // does not establish that the value is a function pointer.
+                 if let Some(v) = stack_arg_code_imm(&insn.raw) {
+                     if in_exec(v) {
+-                        if !global.contains_key(&v) {
++                        if !global.contains_key(&v)
++                            && (looks_like_func_start(prog, v, true)
++                                || is_bare_ret_stub(prog, v)
++                                || preceded_by_terminator(prog, &global, v))
++                        {
+                             cands.insert(v);
+                         } else if looks_like_func_start(prog, v, true) {
+                             // Absorbed into the preceding function by falling through
+@@ -1146,9 +1209,13 @@ fn global_decode(
+                 if let Some(v) = mem_store_code_imm(&insn.raw) {
+                     if in_exec(v) {
+                         if !global.contains_key(&v) {
+-                            // Fresh, unclaimed target: accept a normal prologue or the
+-                            // bare-`ret` no-op stub (seeding unclaimed space is safe).
+-                            if looks_like_func_start(prog, v, true) || is_bare_ret_stub(prog, v) {
++                            // A stored callback can start with an unusual instruction,
++                            // such as push [esp+8]. Require an entry witness: a normal
++                            // prologue, a bare-return stub, or a proven prior terminator.
++                            if looks_like_func_start(prog, v, true)
++                                || is_bare_ret_stub(prog, v)
++                                || preceded_by_terminator(prog, &global, v)
++                            {
+                                 cands.insert(v);
+                             }
+                         } else if looks_like_func_start(prog, v, true) {
+@@ -1163,9 +1230,9 @@ fn global_decode(
+                 // slot is the call target — definitive proof of a function entry,
+                 // so it bypasses the prologue heuristic (the CFG-guard default is a
+                 // bare `ret`). `read_u32`/`read_u64` returns the static slot value;
+-                // an IAT slot holds an import RVA into non-exec data and is filtered
+-                // by `in_exec`, so internal pointer slots only.
+-                if let Some(slot) = abs_indirect_slot(&insn.raw) {
++                // Known import slots are excluded by abs_indirect_slot before
++                // interpreting their unresolved RVA/ordinal as a virtual address.
++                if let Some(slot) = abs_indirect_slot(prog, &insn.raw) {
+                     let target = if ptr == 8 { prog.read_u64(slot) } else { prog.read_u32(slot).map(u64::from) };
+                     if let Some(v) = target {
+                         if in_exec(v) {
+@@ -1258,7 +1325,8 @@ fn global_decode(
+                 // A function drained earlier this pass (lower address) may now
+                 // cover `c`, or it may be a jump-table case target — either way
+                 // it is interior, not an entry.
+-                if global.contains_key(&c) || jt_targets.contains(&c) {
++                if global.contains_key(&c) || inside_decoded_instruction(&global, c)
++                    || jt_targets.contains(&c) {
+                     continue;
+                 }
+                 if entries.insert(c) {
+@@ -1745,9 +1813,11 @@ fn collect_function(
+                 }
+                 work.push_back((next, true));
+             }
+-            // A call returns to `next`, but if the callee is no-return the bytes at
+-            // `next` may be padding or the following function — keep the boundary.
+-            Flow::Call => work.push_back((next, false)),
++            // Preserve boundaries after known direct callees, which may not return.
++            // An indirect call's ordinary return edge may cross a heuristic
++            // entry seeded from a data pointer. Absorb that continuation as
++            // fallthrough; symbol and confirmed call-target boundaries still hold.
++            Flow::Call => work.push_back((next, insn.target.is_none())),
+             Flow::Jump => {
+                 if let Some(t) = insn.target {
+                     work.push_back((t, false));
+@@ -2236,3 +2306,69 @@ mod prologue_tests {
+         assert!(known_prologue_bytes(&[0x8b, 0x44, 0x24], true));
+     }
+ }
++
++#[cfg(test)]
++mod call_continuation_tests {
++    use super::*;
++    use iced_x86::{Decoder, DecoderOptions};
++
++    #[test]
++    fn indirect_return_absorbs_only_heuristic_entries() {
++        // Native callback pattern: call [eax+4]; sub esp,4; mov ebx,eax; ret.
++        let bytes = [0xff, 0x50, 4, 0x83, 0xec, 4, 0x89, 0xc3, 0xc3];
++        let mut decoder = Decoder::with_ip(32, &bytes, 0x1000, DecoderOptions::NONE);
++        let mut global = BTreeMap::new();
++        while decoder.can_decode() {
++            let raw = decoder.decode();
++            let address = raw.ip();
++            global.insert(address, Insn {
++                address, len: raw.len(), text: String::new(),
++                flow: if address == 0x1000 { Flow::Call }
++                    else if address == 0x1008 { Flow::Return } else { Flow::Fallthrough },
++                target: None, call_name: None, raw,
++            });
++        }
++        let boundary = BTreeSet::from([0x1000, 0x1003]);
++        let heuristic = BTreeSet::from([0x1003]);
++        assert_eq!(indirect_call_continuations(&global, &boundary, &BTreeSet::from([0x1000])), BTreeSet::from([0x1003]));
++        assert!(indirect_call_continuations(&global, &boundary, &boundary).is_empty());
++        assert!(collect_function(&global, 0x1000, &boundary, &HashMap::new(), &heuristic).contains_key(&0x1008));
++        assert!(!collect_function(&global, 0x1000, &boundary, &HashMap::new(), &BTreeSet::new()).contains_key(&0x1003));
++        global.get_mut(&0x1000).unwrap().target = Some(0x2000);
++        assert!(!collect_function(&global, 0x1000, &boundary, &HashMap::new(), &heuristic).contains_key(&0x1003));
++    }
++}
++
++#[cfg(test)]
++mod padding_boundary_tests {
++    use super::*;
++    use crate::loader::{Bitness, Section};
++    fn program(bytes: Vec<u8>) -> Program {
++        Program { format: "PE".into(), bitness: Bitness::Bits32, entry: 0x1000,
++            image_base: 0x1000, exports: vec![], dll_inits: vec![], dll_exports: vec![],
++            ctor_list: vec![], sections: vec![Section { name: ".text".into(),
++                address: 0x1000, data: bytes, executable: true, writable: false }],
++            symbols: BTreeMap::new(), imports: BTreeMap::new(), pe_imports: BTreeMap::new(),
++            relocs: BTreeMap::new(), base_relocs: BTreeSet::new(), tls_dir_va: 0, tls_inits: vec![] }
++    }
++    #[test]
++    fn msvc_identity_lea_padding_requires_a_terminator() {
++        let padding = [0x8d,0xa4,0x24,0,0,0,0]; // lea esp,[esp+0]
++        let mut bytes = vec![0xc3]; bytes.extend(padding); bytes.extend([0xdd,0xd8,0xc3]);
++        let prog = program(bytes.clone());
++        assert!(preceded_by_terminator(&prog, &BTreeMap::new(), 0x1008));
++        bytes[0] = 0x90;
++        assert!(!preceded_by_terminator(&program(bytes.clone()), &BTreeMap::new(), 0x1008));
++        bytes[0] = 0xc3; bytes[4] = 4; // lea esp,[esp+4] changes state
++        assert!(!preceded_by_terminator(&program(bytes), &BTreeMap::new(), 0x1008));
++    }
++    #[test]
++    fn repeated_floating_callbacks_after_padding_are_recovered() {
++        let mut prog = program(vec![0xc3,0x8d,0xa4,0x24,0,0,0,0,0xdd,0xd8,0xc3]);
++        prog.sections.push(Section { name: ".rdata".into(), address: 0x2000,
++            data: [0x1008u32.to_le_bytes();3].concat(), executable: false, writable: false });
++        let disasm = Disassembler::new(prog.bitness);
++        let result = analyze(&prog, &disasm, true);
++        assert!(result.functions.iter().any(|f| f.entry == 0x1008));
++    }
++}
+diff --git a/src/builder/mod.rs b/src/builder/mod.rs
+index a0216df..c9dc35b 100644
+--- a/src/builder/mod.rs
++++ b/src/builder/mod.rs
+@@ -347,6 +347,7 @@ fn emit_layout(prog: &Program, blob_path: &Path, snapshot: Option<&[(u64, Vec<u8
+         let _ = write!(wasm_c, "{},", b);
+     }
+     wasm_c.push_str("\n};\n");
++    wasm_c.push_str("uint32_t aret_image_lo = 0, aret_image_hi = 0;\n");
+     wasm_c.push_str("struct aret_sec { uint32_t va; uint32_t off; uint32_t len; };\n");
+     wasm_c.push_str("static const struct aret_sec aret_secs[] = {\n");
+     for (va, off, len) in &table {
+@@ -356,8 +357,13 @@ fn emit_layout(prog: &Program, blob_path: &Path, snapshot: Option<&[(u64, Vec<u8
+     wasm_c.push_str(
+         "void __aret_map_memory(void) {\n\
+ \x20   unsigned i;\n\
+-\x20   for (i = 0; i < sizeof(aret_secs)/sizeof(aret_secs[0]); i++)\n\
++\x20   aret_image_lo = 0xffffffffu; aret_image_hi = 0;\n\
++\x20   for (i = 0; i < sizeof(aret_secs)/sizeof(aret_secs[0]); i++) {\n\
++\x20       uint32_t lo = aret_secs[i].va, hi = lo + aret_secs[i].len;\n\
++\x20       if (lo < aret_image_lo) aret_image_lo = lo;\n\
++\x20       if (hi > aret_image_hi) aret_image_hi = hi;\n\
+ \x20       memcpy((void *)(uintptr_t)aret_secs[i].va, aret_blob + aret_secs[i].off, aret_secs[i].len);\n\
++\x20   }\n\
+ }\n",
+     );
+     let max_va = table.iter().map(|(va, _, len)| va + *len as u64).max().unwrap_or(0);
+@@ -476,7 +482,7 @@ fn import_returns_u64(sym: &str) -> bool {
+ /// `aret_unimpl`) and returns 0; the HLE's strong definitions override the weak
+ /// stubs for the imports that *are* implemented. The runtime warnings are the
+ /// shopping list for extending the HLE (or bridging to Wine).
+-fn emit_import_stubs(prog: &Program) -> String {
++fn emit_import_stubs(prog: &Program, wasm: bool) -> String {
+     use std::collections::BTreeMap;
+     use std::fmt::Write as _;
+ 
+@@ -497,9 +503,10 @@ fn emit_import_stubs(prog: &Program) -> String {
+         // in aret_decls.h shadows the call sites, so this stub stays unused.
+         let raw_escaped = raw.replace('\\', "\\\\").replace('"', "\\\"");
+         let ret = if import_returns_u64(sym) { "uint64_t" } else { "uint32_t" };
++        let missing = if wasm { "aret_unmodelled" } else { "aret_unimpl" };
+         let _ = writeln!(
+             s,
+-            "__attribute__((weak)) {ret} {sym}(uint32_t esp) {{ (void)esp; aret_unimpl(\"{raw_escaped}\"); return 0; }}"
++            "__attribute__((weak)) {ret} {sym}(uint32_t esp) {{ (void)esp; {missing}(\"{raw_escaped}\"); return 0; }}"
+         );
+     }
+     s
+@@ -530,11 +537,52 @@ fn emit_import_stubs(prog: &Program) -> String {
+ /// cannot fall behind the shims themselves. The pop comes from `stdcall_pops` — the
+ /// same ground truth (`@N` import-library decorations) the static path uses, so a
+ /// delay-loaded call pops exactly what a direct one would.
+-fn emit_hle_shim_table() -> String {
++// These inventories inspect C definitions, not declarations produced by a
++// compiler. Respect the runtime's explicit platform guards; leave feature guards
++// to the existing inventory behavior. Native-only APIs must not appear in a
++// WASM delay-load table merely because their source is embedded in ARET.
++fn runtime_source_for_target(src: &str, wasm: bool) -> String {
++    let mut out = String::new();
++    let mut active = true;
++    let mut guards: Vec<(bool, Option<bool>)> = Vec::new();
++    for line in src.lines() {
++        let directive = line.trim_start().strip_prefix('#')
++            .map(|s| s.trim_start());
++        if let Some(directive) = directive {
++            let mut words = directive.split_whitespace();
++            match words.next() {
++                Some(kind @ ("if" | "ifdef" | "ifndef")) => {
++                    let condition = match (kind, words.next()) {
++                        ("ifdef", Some("__wasm__")) => Some(wasm),
++                        ("ifndef", Some("__wasm__")) => Some(!wasm),
++                        _ => None,
++                    };
++                    guards.push((active, condition));
++                    active &= condition.unwrap_or(true);
++                }
++                Some("else") => {
++                    if let Some(&(parent, condition)) = guards.last() {
++                        active = parent && condition.map(|v| !v).unwrap_or(true);
++                    }
++                }
++                Some("endif") => {
++                    if let Some((parent, _)) = guards.pop() { active = parent; }
++                }
++                _ => {}
++            }
++        }
++        if active { out.push_str(line); out.push('\n'); }
++    }
++    out
++}
++
++fn emit_hle_shim_table(wasm: bool) -> String {
+     use std::collections::BTreeMap;
+     use std::fmt::Write as _;
+     let mut shims: BTreeMap<&str, u32> = BTreeMap::new();
+-    for src in [HLE_C, CRT_C, WIN32_C] {
++    let sources: Vec<_> = [HLE_C, CRT_C, WIN32_C].iter()
++        .map(|src| runtime_source_for_target(src, wasm)).collect();
++    for src in &sources {
+         for line in src.lines() {
+             let Some(rest) = line.strip_prefix("uint32_t aret_") else { continue };
+             let Some(name) = rest.split('(').next() else { continue };
+@@ -709,7 +757,7 @@ fn emit_gnu_eh_tables(prog: &Program) -> String {
+     s
+ }
+ 
+-fn emit_dispatch(internal: &[u64], host: &[(u64, String)], iat: &[(u64, String)]) -> String {
++fn emit_dispatch(internal: &[u64], host: &[(u64, String)], iat: &[(u64, String)], wasm: bool) -> String {
+     use std::collections::BTreeSet;
+     use std::fmt::Write as _;
+     let mut s = String::new();
+@@ -790,7 +838,7 @@ fn emit_dispatch(internal: &[u64], host: &[(u64, String)], iat: &[(u64, String)]
+         })
+         .collect();
+     pops.sort_by_key(|(va, _)| *va);
+-    s.push_str(&emit_hle_shim_table());
++    s.push_str(&emit_hle_shim_table(wasm));
+     if pops.is_empty() {
+         s.push_str("uint32_t __aret_callee_pop(uint32_t va){ return aret_delay_pop(va); }\n");
+     } else {
+@@ -893,11 +941,12 @@ fn collect_undef_subs(irfs: &[ir::types::IrFunction]) -> Vec<u64> {
+ /// A called shim *not* in this set resolves to the weak "unimplemented" stub at
+ /// link time — i.e. it warns and returns 0, a guess. Parsed from the source
+ /// (rather than hand-listed) so it never drifts from what is actually shimmed.
+-fn implemented_shims() -> std::collections::BTreeSet<String> {
+-    let sources = [HLE_C, CRT_C, WIN32_C, NTDLL_C];
++fn implemented_shims(wasm: bool) -> std::collections::BTreeSet<String> {
++    let sources: Vec<_> = [HLE_C, CRT_C, WIN32_C, NTDLL_C].iter()
++        .map(|src| runtime_source_for_target(src, wasm)).collect();
+     let mut set = std::collections::BTreeSet::new();
+     // 1. Direct definitions: `aret_x(uint32_t`.
+-    for src in sources {
++    for src in &sources {
+         let b = src.as_bytes();
+         let mut i = 0;
+         while let Some(p) = src[i..].find("aret_") {
+@@ -925,7 +974,7 @@ fn implemented_shims() -> std::collections::BTreeSet<String> {
+         (!name.is_empty()).then_some(name)
+     };
+     let mut gen_macros: Vec<(String, String)> = Vec::new(); // (macro, first-param)
+-    for src in sources {
++    for src in &sources {
+         for line in src.lines() {
+             if let Some(rest) = line.trim_start().strip_prefix("#define ") {
+                 if let (Some(paren), Some(param)) = (rest.find('('), firstarg(rest)) {
+@@ -937,7 +986,7 @@ fn implemented_shims() -> std::collections::BTreeSet<String> {
+             }
+         }
+     }
+-    for src in sources {
++    for src in &sources {
+         for line in src.lines() {
+             let t = line.trim();
+             for (mac, _) in &gen_macros {
+@@ -977,7 +1026,7 @@ impl ImportCoverage {
+ 
+ /// Classify a program's whole import table against the shipped shim set.
+ pub fn import_coverage(prog: &crate::loader::Program) -> ImportCoverage {
+-    let impl_set = implemented_shims();
++    let impl_set = implemented_shims(false);
+     let mut covered = std::collections::BTreeSet::new();
+     let mut uncovered = std::collections::BTreeSet::new();
+     for raw in prog.imports.values() {
+@@ -1296,6 +1345,53 @@ pub fn transpile(
+         "frontier contradiction: a function is both internal and host-backed"
+     );
+ 
++    // A coverage report needs aggregate gaps, not emitted C or every function's
++    // IR in memory at once. Keep the lowering and gap collectors identical to
++    // the build path, then discard each function after collecting its results.
++    if walls_only {
++        use std::collections::{BTreeMap, BTreeSet};
++        let defined: BTreeSet<_> = internal_funcs.iter().map(|f| f.entry).collect();
++        let impl_set = implemented_shims(wasm);
++        let mut unresolved = BTreeSet::new();
++        let mut unimplemented_imports = BTreeSet::new();
++        let mut insns = BTreeMap::new();
++        let mut partial = 0;
++        for (index, &f) in internal_funcs.iter().enumerate() {
++            eprintln!("walls: lowering {index}/{} at 0x{:x} ({} instructions)",
++                internal_funcs.len(), f.entry,
++                f.blocks.values().map(|b| b.insns.len()).sum::<usize>());
++            let irf = lower(prog, f);
++            partial += usize::from(ir::build::has_opaque_asm(&irf));
++            let one = std::slice::from_ref(&irf);
++            unresolved.extend(collect_undef_subs(one));
++            unimplemented_imports.extend(collect_named_calls(one).into_iter().filter(|n| {
++                n.starts_with("aret_") && !impl_set.contains(n) && !is_setjmp_intrinsic(n)
++            }));
++            for (insn, count) in collect_unmodelled_insns(one) {
++                *insns.entry(insn).or_insert(0usize) += count;
++            }
++        }
++        let mut unmodelled_insns: Vec<_> = insns.into_iter().collect();
++        unmodelled_insns.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
++        emit::set_shared_stack(false);
++        emit::set_seh_active(false);
++        emit::set_gnu_eh_funcs(std::collections::HashSet::new());
++        emit::set_gnu_eh_frames(std::collections::HashSet::new());
++        return Ok(TranspileReport {
++            out_dir: out_dir.to_path_buf(),
++            binary: std::path::PathBuf::new(),
++            functions: funcs.len(),
++            bits: prog.bitness.bits() as u32,
++            lifted: internal_funcs.len() - partial,
++            partial,
++            host_backed: host_funcs.len(),
++            unresolved: unresolved.difference(&defined).copied().collect(),
++            unimplemented_imports: unimplemented_imports.into_iter().collect(),
++            unmodelled_insns,
++            run_output: None,
++        });
++    }
++
+     let irfs: Vec<_> = internal_funcs.iter().map(|&f| lower(prog, f)).collect();
+     let n_funcs = funcs.len();
+     // Classification (for honest reporting): translated functions split into fully
+@@ -1328,7 +1424,7 @@ pub fn transpile(
+     // Soundness: which called shims have no real implementation (they would hit
+     // the weak "unimplemented" stub — warn + return 0, a silent wrong result).
+     let unimplemented_imports: Vec<String> = {
+-        let impl_set = implemented_shims();
++        let impl_set = implemented_shims(wasm);
+         collect_named_calls(&irfs)
+             .into_iter()
+             .filter(|n| n.starts_with("aret_") && !impl_set.contains(n) && !is_setjmp_intrinsic(n))
+@@ -1336,26 +1432,6 @@ pub fn transpile(
+     };
+     // The complete per-instruction lift-gap list (for the wall map + the report).
+     let unmodelled_insns = collect_unmodelled_insns(&irfs);
+-    // `--mode walls`: the caller only wants the coverage-gap map, so stop here —
+-    // before the expensive emit / layout / compile — with everything the report
+-    // needs already computed. Same recovery + lift as a real transpile, so the
+-    // map is exactly the one the produced binary would have.
+-    if walls_only {
+-        let unresolved = collect_undef_subs(&irfs);
+-        return Ok(TranspileReport {
+-            out_dir: out_dir.to_path_buf(),
+-            binary: std::path::PathBuf::new(),
+-            functions: n_funcs,
+-            bits: prog.bitness.bits() as u32,
+-            lifted: n_lifted,
+-            partial: n_partial,
+-            host_backed: n_host,
+-            unresolved,
+-            unimplemented_imports,
+-            unmodelled_insns,
+-            run_output: None,
+-        });
+-    }
+     // The IR is no longer needed; free it before spawning the parallel compilers
+     // (which need the memory) on a large program.
+     drop(irfs);
+@@ -1405,11 +1481,11 @@ pub fn transpile(
+     let mut dll_init_calls = String::new();
+     for &(entry, base) in &prog.dll_inits {
+         dll_init_decls.push_str(&format!(
+-            "         uint64_t sub_{entry:x}(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);\n"
++            "         uint64_t sub_{entry:x}(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);\n"
+         ));
+         dll_init_calls.push_str(&format!(
+             "    {{ uint32_t *dsp=(uint32_t*)top; dsp[0]=0; dsp[1]=0x{base:x}u; dsp[2]=1u; dsp[3]=0u; \
+-             sub_{entry:x}((uint64_t)(uintptr_t)top, 0x{base:x}u, 1u, 0, 0); }}\n"
++             sub_{entry:x}((uint64_t)(uintptr_t)top, 0x{base:x}u, 1u, 0, 0, 0, 0, 0); }}\n"
+         ));
+     }
+     // C++ global constructors (doc 71 2026-08-08): mingw defers these to
+@@ -1422,10 +1498,10 @@ pub fn transpile(
+     let mut ctor_calls = String::new();
+     for &va in &prog.ctor_list {
+         ctor_decls.push_str(&format!(
+-            "         uint64_t sub_{va:x}(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);\n"
++            "         uint64_t sub_{va:x}(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);\n"
+         ));
+         ctor_calls.push_str(&format!(
+-            "    {{ uint32_t *csp=(uint32_t*)top; csp[0]=0; sub_{va:x}((uint64_t)(uintptr_t)top, 0, 0, 0, 0); }}\n"
++            "    {{ uint32_t *csp=(uint32_t*)top; csp[0]=0; sub_{va:x}((uint64_t)(uintptr_t)top, 0, 0, 0, 0, 0, 0, 0); }}\n"
+         ));
+     }
+     // PE TLS callbacks: the Windows loader runs these at process attach, BEFORE each
+@@ -1436,11 +1512,11 @@ pub fn transpile(
+     let mut tls_init_calls = String::new();
+     for &(cb, base) in &prog.tls_inits {
+         tls_init_decls.push_str(&format!(
+-            "         uint64_t sub_{cb:x}(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);\n"
++            "         uint64_t sub_{cb:x}(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);\n"
+         ));
+         tls_init_calls.push_str(&format!(
+             "    {{ uint32_t *tsp=(uint32_t*)top; tsp[0]=0; tsp[1]=0x{base:x}u; tsp[2]=1u; tsp[3]=0u; \
+-             sub_{cb:x}((uint64_t)(uintptr_t)top, 0x{base:x}u, 1u, 0, 0); }}\n"
++             sub_{cb:x}((uint64_t)(uintptr_t)top, 0x{base:x}u, 1u, 0, 0, 0, 0, 0); }}\n"
+         ));
+     }
+     let main_c = format!(
+@@ -1455,7 +1531,7 @@ pub fn transpile(
+          void __aret_map_memory(void);\n\
+          void __aret_patch_iat(void);\n\
+          void __aret_set_stack_bounds(uint32_t base, uint32_t limit);\n\
+-         uint64_t sub_{entry:x}(uint64_t __esp, uint64_t a, uint64_t c, uint64_t d, uint64_t b);\n\
++         uint64_t sub_{entry:x}(uint64_t __esp, uint64_t a, uint64_t c, uint64_t d, uint64_t b, uint64_t si, uint64_t di, uint64_t bx);\n\
+          {dll_init_decls}\
+          {ctor_decls}\
+          {tls_init_decls}\
+@@ -1479,7 +1555,7 @@ pub fn transpile(
+          \x20   sp[1] = (uint32_t)argc;                   /* argc  @ esp+4 */\n\
+          \x20   sp[2] = {argv_expr};        /* argv  @ esp+8 */\n\
+          \x20   uint64_t esp = (uint64_t)(uintptr_t)top;\n\
+-         \x20   return (int)sub_{entry:x}(esp, (uint32_t)argc, {argv_expr}, 0, 0);\n\
++         \x20   return (int)sub_{entry:x}(esp, (uint32_t)argc, {argv_expr}, 0, 0, 0, 0, 0);\n\
+          }}\n",
+     );
+ 
+@@ -1492,10 +1568,10 @@ pub fn transpile(
+     // function address (aborts via aret_unmodelled — unknown code, must not be
+     // faked). The program links even though static recovery is incomplete, and
+     // the gaps fail loud at runtime instead of returning a wrong result.
+-    let mut stubs = emit_import_stubs(prog);
++    let mut stubs = emit_import_stubs(prog, wasm);
+     for &addr in &undef_subs {
+         stubs.push_str(&format!(
+-            "__attribute__((weak)) uint64_t sub_{addr:x}(uint64_t e,uint64_t a,uint64_t c,uint64_t d,uint64_t b){{ (void)e;(void)a;(void)c;(void)d;(void)b; aret_unmodelled(\"sub_{addr:x} (unrecovered function)\"); return 0; }}\n"
++            "__attribute__((weak)) uint64_t sub_{addr:x}(uint64_t e,uint64_t a,uint64_t c,uint64_t d,uint64_t b,uint64_t si,uint64_t di,uint64_t bx){{ (void)e;(void)a;(void)c;(void)d;(void)b;(void)si;(void)di;(void)bx; aret_unmodelled(\"sub_{addr:x} (unrecovered function)\"); return 0; }}\n"
+         ));
+     }
+     // A global ctor that ARET recovered gets a strong `sub_<va>` in a chunk (it runs and
+@@ -1506,7 +1582,7 @@ pub fn transpile(
+     // a no-op'd glue ctor is not an "unrecovered function", it is meant to do nothing.)
+     for &va in &prog.ctor_list {
+         stubs.push_str(&format!(
+-            "__attribute__((weak)) uint64_t sub_{va:x}(uint64_t e,uint64_t a,uint64_t c,uint64_t d,uint64_t b){{ (void)e;(void)a;(void)c;(void)d;(void)b; return 0; }}\n"
++            "__attribute__((weak)) uint64_t sub_{va:x}(uint64_t e,uint64_t a,uint64_t c,uint64_t d,uint64_t b,uint64_t si,uint64_t di,uint64_t bx){{ (void)e;(void)a;(void)c;(void)d;(void)b;(void)si;(void)di;(void)bx; return 0; }}\n"
+         ));
+     }
+     // Indirect-call dispatch table: internal entries (translated) + host-backed
+@@ -1557,7 +1633,7 @@ pub fn transpile(
+         "aret_dispatch.c",
+         &format!(
+             "{}{}{}",
+-            emit_dispatch(&internal_entries, &host_funcs, &iat_slots),
++            emit_dispatch(&internal_entries, &host_funcs, &iat_slots, wasm),
+             emit_lifted_exports(&prog.dll_exports),
+             emit_gnu_eh_tables(prog)
+         ),
+@@ -1751,14 +1827,51 @@ pub fn transpile(
+         sources.extend(chunk_srcs);
+         let clang = std::env::var("WASM_CC").unwrap_or_else(|_| "clang".to_string());
+         let sysroot = std::env::var("WASI_SYSROOT").unwrap_or_else(|_| "/usr".to_string());
++        // Reuse the native build's dependency-validated object cache. Compile
++        // separately so a runtime correction does not rebuild all lifted code.
++        let c_flags: Vec<String> = [
++            "--target=wasm32-wasi", "-O1", "-w", "-Wno-implicit-function-declaration",
++            "-fno-strict-aliasing", "-fno-builtin", "-c",
++        ].iter().map(|flag| flag.to_string())
++            .chain(std::iter::once(format!("--sysroot={sysroot}"))).collect();
++        let cache = objcache::ObjCache::open(&clang);
++        let cache_hits = std::sync::atomic::AtomicUsize::new(0);
++        use rayon::prelude::*;
++        let objs: Result<Vec<std::path::PathBuf>> = sources.par_iter().map(|src| {
++            let obj = out_dir.join(format!("{}.o", src.file_name().unwrap().to_string_lossy()));
++            let pending = cache.as_ref()
++                .and_then(|c| c.begin(&c_flags, src, out_dir).map(|p| (c, p)));
++            if let Some((c, p)) = &pending {
++                if c.lookup(p, out_dir, &obj) {
++                    cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                    return Ok(obj);
++                }
++            }
++            eprintln!("compiling {}", src.display());
++            let mut cmd = Command::new(&clang);
++            cmd.args(&c_flags).arg(src).arg("-I").arg(out_dir).arg("-o").arg(&obj);
++            if let Some((_, p)) = &pending {
++                cmd.arg("-MD").arg("-MF").arg(&p.depfile);
++            }
++            let out = cmd.output().with_context(|| format!("failed to run {clang}"))?;
++            if !out.status.success() {
++                bail!("compile {} failed:\n{}", src.display(),
++                    String::from_utf8_lossy(&out.stderr).trim());
++            }
++            if let Some((c, p)) = &pending { c.store(p, out_dir, &obj); }
++            Ok(obj)
++        }).collect();
++        let objs = objs?;
++        eprintln!("note: {} object(s) compiled, {} reused from cache",
++            objs.len() - cache_hits.load(std::sync::atomic::Ordering::Relaxed),
++            cache_hits.load(std::sync::atomic::Ordering::Relaxed));
++        if let Some(c) = &cache { c.trim(); }
+         let out = Command::new(&clang)
+-            .args(["--target=wasm32-wasi", "-O0", "-w", "-Wno-implicit-function-declaration",
+-                   "-fno-strict-aliasing", "-fno-builtin"])
++            .arg("--target=wasm32-wasi")
+             .arg(format!("--sysroot={sysroot}"))
+             .arg(format!("-Wl,--global-base={wasm_global_base}"))
+             .arg("-Wl,-z,stack-size=2097152")
+-            .arg("-I").arg(out_dir)
+-            .args(&sources)
++            .args(&objs)
+             .arg("-o").arg(&binary)
+             .output()
+             .with_context(|| format!("failed to run {clang} (set WASM_CC?)"))?;
+@@ -1998,3 +2111,23 @@ mod snapshot_tests {
+         let _ = std::fs::remove_file(&path);
+     }
+ }
++
++#[cfg(test)]
++mod platform_inventory_tests {
++    use super::*;
++
++    #[test]
++    fn wasm_inventory_excludes_native_only_definitions() {
++        let native = implemented_shims(false);
++        let wasm = implemented_shims(true);
++        assert!(native.contains("aret_WSAStartup"));
++        assert!(!wasm.contains("aret_WSAStartup"));
++        assert!(wasm.contains("aret_GetStdHandle"));
++        let table = emit_hle_shim_table(true);
++        assert!(!table.contains("aret_WSASocketA"));
++        assert!(table.contains("aret_GetStdHandle"));
++        let nested = "#ifndef __wasm__\n#if FEATURE\nnative_a\n#else\nnative_b\n#endif\n#else\nwasm_a\n#endif\nshared\n";
++        assert_eq!(runtime_source_for_target(nested, true),
++            "#else\nwasm_a\n#endif\nshared\n");
++    }
++}
+diff --git a/src/cpudiff.rs b/src/cpudiff.rs
+index c45f35e..92c300a 100644
+--- a/src/cpudiff.rs
++++ b/src/cpudiff.rs
+@@ -220,6 +220,10 @@ impl Interp {
+         FUNCDIFF_MEMCALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+         const CAP: u64 = 0x10_0000; // 1 MiB — larger copies/fills skip
+         match name {
++            "__aret_memory_fence" if args.is_empty() => {
++                std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
++                Some(())
++            }
+             "memcpy" | "memmove" if args.len() == 3 => {
+                 let dst = self.eval(&args[0])?;
+                 let src = self.eval(&args[1])?;
+@@ -425,6 +429,8 @@ impl Interp {
+                 self.mem_write(a, ty_bytes(ty)?, v)
+             }
+             Stmt::Nop => Some(()),
++            Stmt::CallStmt(Expr::Call { target: CallTarget::Named(name), args, .. })
++                if is_modeled_memcall(name, args.len()) => self.do_memcall(name, args),
+             // A branch, call, asm, … — not part of a single-instruction
+             // arithmetic test; bail so the case is skipped rather than mis-scored.
+             _ => None,
+@@ -1139,6 +1145,8 @@ fn helper_call(name: &str, a: &[u64]) -> Option<u64> {
+         "__fp_sub32" => p32(g32(a[0]) - g32(a[1])),
+         "__fp_mul32" => p32(g32(a[0]) * g32(a[1])),
+         "__fp_div32" => p32(g32(a[0]) / g32(a[1])),
++        "__fp_sqrt32" => p32(g32(a[0]).sqrt()),
++        "__fp_sqrt64" => p64(g64(a[0]).sqrt()),
+         // int -> float (exact for i32 into f64; rounds otherwise, round-to-even)
+         "__fp_i32_64" => p64((a[0] as u32 as i32) as f64),
+         "__fp_i64_64" => p64((a[0] as i64) as f64),
+@@ -2295,7 +2303,8 @@ fn is_stub_import(name: &str) -> bool {
+ /// (`do_memcall`): the synthetic `memcpy`/`memmove` (from `rep movs`) and
+ /// `__rep_stos*` (from `rep stos`), each with explicit `(dst, src/val, len)`.
+ fn is_modeled_memcall(name: &str, argc: usize) -> bool {
+-    (argc == 3 && matches!(name, "memcpy" | "memmove"))
++    (argc == 0 && name == "__aret_memory_fence")
++        || (argc == 3 && matches!(name, "memcpy" | "memmove"))
+         || (argc == 4
+             && matches!(
+                 name,
+@@ -3016,6 +3025,22 @@ pub fn run_functions_opt(path: &str, iters: u32) -> Result<Vec<FnMismatch>, Stri
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn memory_fences_preserve_architectural_state() {
++        let mut seed = 0x8d4927b1906fe35a;
++        for bytes in [vec![0x0f, 0xae, 0xe8], vec![0x0f, 0xae, 0xf0], vec![0x0f, 0xae, 0xf8]] {
++            let lifted = crate::ir::lift::lift(&super::decode(&bytes), 32);
++            assert!(matches!(&lifted[..], [Stmt::CallStmt(Expr::Call { target: CallTarget::Named(name), .. })]
++                if name == "__aret_memory_fence"));
++            let state = super::CpuState { regs: [super::DATA_PTR; 8],
++                flags: Default::default(), xmm: [[0; 2]; 8] };
++            let mut interp = super::Interp::new(&state, vec![0; super::DATA_SIZE]);
++            for stmt in &lifted { assert!(interp.exec(stmt).is_some()); }
++            let mismatches = super::diff_one(&bytes, 1024, &mut seed).expect("fence oracle");
++            assert!(mismatches.is_empty(), "fence state mismatches: {mismatches:?}");
++        }
++    }
++
+     /// Per-instruction differential: every instruction in the curated `corpus()`
+     /// (arithmetic/logic/shift/SSE + the stack/frame family) lifted and run
+     /// against Unicorn over thousands of random register/flag/memory states must
+@@ -3023,6 +3048,296 @@ mod tests {
+     /// direct, by-construction coverage of the instruction space — the layer that
+     /// catches lift bugs a real binary would only hit by luck (the `push [esp+d]`
+     /// off-by-slot bug lived exactly here). A divergence is a real lift bug.
++    #[test]
++    fn packed_float_conversions_match_unicorn() {
++        let mut seed = 0x9e3779b97f4a7c15;
++        for bytes in [
++            vec![0x0f, 0x5a, 0xc0],       // cvtps2pd xmm0,xmm0
++            vec![0x0f, 0x5a, 0xc1],       // cvtps2pd xmm0,xmm1
++            vec![0x0f, 0x5a, 0x00],       // cvtps2pd xmm0,[eax] (64-bit load)
++            vec![0x66, 0x0f, 0x5a, 0xc0], // cvtpd2ps xmm0,xmm0
++            vec![0x66, 0x0f, 0x5a, 0xc1], // cvtpd2ps xmm0,xmm1
++            vec![0x66, 0x0f, 0x5a, 0x00], // cvtpd2ps xmm0,[eax] (128-bit load)
++        ] {
++            let lifted = crate::ir::lift::lift(&super::decode(&bytes), 32);
++            assert!(!lifted.iter().any(|s| matches!(s, super::Stmt::Asm(_))));
++            // Ensure these cases can execute in the interpreter rather than
++            // silently passing through the differential harness's skip path.
++            let state = super::CpuState { regs: [super::DATA_PTR; 8],
++                flags: Default::default(), xmm: [[0; 2]; 8] };
++            let mut interp = super::Interp::new(&state, vec![0; super::DATA_SIZE]);
++            for stmt in &lifted {
++                assert!(interp.exec(stmt).is_some());
++            }
++            let mismatches = super::diff_one(&bytes, 512, &mut seed).expect("conversion oracle");
++            assert!(mismatches.is_empty(), "conversion mismatches: {mismatches:?}");
++        }
++    }
++
++    #[test]
++    fn quadword_shifts_match_unicorn() {
++        let mut seed = 0x9e3779b97f4a7c15;
++        let mut cases = Vec::new();
++        for group in [0xd0, 0xf0] {
++            for count in [0, 1, 63, 64, 65, 255] {
++                cases.push(vec![0x66, 0x0f, 0x73, group, count]);
++            }
++        }
++        for opcode in [0xd3, 0xf3] {
++            for operand in [0xc0, 0xc1, 0x00] {
++                cases.push(vec![0x66, 0x0f, opcode, operand]);
++            }
++        }
++        for bytes in cases {
++            let lifted = crate::ir::lift::lift(&decode(&bytes), 32);
++            assert!(!lifted.iter().any(|s| matches!(s, Stmt::Asm(_))));
++            let state = CpuState { regs: [DATA_PTR; 8],
++                flags: Default::default(), xmm: [[0; 2]; 8] };
++            let mut interp = Interp::new(&state, vec![0; DATA_SIZE]);
++            for stmt in &lifted { assert!(interp.exec(stmt).is_some()); }
++            let mismatches = diff_one(&bytes, 1024, &mut seed).unwrap();
++            assert!(mismatches.is_empty(), "quadword shift mismatches: {mismatches:?}");
++        }
++        // Random 64-bit counts mostly exceed 63. Exercise actual shifts and
++        // boundary counts explicitly, including a destination/source alias.
++        for opcode in [0xd3, 0xf3] {
++            for operand in [0xc0, 0xc1, 0x00] {
++                let bytes = [0x66, 0x0f, opcode, operand];
++                let lifted = crate::ir::lift::lift(&decode(&bytes), 32);
++                unsafe {
++                    let mut uc = std::ptr::null_mut();
++                    assert_eq!(uc_open(UC_ARCH_X86, UC_MODE_32, &mut uc), 0);
++                    assert_eq!(uc_mem_map(uc, CODE_ADDR, 4096, UC_PROT_ALL), 0);
++                    assert_eq!(uc_mem_map(uc, DATA_ADDR, DATA_SIZE, UC_PROT_ALL), 0);
++                    assert_eq!(uc_mem_write(uc, CODE_ADDR, bytes.as_ptr().cast(), bytes.len()), 0);
++                    for count in [0u64, 1, 31, 63, 64, 65, u64::MAX] {
++                        let mut st = CpuState { regs: [DATA_PTR; 8],
++                            flags: Default::default(), xmm: [[0; 2]; 8] };
++                        st.xmm[0] = [0x8123456789abcdef, 0xfedcba9876543210];
++                        st.xmm[1] = [count, u64::MAX];
++                        if operand == 0xc0 { st.xmm[0][0] = count; }
++                        let mut memory = vec![0; DATA_SIZE];
++                        memory[0x80..0x88].copy_from_slice(&count.to_le_bytes());
++                        memory[0x88..0x90].fill(0xff);
++                        let mut interp = Interp::new(&st, memory.clone());
++                        for stmt in &lifted { assert!(interp.exec(stmt).is_some()); }
++                        assert_eq!(uc_mem_write(uc, DATA_ADDR, memory.as_ptr().cast(), DATA_SIZE), 0);
++                        let address = DATA_PTR as u32;
++                        assert_eq!(uc_reg_write(uc, UC_X86_REG_EAX, (&address as *const u32).cast()), 0);
++                        for n in 0..2 {
++                            assert_eq!(uc_reg_write(uc, UC_X86_REG_XMM0 + n as c_int,
++                                st.xmm[n].as_ptr().cast()), 0);
++                        }
++                        assert_eq!(uc_emu_start(uc, CODE_ADDR, CODE_ADDR + 4, 0, 1), 0);
++                        let mut actual = [0u64; 2];
++                        assert_eq!(uc_reg_read(uc, UC_X86_REG_XMM0, actual.as_mut_ptr().cast()), 0);
++                        assert_eq!(interp.xmm[0], actual, "{bytes:02x?}, count={count}");
++                    }
++                    assert_eq!(uc_close(uc), 0);
++                }
++            }
++        }
++
++    }
++
++    #[test]
++    fn packed_double_comparisons_match_unicorn() {
++        let mut seed = 0x9e3779b97f4a7c15;
++        for predicate in 0..8 {
++            for operand in [0xc0, 0xc1, 0x00] {
++                let bytes = [0x66, 0x0f, 0xc2, operand, predicate];
++                let lifted = crate::ir::lift::lift(&decode(&bytes), 32);
++                assert!(!lifted.iter().any(|s| matches!(s, Stmt::Asm(_))));
++                let state = CpuState { regs: [DATA_PTR; 8],
++                    flags: Default::default(), xmm: [[0; 2]; 8] };
++                let mut interp = Interp::new(&state, vec![0; DATA_SIZE]);
++                for stmt in &lifted { assert!(interp.exec(stmt).is_some()); }
++                let mismatches = diff_one(&bytes, 1024, &mut seed).unwrap();
++                assert!(mismatches.is_empty(), "packed compare mismatches: {mismatches:?}");
++            }
++            let bytes = [0x66, 0x0f, 0xc2, 0xc1, predicate];
++            let lifted = crate::ir::lift::lift(&decode(&bytes), 32);
++            let cases = [0u64, 0x8000000000000000, 0x7ff8000000000021,
++                0x7ff0000000000043, 0x7ff0000000000000, 0xfff0000000000000,
++                0x3ff0000000000000, 0xbff0000000000000];
++            unsafe {
++                let mut uc = std::ptr::null_mut();
++                assert_eq!(uc_open(UC_ARCH_X86, UC_MODE_32, &mut uc), 0);
++                assert_eq!(uc_mem_map(uc, CODE_ADDR, 4096, UC_PROT_ALL), 0);
++                assert_eq!(uc_mem_write(uc, CODE_ADDR, bytes.as_ptr().cast(), bytes.len()), 0);
++                for &a in &cases {
++                    for &b in &cases {
++                        let mut st = CpuState { regs: [DATA_PTR; 8],
++                            flags: Default::default(), xmm: [[0; 2]; 8] };
++                        st.xmm[0] = [a, b];
++                        st.xmm[1] = [b, a];
++                        let mut interp = Interp::new(&st, vec![0; DATA_SIZE]);
++                        for stmt in &lifted { assert!(interp.exec(stmt).is_some()); }
++                        let mxcsr = 0x1f80u32;
++                        assert_eq!(uc_reg_write(uc, UC_X86_REG_MXCSR, (&mxcsr as *const u32).cast()), 0);
++                        for n in 0..2 {
++                            assert_eq!(uc_reg_write(uc, UC_X86_REG_XMM0 + n as c_int,
++                                st.xmm[n].as_ptr().cast()), 0);
++                        }
++                        assert_eq!(uc_emu_start(uc, CODE_ADDR, CODE_ADDR + 5, 0, 1), 0);
++                        let mut actual = [0u64; 2];
++                        assert_eq!(uc_reg_read(uc, UC_X86_REG_XMM0, actual.as_mut_ptr().cast()), 0);
++                        assert_eq!(interp.xmm[0], actual, "predicate={predicate}, a={a:x}, b={b:x}");
++                    }
++                }
++                assert_eq!(uc_close(uc), 0);
++            }
++        }
++    }
++
++    #[test]
++    fn double_masks_and_blends_match_unicorn() {
++        let mut seed = 0x9e3779b97f4a7c15;
++        let mut cases = Vec::new();
++        for operand in [0xc0, 0xc1, 0xd3] {
++            cases.push(vec![0x66, 0x0f, 0x50, operand]);
++        }
++        for operand in [0xc0, 0xc1, 0xd0, 0xd1, 0xd2, 0x10] {
++            cases.push(vec![0x66, 0x0f, 0x38, 0x15, operand]);
++        }
++        for bytes in cases {
++            let lifted = crate::ir::lift::lift(&decode(&bytes), 32);
++            assert!(!lifted.iter().any(|s| matches!(s, Stmt::Asm(_))));
++            let state = CpuState { regs: [DATA_PTR; 8],
++                flags: Default::default(), xmm: [[0; 2]; 8] };
++            let mut interp = Interp::new(&state, vec![0; DATA_SIZE]);
++            for stmt in &lifted { assert!(interp.exec(stmt).is_some()); }
++            let mismatches = diff_one(&bytes, 1024, &mut seed).unwrap();
++            assert!(mismatches.is_empty(), "double masks/blends mismatches: {mismatches:?}");
++        }
++        let bytes = [0x66, 0x0f, 0x38, 0x15, 0xd1]; // xmm2,xmm1, implicit xmm0
++        let lifted = crate::ir::lift::lift(&decode(&bytes), 32);
++        unsafe {
++            let mut uc = std::ptr::null_mut();
++            assert_eq!(uc_open(UC_ARCH_X86, UC_MODE_32, &mut uc), 0);
++            assert_eq!(uc_mem_map(uc, CODE_ADDR, 4096, UC_PROT_ALL), 0);
++            assert_eq!(uc_mem_write(uc, CODE_ADDR, bytes.as_ptr().cast(), bytes.len()), 0);
++            for a in [0u64, 1, 0x7fffffffffffffff, 0x8000000000000000, u64::MAX] {
++                for b in [0u64, 1, 0x7fffffffffffffff, 0x8000000000000000, u64::MAX] {
++                    let mut st = CpuState { regs: [DATA_PTR; 8],
++                        flags: Default::default(), xmm: [[0; 2]; 8] };
++                    st.xmm[0] = [a, b];
++                    st.xmm[1] = [0x0123456789abcdef, 0xfedcba9876543210];
++                    st.xmm[2] = [0x1111111111111111, 0x2222222222222222];
++                    let mut interp = Interp::new(&st, vec![0; DATA_SIZE]);
++                    for stmt in &lifted { assert!(interp.exec(stmt).is_some()); }
++                    for n in 0..3 {
++                        assert_eq!(uc_reg_write(uc, UC_X86_REG_XMM0 + n as c_int,
++                            st.xmm[n].as_ptr().cast()), 0);
++                    }
++                    assert_eq!(uc_emu_start(uc, CODE_ADDR, CODE_ADDR + 5, 0, 1), 0);
++                    let mut actual = [0u64; 2];
++                    assert_eq!(uc_reg_read(uc, UC_X86_REG_XMM0 + 2, actual.as_mut_ptr().cast()), 0);
++                    assert_eq!(interp.xmm[2], actual, "blend masks={a:x}/{b:x}");
++                }
++            }
++            assert_eq!(uc_close(uc), 0);
++        }
++    }
++
++    #[test]
++    fn scalar_sqrt_matches_unicorn() {
++        let mut seed = 0x9e3779b97f4a7c15;
++        for prefix in [0xf3, 0xf2] {
++            for operand in [0xc0, 0xc1, 0x00] {
++                let bytes = [prefix, 0x0f, 0x51, operand];
++                let lifted = crate::ir::lift::lift(&decode(&bytes), 32);
++                assert!(!lifted.iter().any(|s| matches!(s, Stmt::Asm(_))));
++                let state = CpuState { regs: [DATA_PTR; 8],
++                    flags: Default::default(), xmm: [[0; 2]; 8] };
++                let mut interp = Interp::new(&state, vec![0; DATA_SIZE]);
++                for stmt in &lifted { assert!(interp.exec(stmt).is_some()); }
++                let mismatches = diff_one(&bytes, 1024, &mut seed).unwrap();
++                assert!(mismatches.is_empty(), "sqrt mismatches: {mismatches:?}");
++            }
++        }
++    }
++
++    #[test]
++    fn scalar_min_max_match_unicorn() {
++        let mut seed = 0x9e3779b97f4a7c15;
++        for prefix in [0xf3, 0xf2] {
++            for opcode in [0x5d, 0x5f] {
++                for operand in [0xc0, 0xc1, 0x00] {
++                    let bytes = [prefix, 0x0f, opcode, operand];
++                    let lifted = crate::ir::lift::lift(&decode(&bytes), 32);
++                    assert!(!lifted.iter().any(|s| matches!(s, Stmt::Asm(_))));
++                    let state = CpuState { regs: [DATA_PTR; 8],
++                        flags: Default::default(), xmm: [[0; 2]; 8] };
++                    let mut interp = Interp::new(&state, vec![0; DATA_SIZE]);
++                    for stmt in &lifted { assert!(interp.exec(stmt).is_some()); }
++                    let mismatches = diff_one(&bytes, 512, &mut seed).unwrap();
++                    assert!(mismatches.is_empty(), "min/max mismatches: {mismatches:?}");
++                }
++                // Directed edge cases: both signed zeros, NaNs with payloads,
++                // infinities, and finite values. Compare the complete XMM register
++                // so preserving its upper lanes is checked too.
++                let bytes = [prefix, 0x0f, opcode, 0xc1];
++                let lifted = crate::ir::lift::lift(&decode(&bytes), 32);
++                let cases: &[u64] = if prefix == 0xf3 {
++                    &[0, 0x80000000, 0x7fc00021, 0x7f800043, 0x7f800000,
++                      0xff800000, 0x3f800000, 0xbf800000]
++                } else {
++                    &[0, 0x8000000000000000, 0x7ff8000000000021, 0x7ff0000000000043,
++                      0x7ff0000000000000, 0xfff0000000000000,
++                      0x3ff0000000000000, 0xbff0000000000000]
++                };
++                unsafe {
++                    let mut uc = std::ptr::null_mut();
++                    assert_eq!(uc_open(UC_ARCH_X86, UC_MODE_32, &mut uc), 0);
++                    assert_eq!(uc_mem_map(uc, CODE_ADDR, 4096, UC_PROT_ALL), 0);
++                    assert_eq!(uc_mem_write(uc, CODE_ADDR, bytes.as_ptr().cast(), bytes.len()), 0);
++                    for &a in cases {
++                        for &b in cases {
++                            let mut st = CpuState { regs: [DATA_PTR; 8],
++                                flags: Default::default(), xmm: [[0; 2]; 8] };
++                            st.xmm[0] = [a, 0x123456789abcdef0];
++                            if prefix == 0xf3 { st.xmm[0][0] |= 0x7654321000000000; }
++                            st.xmm[1] = [b, 0xfedcba9876543210];
++                            let mut interp = Interp::new(&st, vec![0; DATA_SIZE]);
++                            for stmt in &lifted { assert!(interp.exec(stmt).is_some()); }
++                            let mxcsr = 0x1f80u32; // masked exceptions, no flush-to-zero
++                            assert_eq!(uc_reg_write(uc, UC_X86_REG_MXCSR, (&mxcsr as *const u32).cast()), 0);
++                            for n in 0..2 {
++                                assert_eq!(uc_reg_write(uc, UC_X86_REG_XMM0 + n as c_int,
++                                    st.xmm[n].as_ptr().cast()), 0);
++                            }
++                            assert_eq!(uc_emu_start(uc, CODE_ADDR, CODE_ADDR + 4, 0, 1), 0);
++                            let mut actual = [0u64; 2];
++                            assert_eq!(uc_reg_read(uc, UC_X86_REG_XMM0, actual.as_mut_ptr().cast()), 0);
++                            assert_eq!(interp.xmm[0], actual, "{bytes:02x?}, a={a:x}, b={b:x}");
++                        }
++                    }
++                    assert_eq!(uc_close(uc), 0);
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn lahf_matches_unicorn_after_arithmetic() {
++        let lifted = crate::ir::lift::lift(&super::decode(&[0x9f]), 32);
++        assert!(!lifted.iter().any(|s| matches!(s, super::Stmt::Asm(_))));
++        let mut seed = 0x9e3779b97f4a7c15;
++        assert!(super::diff_one(&[0x9f], 512, &mut seed).unwrap().is_empty());
++        for arithmetic in [
++            vec![0x00, 0xc8],       // add al,cl
++            vec![0x38, 0xc8],       // cmp al,cl
++            vec![0x66, 0x01, 0xc8], // add ax,cx
++            vec![0x66, 0x39, 0xc8], // cmp ax,cx
++            vec![0x01, 0xc8],       // add eax,ecx
++            vec![0x39, 0xc8],       // cmp eax,ecx
++        ] {
++            let mismatches = super::diff_seq(&[arithmetic, vec![0x9f]], 512, &mut seed).unwrap();
++            assert!(mismatches.is_empty(), "flag capture mismatches: {mismatches:?}");
++        }
++    }
++
+     #[test]
+     fn per_instruction_corpus_matches_unicorn() {
+         let mismatches = super::run(4000).expect("cpudiff corpus run");
+diff --git a/src/emit/mod.rs b/src/emit/mod.rs
+index 925967c..ad6ef59 100644
+--- a/src/emit/mod.rs
++++ b/src/emit/mod.rs
+@@ -110,6 +110,7 @@ fn redirect_terminator(last: Option<&mut Stmt>, from: u32, to: u32) {
+ /// with native (IEEE-754) `float`/`double`, and reinterpret back, so the
+ /// decompiled floating-point arithmetic is bit-exact with the original binary.
+ pub(crate) const FLOAT_HELPERS: &str = concat!(
++    "static inline uint64_t __aret_memory_fence(void){__atomic_thread_fence(__ATOMIC_SEQ_CST);return 0;}\n",
+     "typedef union{uint32_t u;float f;}__fp32;typedef union{uint64_t u;double d;}__fp64;\n",
+     "static inline uint64_t __fp_f32(float f){__fp32 t;t.f=f;return t.u;}\n",
+     "static inline float __fp_g32(uint64_t b){__fp32 t;t.u=(uint32_t)b;return t.f;}\n",
+@@ -123,6 +124,8 @@ pub(crate) const FLOAT_HELPERS: &str = concat!(
+     "static inline uint64_t __fp_sub64(uint64_t a,uint64_t b){return __fp_f64(__fp_g64(a)-__fp_g64(b));}\n",
+     "static inline uint64_t __fp_mul64(uint64_t a,uint64_t b){return __fp_f64(__fp_g64(a)*__fp_g64(b));}\n",
+     "static inline uint64_t __fp_div64(uint64_t a,uint64_t b){return __fp_f64(__fp_g64(a)/__fp_g64(b));}\n",
++    "static inline uint64_t __fp_sqrt32(uint64_t a){return __fp_f32(__builtin_sqrtf(__fp_g32(a)));}\n",
++    "static inline uint64_t __fp_sqrt64(uint64_t a){return __fp_f64(__builtin_sqrt(__fp_g64(a)));}\n",
+     "static inline uint64_t __fp_i32_32(uint64_t i){return __fp_f32((float)(int32_t)i);}\n",
+     "static inline uint64_t __fp_i64_32(uint64_t i){return __fp_f32((float)(int64_t)i);}\n",
+     "static inline uint64_t __fp_i32_64(uint64_t i){return __fp_f64((double)(int32_t)i);}\n",
+@@ -366,9 +369,23 @@ pub(crate) const FLOAT_HELPERS: &str = concat!(
+     // real x87 stack: values a runtime-mode callee leaves in st(0) are visible to
+     // its runtime-mode caller, exactly as on hardware. So no per-function reset,
+     // and cross-chunk calls share it.
++    // Integer conversions observe MXCSR, unlike the pure arithmetic helpers.
++    "extern uint32_t __aret_mxcsr;\n",
++    "static inline uint64_t __ssert_getcsr(void){return __aret_mxcsr;}\n",
++    "static inline uint64_t __ssert_setcsr(uint64_t v){if(v&~UINT64_C(0xffff))aret_unmodelled(\"reserved MXCSR bits\");__aret_mxcsr=(uint32_t)v;return 0;}\n",
++    "static inline void __ssert_exception(unsigned f){__aret_mxcsr|=f;if(!(__aret_mxcsr&(f<<7)))aret_unmodelled(\"unmasked SSE conversion exception\");}\n",
++    "static inline uint64_t __ssert_cvt(double x,unsigned w){double r;switch((__aret_mxcsr>>13)&3){case 1:r=__builtin_floor(x);break;case 2:r=__builtin_ceil(x);break;case 3:r=__builtin_trunc(x);break;default:{double l=__builtin_floor(x),d=x-l;r=(d<0.5)?l:(d>0.5)?l+1:(__builtin_fmod(l,2.0)==0)?l:l+1;break;}}double lim=w==32?2147483648.0:9223372036854775808.0;if(!__builtin_isfinite(x)||r < -lim||r >= lim){__ssert_exception(1);return w==32?UINT64_C(0xffffffff80000000):UINT64_C(0x8000000000000000);}if(r!=x)__ssert_exception(32);return w==32?(uint64_t)(int64_t)(int32_t)r:(uint64_t)(int64_t)r;}\n",
++    "static inline uint64_t __ssert_cvt32_i32(uint64_t b){float x=__fp_g32(b);if((__aret_mxcsr&64)&&((b&0x7f800000)==0))x=0;return __ssert_cvt((double)x,32);}\n",
++    "static inline uint64_t __ssert_cvt32_i64(uint64_t b){float x=__fp_g32(b);if((__aret_mxcsr&64)&&((b&0x7f800000)==0))x=0;return __ssert_cvt((double)x,64);}\n",
++    "static inline uint64_t __ssert_cvt64_i32(uint64_t b){double x=__fp_g64(b);if((__aret_mxcsr&64)&&((b&UINT64_C(0x7ff0000000000000))==0))x=0;return __ssert_cvt(x,32);}\n",
++    "static inline uint64_t __ssert_cvt64_i64(uint64_t b){double x=__fp_g64(b);if((__aret_mxcsr&64)&&((b&UINT64_C(0x7ff0000000000000))==0))x=0;return __ssert_cvt(x,64);}\n",
++    "extern uint64_t __aret_sse_regs[32];\n",
++    "static inline uint64_t __aret_sse_get(uint64_t i){return __aret_sse_regs[i];}\n",
++    "static inline uint64_t __aret_sse_set(uint64_t i,uint64_t v){__aret_sse_regs[i]=v;return 0;}\n",
+     "extern long double __x87rt_s[16];\n",
+     "extern int __x87rt_p;\n",
+     "extern int __x87rt_rc;\n",
++    "extern unsigned short __x87rt_cw,__x87rt_tags,__x87rt_sw,__x87rt_opcode,__x87rt_cs,__x87rt_ds;extern unsigned __x87rt_top;extern uint32_t __x87rt_ip,__x87rt_dp;\n",
+     // Bounds-checked slot access: `st(i)` = s[p-1-i]. An out-of-range access means
+     // the runtime stack is inconsistent (e.g. a value an unrecognised callee left
+     // in st(0) was never pushed) — TRAP rather than read stale data, keeping the
+@@ -384,43 +401,49 @@ pub(crate) const FLOAT_HELPERS: &str = concat!(
+     // consider the out-of-range access after the call reachable — the guard must
+     // terminate the path exactly as before, not merely abort at runtime.
+     "extern void aret_x87_stack_error(const char*,int,int) __attribute__((noreturn));\n",
+-    "static inline long double* __x87rt_at(int i){int k=__x87rt_p-1-i;if(k<0||k>=16)aret_x87_stack_error(\"st(i) access\",i,__x87rt_p);return &__x87rt_s[k];}\n",
+-    "static inline void __x87rt_psh(long double v){if(__x87rt_p<0||__x87rt_p>=16)aret_x87_stack_error(\"push\",-1,__x87rt_p);__x87rt_s[__x87rt_p++]=v;}\n",
++    "static inline long double* __x87rt_at(int i){unsigned k=(__x87rt_top+i)&7;if(i<0||i>=8||((__x87rt_tags>>(2*k))&3)==3)aret_x87_stack_error(\"st(i) access\",i,__x87rt_p);return &__x87rt_s[k];}\n",
++    "static inline unsigned __x87rt_class(long double v){if(v==0)return 1;if(!__builtin_isfinite(v))return 2;int e;__builtin_frexpl(v,&e);return e< -16381?2:0;}\n",
++    "static inline void __x87rt_put(long double* p,long double v){unsigned k=(unsigned)(p-__x87rt_s);*p=v;__x87rt_tags=(__x87rt_tags&~(3u<<(2*k)))|(__x87rt_class(v)<<(2*k));}\n",
++    "static inline void __x87rt_pop(void){(void)__x87rt_at(0);__x87rt_tags|=3u<<(2*__x87rt_top);__x87rt_top=(__x87rt_top+1)&7;--__x87rt_p;}\n",
++    "static inline void __x87rt_psh(long double v){unsigned k=(__x87rt_top-1)&7;if((( __x87rt_tags>>(2*k))&3)!=3)aret_x87_stack_error(\"push\",-1,__x87rt_p);__x87rt_top=k;++__x87rt_p;__x87rt_put(&__x87rt_s[k],v);}\n",
+     "static inline uint64_t __x87rt_ld32(uint64_t a){__x87rt_psh((long double)*(float*)(uintptr_t)a);return 0;}\n",
+     "static inline uint64_t __x87rt_ld64(uint64_t a){__x87rt_psh((long double)*(double*)(uintptr_t)a);return 0;}\n",
+-    "static inline uint64_t __x87rt_ld80(uint64_t a){__x87rt_psh(*(long double*)(uintptr_t)a);return 0;}\n",
++    // x86 extended memory is ten bytes, regardless of the host long double ABI.
++    "static inline long double __x87rt_decode80(uint64_t a){const uint8_t* p=(const uint8_t*)(uintptr_t)a;uint64_t m=0;for(int i=0;i<8;i++)m|=(uint64_t)p[i]<<(8*i);unsigned se=p[8]|((unsigned)p[9]<<8),e=se&0x7fff;long double v;if(e==0x7fff)v=(m==UINT64_C(0x8000000000000000))?__builtin_infl():__builtin_nanl(\"\");else v=__builtin_ldexpl((long double)m,(e?e:1)-16383-63);return (se&0x8000)?-v:v;}\n",
++    "static inline uint64_t __x87rt_ld80(uint64_t a){__x87rt_psh(__x87rt_decode80(a));return 0;}\n",
+     "static inline uint64_t __x87rt_ild16(uint64_t a){__x87rt_psh((long double)*(int16_t*)(uintptr_t)a);return 0;}\n",
+     "static inline uint64_t __x87rt_ild32(uint64_t a){__x87rt_psh((long double)*(int32_t*)(uintptr_t)a);return 0;}\n",
+     "static inline uint64_t __x87rt_ild64(uint64_t a){__x87rt_psh((long double)*(int64_t*)(uintptr_t)a);return 0;}\n",
+     "static inline uint64_t __x87rt_ldi(int i){long double v=*__x87rt_at(i);__x87rt_psh(v);return 0;}\n",
+     "static inline uint64_t __x87rt_ld1(void){__x87rt_psh(1.0L);return 0;}\n",
+     "static inline uint64_t __x87rt_ldz(void){__x87rt_psh(0.0L);return 0;}\n",
+-    "static inline uint64_t __x87rt_st32(uint64_t a,int pp){*(float*)(uintptr_t)a=(float)*__x87rt_at(0);if(pp)__x87rt_p--;return 0;}\n",
+-    "static inline uint64_t __x87rt_st64(uint64_t a,int pp){*(double*)(uintptr_t)a=(double)*__x87rt_at(0);if(pp)__x87rt_p--;return 0;}\n",
+-    "static inline uint64_t __x87rt_st80(uint64_t a,int pp){*(long double*)(uintptr_t)a=*__x87rt_at(0);if(pp)__x87rt_p--;return 0;}\n",
++    "static inline uint64_t __x87rt_st32(uint64_t a,int pp){*(float*)(uintptr_t)a=(float)*__x87rt_at(0);if(pp)__x87rt_pop();return 0;}\n",
++    "static inline uint64_t __x87rt_st64(uint64_t a,int pp){*(double*)(uintptr_t)a=(double)*__x87rt_at(0);if(pp)__x87rt_pop();return 0;}\n",
++    "static inline void __x87rt_encode80(uint64_t a,long double v){uint8_t* p=(uint8_t*)(uintptr_t)a;unsigned sign=__builtin_signbit(v)?0x8000:0,e=0;uint64_t m=0;v=__builtin_fabsl(v);if(__builtin_isnan(v)){e=0x7fff;m=UINT64_C(0xc000000000000000);}else if(__builtin_isinf(v)){e=0x7fff;m=UINT64_C(0x8000000000000000);}else if(v!=0){int x;long double f=__builtin_frexpl(v,&x);int be=x+16382;if(be>=0x7fff){e=0x7fff;m=UINT64_C(0x8000000000000000);}else{long double scaled=be>0?__builtin_ldexpl(f,64):__builtin_ldexpl(v,16445);long double hi=__builtin_floorl(__builtin_ldexpl(scaled,-32)),lo=scaled-__builtin_ldexpl(hi,32);m=((uint64_t)(uint32_t)hi<<32)|(uint32_t)lo;long double frac=lo-__builtin_floorl(lo);int up=__x87rt_rc==1?(sign&&frac>0):__x87rt_rc==2?(!sign&&frac>0):__x87rt_rc==3?0:(frac>0.5L||(frac==0.5L&&(m&1)));e=be>0?be:0;if(up&&++m==0){m=UINT64_C(0x8000000000000000);++e;}if(!e&&(m>>63))e=1;}}for(int i=0;i<8;i++)p[i]=(uint8_t)(m>>(8*i));unsigned se=sign|e;p[8]=(uint8_t)se;p[9]=(uint8_t)(se>>8);}\n",
++    "static inline uint64_t __x87rt_st80(uint64_t a,int pp){__x87rt_encode80(a,*__x87rt_at(0));if(pp)__x87rt_pop();return 0;}\n",
+     "static inline long double __x87rt_rnd(long double v){switch(__x87rt_rc){case 1:return __builtin_floorl(v);case 2:return __builtin_ceill(v);case 3:return __builtin_truncl(v);default:return __builtin_rintl(v);}}\n",
+-    "static inline uint64_t __x87rt_ist16(uint64_t a,int pp){*(int16_t*)(uintptr_t)a=(int16_t)(long long)__x87rt_rnd(*__x87rt_at(0));if(pp)__x87rt_p--;return 0;}\n",
+-    "static inline uint64_t __x87rt_ist32(uint64_t a,int pp){*(int32_t*)(uintptr_t)a=(int32_t)(long long)__x87rt_rnd(*__x87rt_at(0));if(pp)__x87rt_p--;return 0;}\n",
+-    "static inline uint64_t __x87rt_ist64(uint64_t a,int pp){*(int64_t*)(uintptr_t)a=(int64_t)__x87rt_rnd(*__x87rt_at(0));if(pp)__x87rt_p--;return 0;}\n",
+-    "static inline uint64_t __x87rt_sti(int i,int pp){*__x87rt_at(i)=*__x87rt_at(0);if(pp)__x87rt_p--;return 0;}\n",
++    "static inline uint64_t __x87rt_ist16(uint64_t a,int pp){*(int16_t*)(uintptr_t)a=(int16_t)(long long)__x87rt_rnd(*__x87rt_at(0));if(pp)__x87rt_pop();return 0;}\n",
++    "static inline uint64_t __x87rt_ist32(uint64_t a,int pp){*(int32_t*)(uintptr_t)a=(int32_t)(long long)__x87rt_rnd(*__x87rt_at(0));if(pp)__x87rt_pop();return 0;}\n",
++    "static inline uint64_t __x87rt_ist64(uint64_t a,int pp){*(int64_t*)(uintptr_t)a=(int64_t)__x87rt_rnd(*__x87rt_at(0));if(pp)__x87rt_pop();return 0;}\n",
++    "static inline uint64_t __x87rt_sti(int i,int pp){__x87rt_put(__x87rt_at(i),*__x87rt_at(0));if(pp)__x87rt_pop();return 0;}\n",
+     "static inline long double __x87rt_op(int o,long double a,long double b){switch(o){case 0:return a+b;case 1:return a-b;case 2:return b-a;case 3:return a*b;case 4:return a/b;default:return b/a;}}\n",
+-    "static inline uint64_t __x87rt_ar(int o,int ai,int bi,int pp){long double* a=__x87rt_at(ai);long double b=*__x87rt_at(bi);*a=__x87rt_op(o,*a,b);if(pp)__x87rt_p--;return 0;}\n",
+-    "static inline uint64_t __x87rt_am32(int o,uint64_t a){long double* t=__x87rt_at(0);*t=__x87rt_op(o,*t,(long double)*(float*)(uintptr_t)a);return 0;}\n",
+-    "static inline uint64_t __x87rt_am64(int o,uint64_t a){long double* t=__x87rt_at(0);*t=__x87rt_op(o,*t,(long double)*(double*)(uintptr_t)a);return 0;}\n",
+-    "static inline uint64_t __x87rt_ami16(int o,uint64_t a){long double* t=__x87rt_at(0);*t=__x87rt_op(o,*t,(long double)*(int16_t*)(uintptr_t)a);return 0;}\n",
+-    "static inline uint64_t __x87rt_ami32(int o,uint64_t a){long double* t=__x87rt_at(0);*t=__x87rt_op(o,*t,(long double)*(int32_t*)(uintptr_t)a);return 0;}\n",
+-    "static inline uint64_t __x87rt_xch(int i){long double* a=__x87rt_at(0);long double* b=__x87rt_at(i);long double t=*a;*a=*b;*b=t;return 0;}\n",
+-    "static inline uint64_t __x87rt_chs(void){long double* t=__x87rt_at(0);*t=-*t;return 0;}\n",
+-    "static inline uint64_t __x87rt_abs(void){long double* t=__x87rt_at(0);if(*t<0)*t=-*t;return 0;}\n",
+-    "static inline uint64_t __x87rt_sqrt(void){long double* t=__x87rt_at(0);*t=__builtin_sqrtl(*t);return 0;}\n",
+-    "static inline uint64_t __x87rt_rndint(void){long double* t=__x87rt_at(0);*t=__x87rt_rnd(*t);return 0;}\n",
+-    "static inline uint64_t __x87rt_ldcw(uint64_t a){__x87rt_rc=(*(uint16_t*)(uintptr_t)a>>10)&3;return 0;}\n",
+-    "static inline uint64_t __x87rt_stcw(uint64_t a){*(uint16_t*)(uintptr_t)a=(uint16_t)(0x037F|(__x87rt_rc<<10));return 0;}\n",
++    "static inline uint64_t __x87rt_ar(int o,int ai,int bi,int pp){long double* a=__x87rt_at(ai);long double b=*__x87rt_at(bi);__x87rt_put(a,__x87rt_op(o,*a,b));if(pp)__x87rt_pop();return 0;}\n",
++    "static inline uint64_t __x87rt_am32(int o,uint64_t a){long double* t=__x87rt_at(0);__x87rt_put(t,__x87rt_op(o,*t,(long double)*(float*)(uintptr_t)a));return 0;}\n",
++    "static inline uint64_t __x87rt_am64(int o,uint64_t a){long double* t=__x87rt_at(0);__x87rt_put(t,__x87rt_op(o,*t,(long double)*(double*)(uintptr_t)a));return 0;}\n",
++    "static inline uint64_t __x87rt_ami16(int o,uint64_t a){long double* t=__x87rt_at(0);__x87rt_put(t,__x87rt_op(o,*t,(long double)*(int16_t*)(uintptr_t)a));return 0;}\n",
++    "static inline uint64_t __x87rt_ami32(int o,uint64_t a){long double* t=__x87rt_at(0);__x87rt_put(t,__x87rt_op(o,*t,(long double)*(int32_t*)(uintptr_t)a));return 0;}\n",
++    "static inline uint64_t __x87rt_xch(int i){long double* a=__x87rt_at(0);long double* b=__x87rt_at(i);long double t=*a;__x87rt_put(a,*b);__x87rt_put(b,t);return 0;}\n",
++    "static inline uint64_t __x87rt_chs(void){long double* t=__x87rt_at(0);__x87rt_put(t,-*t);return 0;}\n",
++    "static inline uint64_t __x87rt_abs(void){long double* t=__x87rt_at(0);__x87rt_put(t,__builtin_fabsl(*t));return 0;}\n",
++    "static inline uint64_t __x87rt_sqrt(void){long double* t=__x87rt_at(0);__x87rt_put(t,__builtin_sqrtl(*t));return 0;}\n",
++    "static inline uint64_t __x87rt_rndint(void){long double* t=__x87rt_at(0);__x87rt_put(t,__x87rt_rnd(*t));return 0;}\n",
++    "static inline uint64_t __x87rt_ldcw(uint64_t a){__x87rt_cw=*(uint16_t*)(uintptr_t)a;__x87rt_rc=(__x87rt_cw>>10)&3;return 0;}\n",
++    "static inline uint64_t __x87rt_stcw(uint64_t a){*(uint16_t*)(uintptr_t)a=__x87rt_cw;return 0;}\n",
+     // fp-return handoff for runtime-mode functions (shares the static channel).
+     // reset at entry (clean stack), retstore at ret (publish st(0) if fp-returning),
+     // pushret after a recognised fp-returning call. Together with the bounds trap
+     // above, an unrecognised fp return surfaces as an underflow trap, not garbage.
+-    "static inline uint64_t __x87rt_reset(void){__x87rt_p=0;return 0;}\n",
++    "static inline uint64_t __x87rt_reset(void){__x87rt_p=0;__x87rt_top=0;__x87rt_tags=0xffff;__x87rt_cw=0x37f;__x87rt_rc=0;__x87rt_sw=0;__x87rt_ip=__x87rt_dp=0;__x87rt_opcode=0;__x87rt_cs=__x87rt_ds=0;return 0;}\n",
+     "static inline uint64_t __x87rt_pushret(void){__x87rt_psh(__aret_x87_ret);__aret_x87_ret_valid=0;return 0;}\n",
+     // Wrap a call in runtime mode: clear the channel-valid flag before, then push
+     // the channel onto the stack after IF a callee wrote it (fp return via channel:
+@@ -429,41 +452,50 @@ pub(crate) const FLOAT_HELPERS: &str = concat!(
+     // (computed) fp-returning calls the static analysis cannot classify.
+     "static inline uint64_t __x87rt_precall(void){__aret_x87_ret_valid=0;return 0;}\n",
+     "static inline uint64_t __x87rt_postcall(void){if(__aret_x87_ret_valid){__x87rt_psh(__aret_x87_ret);__aret_x87_ret_valid=0;}return 0;}\n",
+-    "static inline uint64_t __x87rt_retstore(void){if(__x87rt_p>0)__aret_x87_ret=__x87rt_s[--__x87rt_p];return 0;}\n",
+-    "static inline uint64_t __x87rt_free(void){if(__x87rt_p>0)__x87rt_p--;return 0;}\n",
++    "static inline uint64_t __x87rt_retstore(void){if(__x87rt_p>0){__aret_x87_ret=*__x87rt_at(0);__x87rt_pop();}return 0;}\n",
++    "static inline uint64_t __x87rt_free(void){if(__x87rt_p>0)__x87rt_pop();return 0;}\n",
+     // ---- increment 2: comparisons, status word, transcendentals ----
+     "extern unsigned short __x87rt_sw;\n",
+-    "static inline void __x87rt_setsw(long double a,long double b){int u=(a!=a||b!=b);__x87rt_sw=(unsigned short)(((((a<b)||u)?1:0)<<8)|((u?1:0)<<10)|((((a==b)||u)?1:0)<<14));}\n",
+-    "static inline uint64_t __x87rt_com(int i,int pp){__x87rt_setsw(*__x87rt_at(0),*__x87rt_at(i));if(pp)__x87rt_p--;return 0;}\n",
+-    "static inline uint64_t __x87rt_comm32(uint64_t a,int pp){__x87rt_setsw(*__x87rt_at(0),(long double)*(float*)(uintptr_t)a);if(pp)__x87rt_p--;return 0;}\n",
+-    "static inline uint64_t __x87rt_comm64(uint64_t a,int pp){__x87rt_setsw(*__x87rt_at(0),(long double)*(double*)(uintptr_t)a);if(pp)__x87rt_p--;return 0;}\n",
++    "static inline void __x87rt_setsw(long double a,long double b){int u=(a!=a||b!=b);__x87rt_sw=(unsigned short)((__x87rt_sw&~0x4700u)|((((a<b)||u)?1:0)<<8)|((u?1:0)<<10)|((((a==b)||u)?1:0)<<14));}\n",
++    "static inline uint64_t __x87rt_com(int i,int pp){__x87rt_setsw(*__x87rt_at(0),*__x87rt_at(i));if(pp)__x87rt_pop();return 0;}\n",
++    "static inline uint64_t __x87rt_comm32(uint64_t a,int pp){__x87rt_setsw(*__x87rt_at(0),(long double)*(float*)(uintptr_t)a);if(pp)__x87rt_pop();return 0;}\n",
++    "static inline uint64_t __x87rt_comm64(uint64_t a,int pp){__x87rt_setsw(*__x87rt_at(0),(long double)*(double*)(uintptr_t)a);if(pp)__x87rt_pop();return 0;}\n",
+     "static inline uint64_t __x87rt_tst(void){__x87rt_setsw(*__x87rt_at(0),0.0L);return 0;}\n",
+-    "static inline uint64_t __x87rt_fxam(void){long double x=*__x87rt_at(0);unsigned short s=0;if(__builtin_signbitl(x))s|=(1u<<9);if(__builtin_isnan(x))s|=(1u<<8);else if(__builtin_isinf(x))s|=(1u<<10)|(1u<<8);else if(x==0.0L)s|=(1u<<14);else if(__builtin_isnormal(x))s|=(1u<<10);else s|=(1u<<14)|(1u<<10);__x87rt_sw=s;return 0;}\n",
+-    "static inline uint64_t __x87rt_getsw(void){return __x87rt_sw;}\n",
++    "static inline uint64_t __x87rt_fxam(void){long double x=*__x87rt_at(0);unsigned short s=0;if(__builtin_signbitl(x))s|=(1u<<9);if(__builtin_isnan(x))s|=(1u<<8);else if(__builtin_isinf(x))s|=(1u<<10)|(1u<<8);else if(x==0.0L)s|=(1u<<14);else if(__builtin_isnormal(x))s|=(1u<<10);else s|=(1u<<14)|(1u<<10);__x87rt_sw=(__x87rt_sw&~0x4700u)|s;return 0;}\n",
++    "static inline uint64_t __x87rt_getsw(void){return (__x87rt_sw&~0x3800u)|(__x87rt_top<<11);}\n",
+     "static inline uint64_t __x87rt_lt(int i){return *__x87rt_at(0)<*__x87rt_at(i);}\n",
+     "static inline uint64_t __x87rt_eq(int i){return *__x87rt_at(0)==*__x87rt_at(i);}\n",
+     "static inline uint64_t __x87rt_un(int i){long double a=*__x87rt_at(0),b=*__x87rt_at(i);return a!=a||b!=b;}\n",
+-    "static inline uint64_t __x87rt_cmov(int c,int i){if(c)*__x87rt_at(0)=*__x87rt_at(i);return 0;}\n",
+-    "static inline uint64_t __x87rt_yl2x(void){long double* y=__x87rt_at(1);*y=*y*__builtin_log2l(*__x87rt_at(0));__x87rt_p--;return 0;}\n",
+-    "static inline uint64_t __x87rt_yl2xp1(void){long double* y=__x87rt_at(1);*y=*y*__builtin_log2l(*__x87rt_at(0)+1.0L);__x87rt_p--;return 0;}\n",
+-    "static inline uint64_t __x87rt_2xm1(void){long double* t=__x87rt_at(0);*t=__builtin_exp2l(*t)-1.0L;return 0;}\n",
+-    "static inline uint64_t __x87rt_scale(void){long double* t=__x87rt_at(0);*t=__builtin_ldexpl(*t,(int)__builtin_truncl(*__x87rt_at(1)));return 0;}\n",
+-    "static inline uint64_t __x87rt_sin(void){long double* t=__x87rt_at(0);*t=__builtin_sinl(*t);__x87rt_sw&=~(1u<<10);return 0;}\n",
+-    "static inline uint64_t __x87rt_cos(void){long double* t=__x87rt_at(0);*t=__builtin_cosl(*t);__x87rt_sw&=~(1u<<10);return 0;}\n",
+-    "static inline uint64_t __x87rt_sincos(void){long double x=*__x87rt_at(0);*__x87rt_at(0)=__builtin_sinl(x);__x87rt_psh(__builtin_cosl(x));__x87rt_sw&=~(1u<<10);return 0;}\n",
+-    "static inline uint64_t __x87rt_ptan(void){long double* t=__x87rt_at(0);*t=__builtin_tanl(*t);__x87rt_psh(1.0L);__x87rt_sw&=~(1u<<10);return 0;}\n",
+-    "static inline uint64_t __x87rt_patan(void){long double* y=__x87rt_at(1);*y=__builtin_atan2l(*y,*__x87rt_at(0));__x87rt_p--;return 0;}\n",
+-    "static inline uint64_t __x87rt_prem(void){long double* t=__x87rt_at(0);*t=__builtin_fmodl(*t,*__x87rt_at(1));__x87rt_sw&=~(1u<<10);return 0;}\n",
++    "static inline uint64_t __x87rt_cmov(int c,int i){if(c)__x87rt_put(__x87rt_at(0),*__x87rt_at(i));return 0;}\n",
++    "static inline uint64_t __x87rt_yl2x(void){long double* y=__x87rt_at(1);__x87rt_put(y,*y*__builtin_log2l(*__x87rt_at(0)));__x87rt_pop();return 0;}\n",
++    "static inline uint64_t __x87rt_yl2xp1(void){long double* y=__x87rt_at(1);__x87rt_put(y,*y*__builtin_log2l(*__x87rt_at(0)+1.0L));__x87rt_pop();return 0;}\n",
++    "static inline uint64_t __x87rt_2xm1(void){long double* t=__x87rt_at(0);__x87rt_put(t,__builtin_exp2l(*t)-1.0L);return 0;}\n",
++    "static inline uint64_t __x87rt_scale(void){long double* t=__x87rt_at(0);__x87rt_put(t,__builtin_ldexpl(*t,(int)__builtin_truncl(*__x87rt_at(1))));return 0;}\n",
++    "static inline uint64_t __x87rt_sin(void){long double* t=__x87rt_at(0);__x87rt_put(t,__builtin_sinl(*t));__x87rt_sw&=~(1u<<10);return 0;}\n",
++    "static inline uint64_t __x87rt_cos(void){long double* t=__x87rt_at(0);__x87rt_put(t,__builtin_cosl(*t));__x87rt_sw&=~(1u<<10);return 0;}\n",
++    "static inline uint64_t __x87rt_sincos(void){long double x=*__x87rt_at(0);__x87rt_put(__x87rt_at(0),__builtin_sinl(x));__x87rt_psh(__builtin_cosl(x));__x87rt_sw&=~(1u<<10);return 0;}\n",
++    "static inline uint64_t __x87rt_ptan(void){long double* t=__x87rt_at(0);__x87rt_put(t,__builtin_tanl(*t));__x87rt_psh(1.0L);__x87rt_sw&=~(1u<<10);return 0;}\n",
++    "static inline uint64_t __x87rt_patan(void){long double* y=__x87rt_at(1);__x87rt_put(y,__builtin_atan2l(*y,*__x87rt_at(0)));__x87rt_pop();return 0;}\n",
++    "static inline uint64_t __x87rt_prem(void){long double* t=__x87rt_at(0);__x87rt_put(t,__builtin_fmodl(*t,*__x87rt_at(1)));__x87rt_sw&=~(1u<<10);return 0;}\n",
+     "static inline uint64_t __x87rt_ldpi(void){__x87rt_psh(3.14159265358979323846L);return 0;}\n",
+     "static inline uint64_t __x87rt_ldl2e(void){__x87rt_psh(1.44269504088896340736L);return 0;}\n",
+     "static inline uint64_t __x87rt_ldl2t(void){__x87rt_psh(3.32192809488736234787L);return 0;}\n",
+     "static inline uint64_t __x87rt_ldlg2(void){__x87rt_psh(0.30102999566398119521L);return 0;}\n",
+     "static inline uint64_t __x87rt_ldln2(void){__x87rt_psh(0.69314718055994530942L);return 0;}\n",
++    "static inline uint64_t __x87rt_note(uint64_t ip,uint64_t op,uint64_t dp,uint64_t memory){__x87rt_ip=(uint32_t)ip;__x87rt_opcode=(unsigned short)(op&0x7ff);__x87rt_cs=0x23;if(memory){__x87rt_dp=(uint32_t)dp;__x87rt_ds=0x2b;}return 0;}\n",
++    "static inline uint16_t __x87rt_read16(const uint8_t*p){return p[0]|((uint16_t)p[1]<<8);}\n",
++    "static inline uint32_t __x87rt_read32(const uint8_t*p){return __x87rt_read16(p)|((uint32_t)__x87rt_read16(p+2)<<16);}\n",
++    "static inline void __x87rt_write16(uint8_t*p,uint16_t v){p[0]=(uint8_t)v;p[1]=(uint8_t)(v>>8);}\n",
++    "static inline void __x87rt_write32(uint8_t*p,uint32_t v){__x87rt_write16(p,(uint16_t)v);__x87rt_write16(p+2,(uint16_t)(v>>16));}\n",
++    "static inline uint64_t __x87rt_stenv(uint64_t a,uint64_t n){uint8_t*p=(uint8_t*)(uintptr_t)a;uint16_t sw=(uint16_t)__x87rt_getsw();if(n==28){__x87rt_write32(p,0xffff0000u|__x87rt_cw);__x87rt_write32(p+4,0xffff0000u|sw);__x87rt_write32(p+8,0xffff0000u|__x87rt_tags);__x87rt_write32(p+12,__x87rt_ip);__x87rt_write32(p+16,__x87rt_cs|((uint32_t)__x87rt_opcode<<16));__x87rt_write32(p+20,__x87rt_dp);__x87rt_write32(p+24,0xffff0000u|__x87rt_ds);}else if(n==14){__x87rt_write16(p,__x87rt_cw);__x87rt_write16(p+2,sw);__x87rt_write16(p+4,__x87rt_tags);__x87rt_write16(p+6,(uint16_t)__x87rt_ip);__x87rt_write16(p+8,__x87rt_cs);__x87rt_write16(p+10,(uint16_t)__x87rt_dp);__x87rt_write16(p+12,__x87rt_ds);}else aret_x87_stack_error(\"environment size\",-1,__x87rt_p);__x87rt_cw|=63;return 0;}\n",
++    "static inline uint64_t __x87rt_ldenv(uint64_t a,uint64_t n){const uint8_t*p=(const uint8_t*)(uintptr_t)a;__x87rt_cw=__x87rt_read16(p);__x87rt_rc=(__x87rt_cw>>10)&3;if(n==28){__x87rt_sw=__x87rt_read16(p+4);__x87rt_tags=__x87rt_read16(p+8);__x87rt_ip=__x87rt_read32(p+12);__x87rt_cs=__x87rt_read16(p+16);__x87rt_opcode=__x87rt_read16(p+18)&0x7ff;__x87rt_dp=__x87rt_read32(p+20);__x87rt_ds=__x87rt_read16(p+24);}else if(n==14){__x87rt_sw=__x87rt_read16(p+2);__x87rt_tags=__x87rt_read16(p+4);__x87rt_ip=__x87rt_read16(p+6);__x87rt_cs=__x87rt_read16(p+8);__x87rt_dp=__x87rt_read16(p+10);__x87rt_ds=__x87rt_read16(p+12);}else aret_x87_stack_error(\"environment size\",-1,__x87rt_p);__x87rt_top=(__x87rt_sw>>11)&7;__x87rt_p=0;for(unsigned i=0;i<8;i++)if(((__x87rt_tags>>(2*i))&3)!=3)++__x87rt_p;return 0;}\n",
++    "static inline uint64_t __x87rt_clear(void){__x87rt_sw&=~0x80ffu;return 0;}\n",
++
+ );
+ 
+ /// The runtime-helper preamble, included only when the body references it.
+ pub(crate) fn float_preamble(body: &str) -> &'static str {
+-    if body.contains("__fp_") || body.contains("__pi_") || body.contains("__ix_") || body.contains("__x87_") || body.contains("__x87rt_") || body.contains("__rep_") {
++    if body.contains("__ssert_") || body.contains("__aret_sse_") || body.contains("__fp_") || body.contains("__pi_") || body.contains("__ix_") || body.contains("__x87_") || body.contains("__x87rt_") || body.contains("__rep_") {
+         FLOAT_HELPERS
+     } else {
+         ""
+diff --git a/src/ir/build.rs b/src/ir/build.rs
+index 5489fe3..a348277 100644
+--- a/src/ir/build.rs
++++ b/src/ir/build.rs
+@@ -17,6 +17,43 @@ use crate::loader::Program;
+ use std::collections::HashMap;
+ use std::fmt::Write;
+ 
++// MSVC _aulldvrm returns quotient in EDX:EAX and remainder in EBX:ECX.
++// Its four-register ABI cannot pass through an ordinary cdecl return value.
++// Match the complete position-independent helper, never a game-specific address.
++const MSVC_AULLDVRM: &[u8] = &[
++    0x56, 0x8b, 0x44, 0x24, 0x14, 0x0b, 0xc0, 0x75, 0x28, 0x8b, 0x4c, 0x24, 0x10, 0x8b, 0x44, 0x24,
++    0x0c, 0x33, 0xd2, 0xf7, 0xf1, 0x8b, 0xd8, 0x8b, 0x44, 0x24, 0x08, 0xf7, 0xf1, 0x8b, 0xf0, 0x8b,
++    0xc3, 0xf7, 0x64, 0x24, 0x10, 0x8b, 0xc8, 0x8b, 0xc6, 0xf7, 0x64, 0x24, 0x10, 0x03, 0xd1, 0xeb,
++    0x47, 0x8b, 0xc8, 0x8b, 0x5c, 0x24, 0x10, 0x8b, 0x54, 0x24, 0x0c, 0x8b, 0x44, 0x24, 0x08, 0xd1,
++    0xe9, 0xd1, 0xdb, 0xd1, 0xea, 0xd1, 0xd8, 0x0b, 0xc9, 0x75, 0xf4, 0xf7, 0xf3, 0x8b, 0xf0, 0xf7,
++    0x64, 0x24, 0x14, 0x8b, 0xc8, 0x8b, 0x44, 0x24, 0x10, 0xf7, 0xe6, 0x03, 0xd1, 0x72, 0x0e, 0x3b,
++    0x54, 0x24, 0x0c, 0x77, 0x08, 0x72, 0x0f, 0x3b, 0x44, 0x24, 0x08, 0x76, 0x09, 0x4e, 0x2b, 0x44,
++    0x24, 0x10, 0x1b, 0x54, 0x24, 0x14, 0x33, 0xdb, 0x2b, 0x44, 0x24, 0x08, 0x1b, 0x54, 0x24, 0x0c,
++    0xf7, 0xda, 0xf7, 0xd8, 0x83, 0xda, 0x00, 0x8b, 0xca, 0x8b, 0xd3, 0x8b, 0xd9, 0x8b, 0xc8, 0x8b,
++    0xc6, 0x5e, 0xc2, 0x10, 0x00,
++];
++
++fn lower_aulldvrm(bytes: &[u8]) -> Option<Vec<Stmt>> {
++    if !bytes.starts_with(MSVC_AULLDVRM) { return None; }
++    let sp = Location::Reg(RegId(4));
++    let load = |offset| Expr::Load {
++        addr: Box::new(Expr::Binary(BinOp::Add, Box::new(Expr::Read(sp.clone())), Box::new(Expr::konst(offset, 32)))),
++        ty: Ty::int(64),
++    };
++    let quotient = Expr::Binary(BinOp::UDiv, Box::new(load(0)), Box::new(load(8)));
++    let remainder = Expr::Binary(BinOp::UMod, Box::new(load(0)), Box::new(load(8)));
++    let mut out = Vec::new();
++    for (reg, value, high) in [(0, quotient.clone(), false), (2, quotient, true),
++                             (1, remainder.clone(), false), (3, remainder, true)] {
++        out.push(Stmt::Set { dst: Location::Reg(RegId(reg)), expr: Expr::Binary(
++            if high { BinOp::Shr } else { BinOp::And }, Box::new(value),
++            Box::new(Expr::konst(if high { 32 } else { 0xffff_ffff }, 64))) });
++    }
++    out.push(Stmt::Set { dst: sp.clone(), expr: Expr::Binary(BinOp::Add,
++        Box::new(Expr::Read(sp)), Box::new(Expr::konst(16, 32))) });
++    Some(out)
++}
++
+ /// Recognise an MSVC EH/SEH frame-setup helper (`_EH_prolog`/`_SEH_prolog`) and
+ /// return its straight-line body (entry up to, but excluding, the terminal
+ /// `ret`). These helpers REWRITE THE CALLER'S FRAME: they consume the values the
+@@ -248,15 +285,14 @@ pub fn build_ir(prog: &Program, func: &Function) -> IrFunction {
+     // a concrete slot. `None` if the function should not be x87-modelled (any
+     // unmodelled FPU op, ambiguous depth, or a float→int store whose rounding we
+     // cannot prove) — those instructions then degrade to a sound `Asm`.
+-    let (x87, fp_calls) = match x87_states(prog, func) {
++    // Translated callers and callees share the actual x87 stack. A static
++    // per-function ABI classification cannot preserve returns on only some
++    // paths, or values passed to a callee in st(0).
++    let x87_rt = crate::emit::shared_stack();
++    let (x87, fp_calls) = match if x87_rt { None } else { x87_states(prog, func) } {
+         Some((ops, calls)) => (Some(ops), calls),
+         None => (None, HashMap::new()),
+     };
+-    // Runtime x87 fallback mode: the whole function bailed static depth analysis
+-    // (`x87` is None) AND we are in shared-stack (transpile) mode. Only transpile
+-    // gains from it — in decompile the `Asm` fallback runs the real x87 instruction
+-    // (correct), so replacing it there could only regress. Gated accordingly.
+-    let x87_rt = x87.is_none() && crate::emit::shared_stack();
+     // Taken edges of conditional jumps that LEAVE this function for another recovered
+     // one (`jcc other_func`). Each gets a synthetic block appended after the real ones
+     // that performs the tail call; collected here so its index is known while the
+@@ -265,7 +301,7 @@ pub fn build_ir(prog: &Program, func: &Function) -> IrFunction {
+     let mut tail_targets: Vec<(u64, u64)> = Vec::new();
+     // Does this function itself return an fp value (st(0))? Then store st(0) into
+     // the fp return channel at each `ret`, so callers can recover it.
+-    let self_returns_fp = FP_RETURNING.with(|c| c.borrow().contains(&func.entry));
++    let self_returns_fp = !x87_rt && FP_RETURNING.with(|c| c.borrow().contains(&func.entry));
+     // Keep every stack access as raw `__frame` memory (no named scalars) when the
+     // function spills 80-bit x87 values OR 128-bit XMM registers: those go through
+     // byte-addressed memory, and a function may read the same bytes back at a
+@@ -383,22 +419,30 @@ pub fn build_ir(prog: &Program, func: &Function) -> IrFunction {
+                     }
+                 }
+             }
++            if bits == 32 && insn.flow == Flow::Call {
++                if let Some(body) = insn.target.and_then(|target| prog.read_from(target))
++                    .and_then(lower_aulldvrm) {
++                    stmts.extend(body);
++                    continue;
++                }
++            }
+             let mut s = match x87.as_ref().and_then(|m| m.get(&insn.address)) {
+                 Some(&(sp_in, mode)) => crate::ir::lift::lift_x87(insn, sp_in, mode),
+                 // Runtime x87 fallback: the whole function bailed static analysis
+                 // (`x87` is None), so lower each FPU op against the runtime stack
+                 // model instead of degrading to a hard `Asm`/abort.
+                 None if x87_rt && crate::ir::lift::is_x87(&insn.raw) => {
+-                    crate::ir::lift::lift_x87_runtime(insn)
++                    let bytes=prog.read_from(insn.address).unwrap();
++                    let at=bytes[..insn.len].iter().position(|b|(0xd8..=0xdf).contains(b)).unwrap_or(0);
++                    let opcode=(((bytes[at]&7) as u16)<<8)|bytes.get(at+1).copied().unwrap_or(0) as u16;
++                    crate::ir::lift::lift_x87_runtime_with_metadata(insn,opcode)
+                 }
+                 None => lift(insn, bits),
+             };
+             fold_ro_loads(&mut s, insn, prog);
+-            // Runtime x87 fallback: wrap every call so a callee that returns fp via
+-            // the channel (static-fp or host libm — including INDIRECT/computed
+-            // calls the static pass cannot classify) is pushed onto the runtime
+-            // stack, while a runtime-mode fp callee (result left on the shared
+-            // stack) is not double-pushed. `precall` clears the flag first.
++            // Native C shims return floats through a separate channel. Capture
++            // that channel after calls; translated callees already leave their
++            // result on the shared x87 stack and must not be pushed twice.
+             let is_call_rt = x87_rt
+                 && matches!(
+                     insn.raw.flow_control(),
+@@ -484,7 +528,8 @@ pub fn build_ir(prog: &Program, func: &Function) -> IrFunction {
+                         let target = blk.successors[0];
+                         let synth = (order.len() + tail_targets.len()) as u32;
+                         tail_targets.push((target, addr));
+-                        succ.push(synth);
++                        // Structured emission reads CFG successors in taken/fallthrough order.
++                        succ = vec![synth, f];
+                         stmts.push(Stmt::Branch {
+                             cond: cc_to_cond(jcc.raw.condition_code()),
+                             taken: BlockId(synth),
+@@ -778,6 +823,10 @@ pub fn build_ir(prog: &Program, func: &Function) -> IrFunction {
+     // Reset the per-function frame-folding flag for the next function/thread.
+     crate::ir::lift::set_frames_off(false);
+ 
++    if bits == 32 && crate::emit::shared_stack() {
++        super::sse::lower(&mut blocks);
++    }
++
+     IrFunction {
+         entry: func.entry,
+         name: func.name.clone(),
+@@ -2585,3 +2634,151 @@ pub fn dump(f: &IrFunction) -> String {
+     }
+     out
+ }
++
++#[cfg(test)]
++mod conditional_tail_tests {
++    use super::*;
++    use crate::analysis::BasicBlock;
++    use crate::loader::{Bitness, Section};
++    use indexmap::IndexMap;
++    use std::{collections::{BTreeMap, BTreeSet}, io::Write, process::{Command, Stdio}};
++
++    #[test]
++    fn floating_return_survives_an_unclassified_callee() {
++        crate::emit::set_shared_stack(true);
++        set_fp_returning(Default::default());
++        // caller: call helper; fstp double [esp+4]; ret
++        // helper: test ecx,ecx; je integer_return; fld1; ret; xor eax,eax; ret
++        // Its return paths have different x87 depths, so a whole-function ABI
++        // classification cannot preserve the value on the floating path.
++        let mut bytes = vec![0xe8,0x0b,0,0,0,0xdd,0x5c,0x24,4,0xc3];
++        bytes.resize(16, 0x90);
++        bytes.extend([0x85,0xc9,0x74,3,0xd9,0xe8,0xc3,0x31,0xc0,0xc3]);
++        let prog = Program { format: "PE".into(), bitness: Bitness::Bits32,
++            entry: 0x1000, image_base: 0x1000, exports: vec![], dll_inits: vec![],
++            dll_exports: vec![], ctor_list: vec![], sections: vec![Section {
++                name: ".text".into(), address: 0x1000, data: bytes, executable: true, writable: false }],
++            symbols: BTreeMap::new(), imports: BTreeMap::new(), pe_imports: BTreeMap::new(),
++            relocs: BTreeMap::new(), base_relocs: BTreeSet::new(), tls_dir_va: 0, tls_inits: vec![] };
++        let disasm = Disassembler::new(Bitness::Bits32);
++        let block = |start, addresses: &[u64], successors, terminator| BasicBlock {
++            start, insns: addresses.iter().map(|address| disasm.decode_at(&prog, *address).unwrap()).collect(),
++            successors, terminator };
++        let caller = Function { entry: 0x1000, name: "caller".into(),
++            blocks: IndexMap::from([(0x1000, block(0x1000, &[0x1000,0x1005,0x1009], vec![], Flow::Return))]),
++            callees: BTreeSet::from([0x1010]) };
++        let callee = Function { entry: 0x1010, name: "helper".into(),
++            blocks: IndexMap::from([
++                (0x1010, block(0x1010, &[0x1010,0x1012], vec![0x1017,0x1014], Flow::CondJump)),
++                (0x1014, block(0x1014, &[0x1014,0x1016], vec![], Flow::Return)),
++                (0x1017, block(0x1017, &[0x1017,0x1019], vec![], Flow::Return))]),
++            callees: BTreeSet::new() };
++        assert!(!compute_fp_returning(&prog, &[&callee]).contains(&0x1010));
++        let mut functions = vec![build_ir(&prog, &callee), build_ir(&prog, &caller)];
++        for function in &mut functions { thread_internal_call_esp(function); crate::ssa::to_ssa(function); crate::opt::optimize(function); }
++        for structured in [false,true] {
++            let mut forward = BTreeSet::new();
++            let body: String = functions.iter().map(|function| if structured {
++                crate::emit::structured::emit_function(function, &mut forward, true)
++            } else { crate::emit::emit_function(function, &mut forward, true) }).collect();
++            let source = format!("#include <stdint.h>\n#include <stdlib.h>\n#include <math.h>\n{}\nlong double __x87rt_s[16],__aret_x87_ret;int __x87rt_p,__x87rt_rc,__aret_x87_ret_valid;unsigned short __x87rt_sw,__x87rt_cw=0x37f,__x87rt_tags=0xffff,__x87rt_opcode,__x87rt_cs,__x87rt_ds;unsigned __x87rt_top;uint32_t __x87rt_ip,__x87rt_dp;void aret_x87_stack_error(const char*s,int i,int d){{abort();}}\n{}\nstatic unsigned char stack[1024];int main(void){{uintptr_t sp=(uintptr_t)(stack+512);sub_1000(sp,0,1,0,0,0,0,0);if(*(double*)(sp+4)!=1.0||__x87rt_p!=0)return 1;sub_1010(sp,0,0,0,0,0,0,0);return __x87rt_p!=0;}}\n", crate::emit::float_preamble(&body), body);
++            let executable=std::env::temp_dir().join(format!("aret-x87-return-{}-{structured}",std::process::id()));
++            let mut compiler=Command::new("cc").args(["-x","c","-O2","-no-pie","-","-lm","-o"]).arg(&executable).stdin(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
++            compiler.stdin.take().unwrap().write_all(source.as_bytes()).unwrap();
++            let output=compiler.wait_with_output().unwrap();
++            assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
++            let status=Command::new(&executable).status().unwrap();let _=std::fs::remove_file(&executable);
++            assert!(status.success(),"floating return lost, structured={structured}");
++        }
++        crate::emit::set_shared_stack(false);
++    }
++
++    #[test]
++    fn conditional_tail_call_keeps_taken_edge_first() {
++        crate::emit::set_shared_stack(true);
++        // test ecx,ecx; je helper; mov eax,-1; ret; ... helper: mov eax,1; ret
++        let mut bytes = vec![0x85,0xc9,0x74,0x0c,0xb8,0xff,0xff,0xff,0xff,0xc3];
++        bytes.resize(16, 0x90);
++        bytes.extend([0xb8,1,0,0,0,0xc3]);
++        let prog = Program { format: "PE".into(), bitness: Bitness::Bits32,
++            entry: 0x1000, image_base: 0x1000, exports: vec![], dll_inits: vec![],
++            dll_exports: vec![], ctor_list: vec![], sections: vec![Section {
++                name: ".text".into(), address: 0x1000, data: bytes, executable: true, writable: false }],
++            symbols: BTreeMap::new(), imports: BTreeMap::new(), pe_imports: BTreeMap::new(),
++            relocs: BTreeMap::new(), base_relocs: BTreeSet::new(), tls_dir_va: 0, tls_inits: vec![] };
++        let disasm = Disassembler::new(Bitness::Bits32);
++        let block = |start, addresses: &[u64], successors, terminator| BasicBlock {
++            start, insns: addresses.iter().map(|address| disasm.decode_at(&prog, *address).unwrap()).collect(),
++            successors, terminator };
++        let caller = Function { entry: 0x1000, name: "caller".into(),
++            blocks: IndexMap::from([
++                (0x1000, block(0x1000, &[0x1000,0x1002], vec![0x1010,0x1004], Flow::CondJump)),
++                (0x1004, block(0x1004, &[0x1004,0x1009], vec![], Flow::Return))]),
++            callees: BTreeSet::from([0x1010]) };
++        let callee = Function { entry: 0x1010, name: "helper".into(),
++            blocks: IndexMap::from([(0x1010, block(0x1010, &[0x1010,0x1015], vec![], Flow::Return))]),
++            callees: BTreeSet::new() };
++        let mut functions = vec![build_ir(&prog, &callee), build_ir(&prog, &caller)];
++        for function in &mut functions { thread_internal_call_esp(function); crate::ssa::to_ssa(function); crate::opt::optimize(function); }
++        for structured in [false, true] {
++            let mut forward = BTreeSet::new();
++            let body: String = functions.iter().map(|function| if structured {
++                crate::emit::structured::emit_function(function, &mut forward, true)
++            } else { crate::emit::emit_function(function, &mut forward, true) }).collect();
++            let source = format!("#include <stdint.h>\n#include <math.h>\n{}\n{}\nint main(void){{return (uint32_t)sub_1000(0,0,0,0,0,0,0,0)!=1 || (uint32_t)sub_1000(0,0,1,0,0,0,0,0)!=UINT32_MAX;}}\n", crate::emit::float_preamble(&body), body);
++            let executable = std::env::temp_dir().join(format!("aret-tail-{}-{structured}", std::process::id()));
++            let mut compiler = Command::new("cc").args(["-x","c","-O2","-","-lm","-o"])
++                .arg(&executable).stdin(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
++            compiler.stdin.take().unwrap().write_all(source.as_bytes()).unwrap();
++            let output = compiler.wait_with_output().unwrap();
++            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
++            let status = Command::new(&executable).status().unwrap();
++            let _ = std::fs::remove_file(&executable);
++            assert!(status.success(), "conditional tail branch inverted, structured={structured}");
++        }
++        crate::emit::set_shared_stack(false);
++    }
++}
++
++#[cfg(test)]
++mod aulldvrm_tests {
++    use super::*;
++    fn eval(expr: &Expr, regs: &[u64; 8], args: &[u8]) -> u64 {
++        match expr {
++            Expr::Read(Location::Reg(RegId(r))) => regs[*r as usize],
++            Expr::Const(v, _) => *v as u64,
++            Expr::Load { addr, .. } => {
++                let at = eval(addr, regs, args) as usize;
++                u64::from_le_bytes(args[at..at+8].try_into().unwrap())
++            }
++            Expr::Binary(op, left, right) => {
++                let a = eval(left, regs, args); let b = eval(right, regs, args);
++                match op { BinOp::Add => a+b, BinOp::UDiv => a/b, BinOp::UMod => a%b,
++                    BinOp::And => a&b, BinOp::Shr => a>>b, _ => panic!("unexpected operation") }
++            }
++            _ => panic!("unexpected expression"),
++        }
++    }
++    #[test]
++    fn unsigned_division_preserves_all_four_result_registers() {
++        for (n,d) in [(12345u64,10u64), (u64::MAX,10), (u64::MAX,0x100000003),
++                      (0x8000000123456789,0x200000000), (0,7), (7,8), (u64::MAX,1)] {
++            let args: Vec<u8> = n.to_le_bytes().into_iter().chain(d.to_le_bytes()).collect();
++            let mut regs = [0,0,0,0,0,42,43,44];
++            for stmt in lower_aulldvrm(MSVC_AULLDVRM).unwrap() {
++                if let Stmt::Set { dst: Location::Reg(RegId(r)), expr } = stmt {
++                    regs[r as usize] = eval(&expr, &regs, &args);
++                } else { panic!("unexpected statement"); }
++            }
++            assert_eq!((regs[2]<<32)|regs[0], n/d);
++            assert_eq!((regs[3]<<32)|regs[1], n%d);
++            assert_eq!(&regs[4..], &[16,42,43,44]);
++        }
++    }
++    #[test]
++    fn different_or_truncated_helpers_are_not_replaced() {
++        assert!(lower_aulldvrm(&MSVC_AULLDVRM[..MSVC_AULLDVRM.len()-1]).is_none());
++        let mut changed = MSVC_AULLDVRM.to_vec(); changed[20] ^= 1;
++        assert!(lower_aulldvrm(&changed).is_none());
++    }
++}
+diff --git a/src/ir/lift.rs b/src/ir/lift.rs
+index 6020035..f839ff8 100644
+--- a/src/ir/lift.rs
++++ b/src/ir/lift.rs
+@@ -83,10 +83,10 @@ fn is_scalar_float(ins: &Instruction) -> bool {
+     matches!(
+         ins.mnemonic(),
+         Movss | Movsd | Movd | Movq
+-            | Addss | Subss | Mulss | Divss
+-            | Addsd | Subsd | Mulsd | Divsd
+-            | Cvtsi2ss | Cvtsi2sd | Cvttss2si | Cvttsd2si
+-            | Cvtss2sd | Cvtsd2ss
++            | Addss | Subss | Mulss | Divss | Minss | Maxss | Sqrtss
++            | Addsd | Subsd | Mulsd | Divsd | Minsd | Maxsd | Sqrtsd
++            | Cvtsi2ss | Cvtsi2sd | Cvttss2si | Cvttsd2si | Cvtss2si | Cvtsd2si
++            | Cvtss2sd | Cvtsd2ss | Cvtps2pd | Cvtpd2ps
+             | Comiss | Comisd | Ucomiss | Ucomisd
+             | Pxor | Xorps | Xorpd
+             | Movaps | Movapd | Movups | Movupd
+@@ -101,8 +101,8 @@ fn is_scalar_float(ins: &Instruction) -> bool {
+             | Movhlps | Movlhps | Movhps | Movhpd | Movlps | Movlpd | Shufpd
+             | Unpcklpd | Unpckhpd | Addpd | Subpd | Mulpd | Divpd
+             | Addps | Subps | Mulps | Divps | Minps | Maxps | Sqrtps | Cvtdq2ps
+-            | Cmpps | Andps | Orps | Andnps | Shufps | Movmskps | Unpcklps | Unpckhps
+-            | Psllq | Pinsrw | Pinsrd | Cvtdq2pd
++            | Cmpps | Cmppd | Andps | Orps | Andnps | Shufps | Movmskps | Unpcklps | Unpckhps
++            | Psllq | Pinsrw | Pinsrd | Cvtdq2pd | Movmskpd | Blendvpd
+             | Pshufb | Andpd | Orpd | Andnpd
+     )
+ }
+@@ -1176,6 +1176,11 @@ pub fn lift(insn: &Insn, bits: u32) -> Vec<Stmt> {
+         // Sound to drop (Unicorn treats them the same). Measured on ninja (`prefetcht0`).
+         | Mnemonic::Prefetcht0 | Mnemonic::Prefetcht1 | Mnemonic::Prefetcht2
+         | Mnemonic::Prefetchnta | Mnemonic::Prefetchw | Mnemonic::Pause => vec![Stmt::Nop],
++        // Preserve memory ordering rather than treating fences as performance hints.
++        // A sequentially consistent host fence is stronger than LFENCE/SFENCE and
++        // covers MFENCE. The browser currently runs translated code in one worker.
++        Mnemonic::Lfence | Mnemonic::Sfence | Mnemonic::Mfence =>
++            vec![Stmt::CallStmt(fcall("__aret_memory_fence", vec![]))],
+         // Direction flag: `cld` clears DF (forward), `std` sets it (backward). The
+         // string-op lifting reads DF to pick the element-advance sign, so both are
+         // real writes now (not no-ops). DF reads 0 at entry (SSA init) = the ABI's
+@@ -1192,6 +1197,21 @@ pub fn lift(insn: &Insn, bits: u32) -> Vec<Stmt> {
+             let v = some_or_asm!(op_value(ins, 1));
+             some_or_asm!(write_op0(ins, v, bits))
+         }
++        Mnemonic::Xlatb => {
++            // XLAT reads the byte at (B/EB/RBX + unsigned AL), wrapping at
++            // the address size, and changes only AL. It does not set flags.
++            if ins.segment_prefix() != Register::None {
++                return asm();
++            }
++            // Iced also reports the implicit AL index as memory_index(), so
++            // reading mem_addr() here would add AL twice.
++            let base = some_or_asm!(read_reg(ins.memory_base()));
++            let index = some_or_asm!(read_reg(Register::AL));
++            let address_bits = (ins.memory_base().size() * 8) as u32;
++            let address = bin(BinOp::And, bin(BinOp::Add, base, index), konst(mask(address_bits)));
++            let value = Expr::Load { addr: Box::new(address), ty: Ty::int(8) };
++            some_or_asm!(write_reg(Register::AL, value, bits))
++        }
+         Mnemonic::Movsx | Mnemonic::Movsxd => {
+             let v = some_or_asm!(op_value(ins, 1));
+             let sv = Expr::Unary(UnOp::SignExtend, Box::new(v));
+@@ -1481,26 +1501,22 @@ pub fn lift(insn: &Insn, bits: u32) -> Vec<Stmt> {
+             );
+             some_or_asm!(write_op0(ins, word, 32))
+         }
+-        Mnemonic::Psrlq if ins.op_kind(1) == OpKind::Immediate8 => {
+-            let n = konst(ins.immediate(1) as i128);
++        // Both logical quadword shifts use the low 64 bits of the source as
++        // the count. Counts >= 64 produce zero, rather than C shift UB.
++        Mnemonic::Psrlq | Mnemonic::Psllq => {
+             let (lo, hi) = some_or_asm!(read_xmm128(ins, 0));
+-            some_or_asm!(write_xmm128(
+-                ins,
+-                bin(BinOp::Shr, lo, n.clone()),
+-                bin(BinOp::Shr, hi, n)
+-            ))
+-        }
+-        // psllq imm: shift each 64-bit lane left. A count >= 64 zeroes the lane (per the
+-        // ISA; a raw C shift by >= width is UB, so fold it to 0 at the constant count).
+-        Mnemonic::Psllq if ins.op_kind(1) == OpKind::Immediate8 => {
+-            let sh = ins.immediate(1);
+-            let (lo, hi) = some_or_asm!(read_xmm128(ins, 0));
+-            if sh >= 64 {
+-                some_or_asm!(write_xmm128(ins, konst(0), konst(0)))
++            let count = if ins.op_kind(1) == OpKind::Immediate8 {
++                konst(ins.immediate(1) as i128)
+             } else {
+-                let n = konst(sh as i128);
+-                some_or_asm!(write_xmm128(ins, bin(BinOp::Shl, lo, n.clone()), bin(BinOp::Shl, hi, n)))
+-            }
++                some_or_asm!(read_xmm128(ins, 1)).0
++            };
++            let op = if ins.mnemonic() == Mnemonic::Psllq { BinOp::Shl } else { BinOp::Shr };
++            let shift = |value| Expr::Select {
++                cond: Box::new(bin(BinOp::Ult, count.clone(), konst(64))),
++                then_: Box::new(bin(op, value, count.clone())),
++                else_: Box::new(konst(0)),
++            };
++            some_or_asm!(write_xmm128(ins, shift(lo), shift(hi)))
+         }
+         // pinsrw: insert a 16-bit word (from a GP reg's low half or m16) into lane imm&7.
+         Mnemonic::Pinsrw => {
+@@ -1599,6 +1615,21 @@ pub fn lift(insn: &Insn, bits: u32) -> Vec<Stmt> {
+             let (lo, hi) = some_or_asm!(read_xmm128(ins, 1));
+             some_or_asm!(write_xmm128(ins, fcall("__ps_cvtdq", vec![lo]), fcall("__ps_cvtdq", vec![hi])))
+         }
++        Mnemonic::Cvtps2pd => {
++            // Two float32 lanes in the low 64 bits become two float64 lanes.
++            let src = some_or_asm!(op_value(ins, 1));
++            let lo = fcall("__fp_32_64", vec![src.clone()]);
++            let hi = fcall("__fp_32_64", vec![bin(BinOp::Shr, src, konst(32))]);
++            some_or_asm!(write_xmm128(ins, lo, hi))
++        }
++        Mnemonic::Cvtpd2ps => {
++            // The converted pair occupies low64; legacy SSE clears high64.
++            let (lo, hi) = some_or_asm!(read_xmm128(ins, 1));
++            let lo = fcall("__fp_64_32", vec![lo]);
++            let hi = fcall("__fp_64_32", vec![hi]);
++            some_or_asm!(write_xmm128(ins, bin(BinOp::Or, lo,
++                bin(BinOp::Shl, hi, konst(32))), konst(0)))
++        }
+         // cmpps with the imm8 predicate (`cmpltps`/`cmpleps`/`cmpeqps`… aliases).
+         Mnemonic::Cmpps => {
+             let (alo, ahi) = some_or_asm!(read_xmm128(ins, 0));
+@@ -1610,6 +1641,30 @@ pub fn lift(insn: &Insn, bits: u32) -> Vec<Stmt> {
+                 fcall("__ps_cmp", vec![ahi, bhi, p])
+             ))
+         }
++        // Legacy packed-double comparison: the low three immediate bits
++        // select an ordered predicate or its unordered-inclusive complement.
++        Mnemonic::Cmppd => {
++            let (alo, ahi) = some_or_asm!(read_xmm128(ins, 0));
++            let (blo, bhi) = some_or_asm!(read_xmm128(ins, 1));
++            let predicate = ins.immediate(2) & 7;
++            let compare = |a: Expr, b: Expr| {
++                let eq = || fcall("__fp_eq64", vec![a.clone(), b.clone()]);
++                let lt = || fcall("__fp_lt64", vec![a.clone(), b.clone()]);
++                let un = || fcall("__fp_un64", vec![a.clone(), b.clone()]);
++                let result = match predicate {
++                    0 => eq(),
++                    1 => lt(),
++                    2 => bin(BinOp::Or, lt(), eq()),
++                    3 => un(),
++                    4 => bin(BinOp::Eq, eq(), konst(0)),
++                    5 => bin(BinOp::Eq, lt(), konst(0)),
++                    6 => bin(BinOp::Eq, bin(BinOp::Or, lt(), eq()), konst(0)),
++                    _ => bin(BinOp::Eq, un(), konst(0)),
++                };
++                bin(BinOp::Sub, konst(0), result)
++            };
++            some_or_asm!(write_xmm128(ins, compare(alo, blo), compare(ahi, bhi)))
++        }
+         // Bitwise packed-float logic: operate on the raw 128-bit halves.
+         // Packed bitwise and/or/andnot — the *ps and *pd forms are bit-identical
+         // (whole-128-bit bitwise op; the float width is irrelevant to the bits).
+@@ -1662,6 +1717,27 @@ pub fn lift(insn: &Insn, bits: u32) -> Vec<Stmt> {
+             some_or_asm!(write_op0(ins, fcall("__ps_movmsk", vec![lo, hi]), bits))
+         }
+ 
++        // MOVMSKPD packs the two lane sign bits into bits 0 and 1.
++        Mnemonic::Movmskpd => {
++            let (lo, hi) = some_or_asm!(read_xmm128(ins, 1));
++            let mask = bin(BinOp::Or, bin(BinOp::Shr, lo, konst(63)),
++                bin(BinOp::Shl, bin(BinOp::Shr, hi, konst(63)), konst(1)));
++            some_or_asm!(write_op0(ins, mask, bits))
++        }
++        // Legacy BLENDVPD uses implicit XMM0; only each lane's sign bit
++        // selects its source. Other mask bits do not affect the selection.
++        Mnemonic::Blendvpd => {
++            let (alo, ahi) = some_or_asm!(read_xmm128(ins, 0));
++            let (blo, bhi) = some_or_asm!(read_xmm128(ins, 1));
++            let blend = |a, b, mask| Expr::Select {
++                cond: Box::new(bin(BinOp::Shr, mask, konst(63))),
++                then_: Box::new(b), else_: Box::new(a),
++            };
++            some_or_asm!(write_xmm128(ins,
++                blend(alo, blo, Expr::Read(xmm_lo(0))),
++                blend(ahi, bhi, Expr::Read(xmm_hi(0)))))
++        }
++
+         // Packed double arithmetic: each 64-bit half is one IEEE-754 double,
+         // computed bit-exactly via the scalar `__fp_*64` helpers.
+         Mnemonic::Addpd | Mnemonic::Subpd | Mnemonic::Mulpd | Mnemonic::Divpd => {
+@@ -1767,6 +1843,24 @@ pub fn lift(insn: &Insn, bits: u32) -> Vec<Stmt> {
+         Mnemonic::Subsd => some_or_asm!(fbin("__fp_sub64", ins, bits)),
+         Mnemonic::Mulsd => some_or_asm!(fbin("__fp_mul64", ins, bits)),
+         Mnemonic::Divsd => some_or_asm!(fbin("__fp_div64", ins, bits)),
++        Mnemonic::Minss | Mnemonic::Maxss | Mnemonic::Minsd | Mnemonic::Maxsd => {
++            let a = some_or_asm!(op_value(ins, 0));
++            let b = some_or_asm!(op_value(ins, 1));
++            let single = matches!(ins.mnemonic(), Mnemonic::Minss | Mnemonic::Maxss);
++            let maximum = matches!(ins.mnemonic(), Mnemonic::Maxss | Mnemonic::Maxsd);
++            let helper = if single { "__fp_lt32" } else { "__fp_lt64" };
++            // SSE chooses the source operand on equality or unordered inputs.
++            // Select the original bits to preserve NaN payloads and signed zero.
++            let cmp_args = if maximum { vec![b.clone(), a.clone()] }
++                else { vec![a.clone(), b.clone()] };
++            let selected = Expr::Select {
++                cond: Box::new(fcall(helper, cmp_args)),
++                then_: Box::new(a), else_: Box::new(b),
++            };
++            some_or_asm!(write_fp(helper, ins, selected, bits))
++        }
++        Mnemonic::Sqrtss => some_or_asm!(fcvt("__fp_sqrt32", ins, bits)),
++        Mnemonic::Sqrtsd => some_or_asm!(fcvt("__fp_sqrt64", ins, bits)),
+         Mnemonic::Cvtsi2ss => {
+             let n = if op_bits(ins, 1) >= 64 { "__fp_i64_32" } else { "__fp_i32_32" };
+             some_or_asm!(fcvt(n, ins, bits))
+@@ -1783,6 +1877,14 @@ pub fn lift(insn: &Insn, bits: u32) -> Vec<Stmt> {
+             let n = if op_bits(ins, 0) >= 64 { "__fp_64_i64" } else { "__fp_64_i32" };
+             some_or_asm!(fcvt(n, ins, bits))
+         }
++        Mnemonic::Cvtss2si => {
++            let n = if op_bits(ins, 0) >= 64 { "__ssert_cvt32_i64" } else { "__ssert_cvt32_i32" };
++            some_or_asm!(fcvt(n, ins, bits))
++        }
++        Mnemonic::Cvtsd2si => {
++            let n = if op_bits(ins, 0) >= 64 { "__ssert_cvt64_i64" } else { "__ssert_cvt64_i32" };
++            some_or_asm!(fcvt(n, ins, bits))
++        }
+         Mnemonic::Cvtss2sd => some_or_asm!(fcvt("__fp_32_64", ins, bits)),
+         Mnemonic::Cvtsd2ss => some_or_asm!(fcvt("__fp_64_32", ins, bits)),
+         Mnemonic::Comiss | Mnemonic::Ucomiss | Mnemonic::Comisd | Mnemonic::Ucomisd => {
+@@ -1820,11 +1922,18 @@ pub fn lift(insn: &Insn, bits: u32) -> Vec<Stmt> {
+             FlagKind::Cf,
+             bin(BinOp::Xor, Expr::Read(Location::Flag(FlagKind::Cf)), konst(1)),
+         )],
+-        // NB: `lahf` (AH = flags byte) is deliberately NOT modelled — it would
+-        // expose the raw SF/AF/PF bits, which this pipeline computes only well
+-        // enough to reconstruct branch *conditions* (it does not set AF/PF, and
+-        // SF is not width-truncated). Reading them directly would be wrong, so
+-        // `lahf` stays a sound `Asm`. (`sahf` is fine: it *writes* flags from AH.)
++        Mnemonic::Lahf => {
++            // AH = SF:ZF:0:AF:0:PF:1:CF; retain every other accumulator bit.
++            let mut ah = konst(2);
++            for (flag, shift) in [(FlagKind::Cf, 0), (FlagKind::Pf, 2),
++                (FlagKind::Af, 4), (FlagKind::Zf, 6), (FlagKind::Sf, 7)] {
++                ah = bin(BinOp::Or, ah, bin(BinOp::Shl,
++                    bin(BinOp::And, read_flag(flag), konst(1)), konst(shift)));
++            }
++            let dst = Location::Reg(RegId(0));
++            let keep = bin(BinOp::And, Expr::Read(dst.clone()), konst(!0xff00i128 & mask(64)));
++            vec![Stmt::Set { dst, expr: bin(BinOp::Or, keep, bin(BinOp::Shl, ah, konst(8))) }]
++        }
+ 
+         // sahf: load CPU flags from AH (CF=AH.0, PF=AH.2, AF=AH.4, ZF=AH.6,
+         // SF=AH.7). Completes the x87 `fcom; fnstsw ax; sahf` compare idiom.
+@@ -2042,15 +2151,12 @@ pub fn lift(insn: &Insn, bits: u32) -> Vec<Stmt> {
+                 },
+             ]
+         }
+-        // SSE control/status register. `ldmxcsr [m32]` loads MXCSR (rounding mode +
+-        // exception masks/flags); we do not model the SSE rounding/exception state
+-        // (results use the host default, round-to-nearest, exceptions masked) — a
+-        // no-op, matching how the x87 control word (`fldcw`) is treated. `stmxcsr
+-        // [m32]` stores MXCSR: write the reset default 0x1f80 (all exceptions
+-        // masked, round-to-nearest), what the CRT's FP init reads back.
+-        Mnemonic::Ldmxcsr | Mnemonic::Vldmxcsr => vec![Stmt::Nop],
++        // Keep the physical SSE control/status register across calls. The rounded
++        // integer conversions read its mode and accumulate exception flags.
++        Mnemonic::Ldmxcsr | Mnemonic::Vldmxcsr => vec![Stmt::CallStmt(fcall(
++            "__ssert_setcsr", vec![some_or_asm!(op_value(ins, 0))]))],
+         Mnemonic::Stmxcsr | Mnemonic::Vstmxcsr => {
+-            some_or_asm!(write_op0(ins, konst(0x1f80), bits))
++            some_or_asm!(write_op0(ins, fcall("__ssert_getcsr", vec![]), bits))
+         }
+         // cqo: RDX = sign-extension of RAX (64-bit).
+         Mnemonic::Cqo => {
+@@ -2893,6 +2999,18 @@ pub(crate) fn lift_x87_runtime(insn: &Insn) -> Vec<Stmt> {
+     x87_rt_try(insn).unwrap_or_else(|| asm_fallback(insn))
+ }
+ 
++/// Metadata belongs to the original guest instruction, not the generated C.
++pub(crate) fn lift_x87_runtime_with_metadata(insn: &Insn, opcode: u16) -> Vec<Stmt> {
++    use Mnemonic::*;
++    let mut statements = lift_x87_runtime(insn);
++    if !matches!(insn.raw.mnemonic(), Fldcw | Fnstcw | Fstcw | Fldenv | Fnstenv | Fstenv | Fnstsw | Fstsw | Finit | Fninit | Fnclex | Fclex | Fnop | Wait) {
++        let memory = (0..insn.raw.op_count()).any(|i| insn.raw.op_kind(i)==OpKind::Memory);
++        let address = if memory { mem_addr(&insn.raw).map(|(a,_)|a).unwrap_or_else(||konst(0)) } else { konst(0) };
++        statements.insert(0, Stmt::CallStmt(x87call("__x87rt_note", vec![konst(insn.address as i128),konst(opcode as i128),address,konst(memory as i128)])));
++    }
++    statements
++}
++
+ fn x87_rt_try(insn: &Insn) -> Option<Vec<Stmt>> {
+     use Mnemonic::*;
+     let ins = &insn.raw;
+@@ -3022,6 +3140,11 @@ fn x87_rt_try(insn: &Insn) -> Option<Vec<Stmt>> {
+             let (addr, _) = mem_addr(ins)?;
+             vec![rt("__x87rt_ldcw", vec![addr])]
+         }
++        Fnstenv | Fstenv | Fldenv => {
++            let (addr, _) = mem_addr(ins)?;
++            let size = match ins.memory_size() { MemorySize::FpuEnv14 => 14, MemorySize::FpuEnv28 => 28, _ => return None };
++            vec![rt(if mn == Fldenv { "__x87rt_ldenv" } else { "__x87rt_stenv" }, vec![addr, konst(size)])]
++        }
+         Fnstcw | Fstcw => {
+             let (addr, _) = mem_addr(ins)?;
+             vec![rt("__x87rt_stcw", vec![addr])]
+@@ -3138,7 +3261,9 @@ fn x87_rt_try(insn: &Insn) -> Option<Vec<Stmt>> {
+         Fldl2t => vec![rt("__x87rt_ldl2t", vec![])],
+         Fldlg2 => vec![rt("__x87rt_ldlg2", vec![])],
+         Fldln2 => vec![rt("__x87rt_ldln2", vec![])],
+-        Fnclex | Fclex | Fnop | Wait | Finit | Fninit => vec![Stmt::Nop],
++        Fnclex | Fclex => vec![rt("__x87rt_clear", vec![])],
++        Finit | Fninit => vec![rt("__x87rt_reset", vec![])],
++        Fnop | Wait => vec![Stmt::Nop],
+ 
+         _ => return None,
+     })
+@@ -3426,6 +3551,53 @@ mod tests {
+         assert!(matches!(s.as_slice(), [Stmt::Set { .. }]));
+     }
+ 
++    #[test]
++    fn xlat_updates_only_al_and_rejects_unmodelled_segments() {
++        for (bytes, bits) in [(&[0xd7][..], 16), (&[0xd7][..], 32),
++                              (&[0xd7][..], 64), (&[0x67, 0xd7][..], 32),
++                              (&[0x67, 0xd7][..], 64)] {
++            let statements = one(bytes, bits);
++            assert!(matches!(statements.as_slice(), [Stmt::Set { dst: Location::Reg(RegId(0)), .. }]));
++        }
++        assert!(one(&[0x64, 0xd7], 32).iter().any(|statement| matches!(statement,
++            Stmt::CallStmt(Expr::Call { target: CallTarget::Named(name), .. }) if name.starts_with("asm:"))));
++    }
++
++    #[test]
++    fn xlat_unsigned_index_wraps_address_and_preserves_upper_accumulator() {
++        fn evaluate(expr: &Expr, accumulator: i128, base: i128, address: i128, byte: i128) -> i128 {
++            match expr {
++                Expr::Const(value, _) => *value,
++                Expr::Read(Location::Reg(RegId(0))) => accumulator,
++                Expr::Read(Location::Reg(RegId(3))) => base,
++                Expr::Binary(op, left, right) => {
++                    let a = evaluate(left, accumulator, base, address, byte);
++                    let b = evaluate(right, accumulator, base, address, byte);
++                    match op { BinOp::And => a & b, BinOp::Or => a | b, BinOp::Add => a + b,
++                        other => panic!("unexpected XLAT operation: {other:?}") }
++                }
++                Expr::Load { addr, ty } => {
++                    assert_eq!(*ty, Ty::int(8));
++                    assert_eq!(evaluate(addr, accumulator, base, address, byte), address);
++                    byte
++                }
++                other => panic!("unexpected XLAT expression: {other:?}"),
++            }
++        }
++        for (bytes, bits, address_bits) in [(&[0xd7][..], 16, 16), (&[0xd7][..], 32, 32),
++            (&[0xd7][..], 64, 64), (&[0x67, 0xd7][..], 32, 16), (&[0x67, 0xd7][..], 64, 32)] {
++            let statements = one(bytes, bits);
++            let [Stmt::Set { dst: Location::Reg(RegId(0)), expr }] = statements.as_slice() else { panic!("unexpected XLAT writes") };
++            let base = mask(address_bits) - 127;
++            for index in 0..256i128 {
++                let accumulator = (0x123456789abcde00i128 & mask(bits)) | index;
++                let address = (base + index) & mask(address_bits);
++                let byte = index ^ 0xa5;
++                assert_eq!(evaluate(expr, accumulator, base, address, byte), (accumulator & !0xff) | byte);
++            }
++        }
++    }
++
+     #[test]
+     fn cmp_sets_flags() {
+         // cmp eax, ebx (39 d8): six flag definitions (ZF/SF/CF/OF/PF/AF), no
+diff --git a/src/ir/mod.rs b/src/ir/mod.rs
+index bb9f545..83a8e91 100644
+--- a/src/ir/mod.rs
++++ b/src/ir/mod.rs
+@@ -13,6 +13,7 @@ pub mod types;
+ pub mod lift;
+ /// IR CFG builder + pretty-printer.
+ pub mod build;
++mod sse;
+ /// `__stdcall` Win32 import stack-pop counts (callee-pops-args ABI).
+ pub mod stdcall_pops;
+ /// Resolution of PE imports by ordinal (e.g. COMCTL32 #17 = InitCommonControls).
+diff --git a/src/ir/stdcall_pops.rs b/src/ir/stdcall_pops.rs
+index d6b0868..64f8277 100644
+--- a/src/ir/stdcall_pops.rs
++++ b/src/ir/stdcall_pops.rs
+@@ -1194,6 +1194,9 @@ static TABLE: &[(&str, u32)] = &[
+     ("CreateDIBSection", 24),
+     ("CreateDIBitmap", 24),
+     ("CreateDPIScaledDIBSection", 28),
++    ("CreateDXGIFactory", 8),
++    ("CreateDXGIFactory1", 8),
++    ("CreateDXGIFactory2", 12),
+     ("CreateDataAdviseHolder", 4),
+     ("CreateDataCache", 16),
+     ("CreateDesktopA", 24),
+@@ -1615,6 +1618,8 @@ static TABLE: &[(&str, u32)] = &[
+     ("CtfImmSetDefaultRemoteKeyboardLayout", 8),
+     ("CtfImmTIMActivate", 8),
+     ("CtrlRoutine", 4),
++    ("D3D11CreateDevice", 40),
++    ("D3D11CreateDeviceAndSwapChain", 48),
+     ("D3DKMTAbandonSwapChain", 4),
+     ("D3DKMTAcquireKeyedMutex", 4),
+     ("D3DKMTAcquireKeyedMutex2", 4),
+diff --git a/src/opt/mod.rs b/src/opt/mod.rs
+index 78f8fa0..f6cf980 100644
+--- a/src/opt/mod.rs
++++ b/src/opt/mod.rs
+@@ -201,7 +201,9 @@ fn propagate(func: &mut IrFunction) -> bool {
+     for b in &mut func.blocks {
+         for s in &mut b.stmts {
+             map_exprs(s, &mut |e| {
+-                let ne = subst(e, &defs, &uses);
++                // Retain SSA references once inlining would grow this expression
++                // too far. This bounds compilation work without changing execution.
++                let ne = subst(e, &defs, &uses, &mut 64);
+                 if ne != *e {
+                     changed = true;
+                 }
+@@ -214,54 +216,77 @@ fn propagate(func: &mut IrFunction) -> bool {
+ 
+ /// Substitute a use by its definition when safe: constants and copies always;
+ /// other pure expressions only when single-use.
+-fn subst(e: &Expr, defs: &HashMap<u32, Expr>, uses: &HashMap<u32, u32>) -> Expr {
++fn subst(e: &Expr, defs: &HashMap<u32, Expr>, uses: &HashMap<u32, u32>, budget: &mut usize) -> Expr {
+     match e {
+         Expr::Use(v) => match defs.get(&v.0) {
+             Some(Expr::Const(c, t)) => Expr::Const(*c, t.clone()),
+-            Some(Expr::Use(w)) => subst(&Expr::Use(*w), defs, uses),
++            Some(Expr::Use(w)) => subst(&Expr::Use(*w), defs, uses, budget),
+             Some(Expr::Phi(_)) | None => e.clone(),
+             Some(d) => {
+                 if !contains_side_effect(d) && uses.get(&v.0).copied().unwrap_or(0) == 1 {
+-                    subst(d, defs, uses)
++                    // Replacing one Use node by d grows the tree by nodes(d)-1.
++                    let mut available = *budget + 1;
++                    if consume_inline_nodes(d, &mut available) {
++                        *budget = available;
++                        subst(d, defs, uses, budget)
++                    } else {
++                        e.clone()
++                    }
+                 } else {
+                     e.clone()
+                 }
+             }
+         },
+         Expr::Load { addr, ty } => Expr::Load {
+-            addr: Box::new(subst(addr, defs, uses)),
++            addr: Box::new(subst(addr, defs, uses, budget)),
+             ty: ty.clone(),
+         },
+-        Expr::Unary(op, x) => Expr::Unary(*op, Box::new(subst(x, defs, uses))),
++        Expr::Unary(op, x) => Expr::Unary(*op, Box::new(subst(x, defs, uses, budget))),
+         Expr::Binary(op, a, b) => Expr::Binary(
+             *op,
+-            Box::new(subst(a, defs, uses)),
+-            Box::new(subst(b, defs, uses)),
++            Box::new(subst(a, defs, uses, budget)),
++            Box::new(subst(b, defs, uses, budget)),
+         ),
+         Expr::Cast { to, expr } => Expr::Cast {
+             to: to.clone(),
+-            expr: Box::new(subst(expr, defs, uses)),
++            expr: Box::new(subst(expr, defs, uses, budget)),
+         },
+         Expr::Call { target, args, ret } => {
+             let target = match target {
+-                CallTarget::Indirect(x) => CallTarget::Indirect(Box::new(subst(x, defs, uses))),
++                CallTarget::Indirect(x) => CallTarget::Indirect(Box::new(subst(x, defs, uses, budget))),
+                 t => t.clone(),
+             };
+             Expr::Call {
+                 target,
+-                args: args.iter().map(|a| subst(a, defs, uses)).collect(),
++                args: args.iter().map(|a| subst(a, defs, uses, budget)).collect(),
+                 ret: ret.clone(),
+             }
+         }
+         Expr::Select { cond, then_, else_ } => Expr::Select {
+-            cond: Box::new(subst(cond, defs, uses)),
+-            then_: Box::new(subst(then_, defs, uses)),
+-            else_: Box::new(subst(else_, defs, uses)),
++            cond: Box::new(subst(cond, defs, uses, budget)),
++            then_: Box::new(subst(then_, defs, uses, budget)),
++            else_: Box::new(subst(else_, defs, uses, budget)),
+         },
+         other => other.clone(),
+     }
+ }
+ 
++// Candidates here are pure expressions; calls, loads and register reads were
++// rejected above. Stop counting once the budget is exhausted, before cloning.
++fn consume_inline_nodes(e: &Expr, budget: &mut usize) -> bool {
++    if *budget == 0 {
++        return false;
++    }
++    *budget -= 1;
++    match e {
++        Expr::Unary(_, x) | Expr::Cast { expr: x, .. } => consume_inline_nodes(x, budget),
++        Expr::Binary(_, a, b) => consume_inline_nodes(a, budget) && consume_inline_nodes(b, budget),
++        Expr::Select { cond, then_, else_ } => consume_inline_nodes(cond, budget)
++            && consume_inline_nodes(then_, budget) && consume_inline_nodes(else_, budget),
++        _ => true,
++    }
++}
++
+ // --- folding / algebraic simplification -----------------------------------
+ 
+ fn fold_function(func: &mut IrFunction) {

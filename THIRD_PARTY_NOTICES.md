@@ -5,3 +5,9 @@
 - Bundled runtime dependencies retain their upstream license notices in `runtime/vendor/` and in their source files.
 
 The launcher and hosting code are distributed under the GNU AGPL v3 in `LICENSE`. That license does not grant rights to Forager's proprietary game assets.
+
+## Experimental 4.1.9 branch
+
+- **Forager 4.1.9** and its translated game code, artwork, audio, and data retain their original rights. They are not licensed under this repository's software license.
+- **ARET**: https://github.com/aciderix/Automatic-reverse-engineering-toolkit. The upstream project declares the MIT license in its README and Cargo manifest. The modified source is in `native-runtime/aret/`; its upstream base commit is in `native-runtime/aret-base.txt`.
+- **browser_wasi_shim 0.4.2**: https://github.com/bjorn3/browser_wasi_shim, licensed MIT OR Apache-2.0. The bundled distribution and both license texts are in `public/vendor/browser-wasi-shim/`.

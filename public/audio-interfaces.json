@@ -1,0 +1,532 @@
+[
+  {
+    "id": 32,
+    "name": "IMMDeviceEnumerator",
+    "iids": [
+      {
+        "name": "IMMDeviceEnumerator",
+        "bytes": "d26456a91496354fa746de8db63617e6"
+      }
+    ],
+    "methods": [
+      {
+        "name": "QueryInterface",
+        "pop": 12,
+        "parameters": [
+          "IMMDeviceEnumerator *This",
+          "REFIID riid",
+          "void **ppvObject"
+        ]
+      },
+      {
+        "name": "AddRef",
+        "pop": 4,
+        "parameters": [
+          "IMMDeviceEnumerator *This"
+        ]
+      },
+      {
+        "name": "Release",
+        "pop": 4,
+        "parameters": [
+          "IMMDeviceEnumerator *This"
+        ]
+      },
+      {
+        "name": "EnumAudioEndpoints",
+        "pop": 16,
+        "parameters": [
+          "IMMDeviceEnumerator *This",
+          "EDataFlow dataFlow",
+          "DWORD dwStateMask",
+          "IMMDeviceCollection **ppDevices"
+        ]
+      },
+      {
+        "name": "GetDefaultAudioEndpoint",
+        "pop": 16,
+        "parameters": [
+          "IMMDeviceEnumerator *This",
+          "EDataFlow dataFlow",
+          "ERole role",
+          "IMMDevice **ppEndpoint"
+        ]
+      },
+      {
+        "name": "GetDevice",
+        "pop": 12,
+        "parameters": [
+          "IMMDeviceEnumerator *This",
+          "LPCWSTR pwstrId",
+          "IMMDevice **ppDevice"
+        ]
+      },
+      {
+        "name": "RegisterEndpointNotificationCallback",
+        "pop": 8,
+        "parameters": [
+          "IMMDeviceEnumerator *This",
+          "IMMNotificationClient *pClient"
+        ]
+      },
+      {
+        "name": "UnregisterEndpointNotificationCallback",
+        "pop": 8,
+        "parameters": [
+          "IMMDeviceEnumerator *This",
+          "IMMNotificationClient *pClient"
+        ]
+      }
+    ]
+  },
+  {
+    "id": 33,
+    "name": "IMMDevice",
+    "iids": [
+      {
+        "name": "IMMDevice",
+        "bytes": "3f0666d68715434e81f1b948e807363f"
+      }
+    ],
+    "methods": [
+      {
+        "name": "QueryInterface",
+        "pop": 12,
+        "parameters": [
+          "IMMDevice *This",
+          "REFIID riid",
+          "void **ppvObject"
+        ]
+      },
+      {
+        "name": "AddRef",
+        "pop": 4,
+        "parameters": [
+          "IMMDevice *This"
+        ]
+      },
+      {
+        "name": "Release",
+        "pop": 4,
+        "parameters": [
+          "IMMDevice *This"
+        ]
+      },
+      {
+        "name": "Activate",
+        "pop": 20,
+        "parameters": [
+          "IMMDevice *This",
+          "REFIID iid",
+          "DWORD dwClsCtx",
+          "PROPVARIANT *pActivationParams",
+          "void **ppv"
+        ]
+      },
+      {
+        "name": "OpenPropertyStore",
+        "pop": 12,
+        "parameters": [
+          "IMMDevice *This",
+          "DWORD stgmAccess",
+          "IPropertyStore **ppProperties"
+        ]
+      },
+      {
+        "name": "GetId",
+        "pop": 8,
+        "parameters": [
+          "IMMDevice *This",
+          "LPWSTR *ppstrId"
+        ]
+      },
+      {
+        "name": "GetState",
+        "pop": 8,
+        "parameters": [
+          "IMMDevice *This",
+          "DWORD *pdwState"
+        ]
+      }
+    ]
+  },
+  {
+    "id": 34,
+    "name": "IAudioClient",
+    "iids": [
+      {
+        "name": "IAudioClient",
+        "bytes": "4cadb91cfadb324cb178c2f568a703b2"
+      }
+    ],
+    "methods": [
+      {
+        "name": "QueryInterface",
+        "pop": 12,
+        "parameters": [
+          "IAudioClient *This",
+          "REFIID riid",
+          "void **ppvObject"
+        ]
+      },
+      {
+        "name": "AddRef",
+        "pop": 4,
+        "parameters": [
+          "IAudioClient *This"
+        ]
+      },
+      {
+        "name": "Release",
+        "pop": 4,
+        "parameters": [
+          "IAudioClient *This"
+        ]
+      },
+      {
+        "name": "Initialize",
+        "pop": 36,
+        "parameters": [
+          "IAudioClient *This",
+          "AUDCLNT_SHAREMODE ShareMode",
+          "DWORD StreamFlags",
+          "REFERENCE_TIME hnsBufferDuration",
+          "REFERENCE_TIME hnsPeriodicity",
+          "const WAVEFORMATEX *pFormat",
+          "LPCGUID AudioSessionGuid"
+        ]
+      },
+      {
+        "name": "GetBufferSize",
+        "pop": 8,
+        "parameters": [
+          "IAudioClient *This",
+          "UINT32 *pNumBufferFrames"
+        ]
+      },
+      {
+        "name": "GetStreamLatency",
+        "pop": 8,
+        "parameters": [
+          "IAudioClient *This",
+          "REFERENCE_TIME *phnsLatency"
+        ]
+      },
+      {
+        "name": "GetCurrentPadding",
+        "pop": 8,
+        "parameters": [
+          "IAudioClient *This",
+          "UINT32 *pNumPaddingFrames"
+        ]
+      },
+      {
+        "name": "IsFormatSupported",
+        "pop": 16,
+        "parameters": [
+          "IAudioClient *This",
+          "AUDCLNT_SHAREMODE ShareMode",
+          "const WAVEFORMATEX *pFormat",
+          "WAVEFORMATEX **ppClosestMatch"
+        ]
+      },
+      {
+        "name": "GetMixFormat",
+        "pop": 8,
+        "parameters": [
+          "IAudioClient *This",
+          "WAVEFORMATEX **ppDeviceFormat"
+        ]
+      },
+      {
+        "name": "GetDevicePeriod",
+        "pop": 12,
+        "parameters": [
+          "IAudioClient *This",
+          "REFERENCE_TIME *phnsDefaultDevicePeriod",
+          "REFERENCE_TIME *phnsMinimumDevicePeriod"
+        ]
+      },
+      {
+        "name": "Start",
+        "pop": 4,
+        "parameters": [
+          "IAudioClient *This"
+        ]
+      },
+      {
+        "name": "Stop",
+        "pop": 4,
+        "parameters": [
+          "IAudioClient *This"
+        ]
+      },
+      {
+        "name": "Reset",
+        "pop": 4,
+        "parameters": [
+          "IAudioClient *This"
+        ]
+      },
+      {
+        "name": "SetEventHandle",
+        "pop": 8,
+        "parameters": [
+          "IAudioClient *This",
+          "HANDLE eventHandle"
+        ]
+      },
+      {
+        "name": "GetService",
+        "pop": 12,
+        "parameters": [
+          "IAudioClient *This",
+          "REFIID riid",
+          "void **ppv"
+        ]
+      }
+    ]
+  },
+  {
+    "id": 35,
+    "name": "IAudioRenderClient",
+    "iids": [
+      {
+        "name": "IAudioRenderClient",
+        "bytes": "fcac94f246318344a7bfaddca7c260e2"
+      }
+    ],
+    "methods": [
+      {
+        "name": "QueryInterface",
+        "pop": 12,
+        "parameters": [
+          "IAudioRenderClient *This",
+          "REFIID riid",
+          "void **ppvObject"
+        ]
+      },
+      {
+        "name": "AddRef",
+        "pop": 4,
+        "parameters": [
+          "IAudioRenderClient *This"
+        ]
+      },
+      {
+        "name": "Release",
+        "pop": 4,
+        "parameters": [
+          "IAudioRenderClient *This"
+        ]
+      },
+      {
+        "name": "GetBuffer",
+        "pop": 12,
+        "parameters": [
+          "IAudioRenderClient *This",
+          "UINT32 NumFramesRequested",
+          "BYTE **ppData"
+        ]
+      },
+      {
+        "name": "ReleaseBuffer",
+        "pop": 12,
+        "parameters": [
+          "IAudioRenderClient *This",
+          "UINT32 NumFramesWritten",
+          "DWORD dwFlags"
+        ]
+      }
+    ]
+  },
+  {
+    "id": 36,
+    "name": "IMMDeviceCollection",
+    "iids": [
+      {
+        "name": "IMMDeviceCollection",
+        "bytes": "bea1d70b1a7adb448397cc5392387b5e"
+      }
+    ],
+    "methods": [
+      {
+        "name": "QueryInterface",
+        "pop": 12,
+        "parameters": [
+          "IMMDeviceCollection *This",
+          "REFIID riid",
+          "void **ppvObject"
+        ]
+      },
+      {
+        "name": "AddRef",
+        "pop": 4,
+        "parameters": [
+          "IMMDeviceCollection *This"
+        ]
+      },
+      {
+        "name": "Release",
+        "pop": 4,
+        "parameters": [
+          "IMMDeviceCollection *This"
+        ]
+      },
+      {
+        "name": "GetCount",
+        "pop": 8,
+        "parameters": [
+          "IMMDeviceCollection *This",
+          "UINT *pcDevices"
+        ]
+      },
+      {
+        "name": "Item",
+        "pop": 12,
+        "parameters": [
+          "IMMDeviceCollection *This",
+          "UINT nDevice",
+          "IMMDevice **ppdevice"
+        ]
+      }
+    ]
+  },
+  {
+    "id": 37,
+    "name": "IPropertyStore",
+    "iids": [
+      {
+        "name": "IPropertyStore",
+        "bytes": "eb8e6d88f28c46448d02cdba1dbdcf99"
+      }
+    ],
+    "methods": [
+      {
+        "name": "QueryInterface",
+        "pop": 12,
+        "parameters": [
+          "IPropertyStore *This",
+          "REFIID riid",
+          "void **ppvObject"
+        ]
+      },
+      {
+        "name": "AddRef",
+        "pop": 4,
+        "parameters": [
+          "IPropertyStore *This"
+        ]
+      },
+      {
+        "name": "Release",
+        "pop": 4,
+        "parameters": [
+          "IPropertyStore *This"
+        ]
+      },
+      {
+        "name": "GetCount",
+        "pop": 8,
+        "parameters": [
+          "IPropertyStore *This",
+          "DWORD *cProps"
+        ]
+      },
+      {
+        "name": "GetAt",
+        "pop": 12,
+        "parameters": [
+          "IPropertyStore *This",
+          "DWORD iProp",
+          "PROPERTYKEY *pkey"
+        ]
+      },
+      {
+        "name": "GetValue",
+        "pop": 12,
+        "parameters": [
+          "IPropertyStore *This",
+          "REFPROPERTYKEY key",
+          "PROPVARIANT *pv"
+        ]
+      },
+      {
+        "name": "SetValue",
+        "pop": 12,
+        "parameters": [
+          "IPropertyStore *This",
+          "REFPROPERTYKEY key",
+          "REFPROPVARIANT propvar"
+        ]
+      },
+      {
+        "name": "Commit",
+        "pop": 4,
+        "parameters": [
+          "IPropertyStore *This"
+        ]
+      }
+    ]
+  },
+  {
+    "id": 38,
+    "name": "IAudioClock",
+    "iids": [
+      {
+        "name": "IAudioClock",
+        "bytes": "4f3163cdba3f1b4a812cef96358728e7"
+      }
+    ],
+    "methods": [
+      {
+        "name": "QueryInterface",
+        "pop": 12,
+        "parameters": [
+          "IAudioClock *This",
+          "REFIID riid",
+          "void **ppvObject"
+        ]
+      },
+      {
+        "name": "AddRef",
+        "pop": 4,
+        "parameters": [
+          "IAudioClock *This"
+        ]
+      },
+      {
+        "name": "Release",
+        "pop": 4,
+        "parameters": [
+          "IAudioClock *This"
+        ]
+      },
+      {
+        "name": "GetFrequency",
+        "pop": 8,
+        "parameters": [
+          "IAudioClock *This",
+          "UINT64 *pu64Frequency"
+        ]
+      },
+      {
+        "name": "GetPosition",
+        "pop": 12,
+        "parameters": [
+          "IAudioClock *This",
+          "UINT64 *pu64Position",
+          "UINT64 *pu64QPCPosition"
+        ]
+      },
+      {
+        "name": "GetCharacteristics",
+        "pop": 8,
+        "parameters": [
+          "IAudioClock *This",
+          "DWORD *pdwCharacteristics"
+        ]
+      }
+    ]
+  }
+]

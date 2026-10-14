@@ -17,6 +17,7 @@ const types = {
 const port = Number(process.env.PORT || 8767);
 
 createServer(async (request, response) => {
+  response.setHeader("Cache-Control", "no-cache");
   response.setHeader("Cross-Origin-Opener-Policy", "same-origin");
   response.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
   response.setHeader("Cross-Origin-Resource-Policy", "same-origin");

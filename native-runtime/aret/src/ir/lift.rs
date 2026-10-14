@@ -1,0 +1,3625 @@
+//! IR lifter: machine instruction -> typed IR statements (pre-SSA).
+//!
+//! Built on `iced-x86`'s *structured* operand API (registers, memory, immediates)
+//! rather than the Intel text, per roadmap §3.3. CPU flags are modelled
+//! explicitly so a later pass can recover branch conditions by dataflow.
+//!
+//! Scope: the compute (data movement + arithmetic/logic + flags) part of an
+//! instruction, plus `ret`/`call`. Branch terminators (`jmp`/`jcc`) carry
+//! `BlockId`s that only exist once the IR CFG is built, so they are added by
+//! that later layer, not here. Anything with an operand shape we do not model
+//! (high-byte registers, far pointers, exotic SIMD) falls back to `Stmt::Asm`,
+//! keeping the IR always semantically honest.
+//!
+//! Not yet wired into the default pipeline (parallel migration, roadmap §3.5).
+#![allow(dead_code)]
+
+use super::types::*;
+use crate::disasm::Insn;
+use iced_x86::{
+    ConditionCode, Instruction, InstructionInfoFactory, MemorySize, Mnemonic, OpAccess, OpKind,
+    Register, RflagsBits,
+};
+
+/// Canonical register-family id (al/ax/eax/rax all share one). XMM families
+/// start at 16.
+fn reg_id(r: Register) -> Option<RegId> {
+    if r.is_xmm() {
+        return Some(RegId(16 + r.number() as u16));
+    }
+    use Register::*;
+    let n = match r.full_register() {
+        RAX => 0,
+        RCX => 1,
+        RDX => 2,
+        RBX => 3,
+        RSP => 4,
+        RBP => 5,
+        RSI => 6,
+        RDI => 7,
+        R8 => 8,
+        R9 => 9,
+        R10 => 10,
+        R11 => 11,
+        R12 => 12,
+        R13 => 13,
+        R14 => 14,
+        R15 => 15,
+        _ => return Option::None,
+    };
+    Some(RegId(n))
+}
+
+fn is_high_byte(r: Register) -> bool {
+    matches!(r, Register::AH | Register::BH | Register::CH | Register::DH)
+}
+
+fn mask(bits: u32) -> i128 {
+    if bits >= 128 {
+        -1
+    } else {
+        (1i128 << bits) - 1
+    }
+}
+
+fn konst(v: i128) -> Expr {
+    Expr::Const(v, Ty::int(64))
+}
+
+/// Read a register operand as its correctly-masked value.
+/// Whether any operand of `ins` is a vector (XMM/YMM/ZMM) register — i.e. an
+/// SSE/AVX instruction the scalar IR cannot model faithfully.
+fn uses_vector_reg(ins: &Instruction) -> bool {
+    (0..ins.op_count()).any(|i| {
+        let r = ins.op_register(i);
+        r.is_xmm() || r.is_ymm() || r.is_zmm()
+    })
+}
+
+/// Scalar SSE floating-point instructions modelled via the `__fp_*` runtime
+/// helpers (operating on bit patterns). These are exempt from the vector guard.
+fn is_scalar_float(ins: &Instruction) -> bool {
+    use Mnemonic::*;
+    matches!(
+        ins.mnemonic(),
+        Movss | Movsd | Movd | Movq
+            | Addss | Subss | Mulss | Divss | Minss | Maxss | Sqrtss
+            | Addsd | Subsd | Mulsd | Divsd | Minsd | Maxsd | Sqrtsd
+            | Cvtsi2ss | Cvtsi2sd | Cvttss2si | Cvttsd2si | Cvtss2si | Cvtsd2si
+            | Cvtss2sd | Cvtsd2ss | Cvtps2pd | Cvtpd2ps
+            | Comiss | Comisd | Ucomiss | Ucomisd
+            | Pxor | Xorps | Xorpd
+            | Movaps | Movapd | Movups | Movupd
+            | Movdqa | Movdqu | Paddd | Psubd | Psrldq | Pslldq
+            | Pand | Pandn | Por | Pcmpeqd | Pcmpgtd | Pshufd
+            | Pcmpeqb | Pcmpgtb | Pcmpeqw | Pmovmskb | Pshuflw | Pshufhw
+            | Paddw | Paddq | Pcmpgtw | Pmuludq | Psrlq | Psubusw
+            | Paddb | Psubb | Psubw | Psubq | Pmullw
+            | Pslld | Psrld | Psrad | Psllw | Psrlw | Psraw
+            | Packuswb | Packssdw | Punpcklbw | Punpckhbw | Pextrw
+            | Punpcklwd | Punpckhwd | Punpckldq | Punpckhdq | Punpcklqdq | Punpckhqdq
+            | Movhlps | Movlhps | Movhps | Movhpd | Movlps | Movlpd | Shufpd
+            | Unpcklpd | Unpckhpd | Addpd | Subpd | Mulpd | Divpd
+            | Addps | Subps | Mulps | Divps | Minps | Maxps | Sqrtps | Cvtdq2ps
+            | Cmpps | Cmppd | Andps | Orps | Andnps | Shufps | Movmskps | Unpcklps | Unpckhps
+            | Psllq | Pinsrw | Pinsrd | Cvtdq2pd | Movmskpd | Blendvpd
+            | Pshufb | Andpd | Orpd | Andnpd
+    )
+}
+
+/// Build a call to a named runtime helper returning a 64-bit bit pattern.
+fn fcall(name: &str, args: Vec<Expr>) -> Expr {
+    Expr::Call { target: CallTarget::Named(name.to_string()), args, ret: Ty::int(64) }
+}
+
+/// XMM lane number of a register operand.
+fn xmm_num(r: Register) -> Option<u16> {
+    if r.is_xmm() {
+        Some(r.number() as u16)
+    } else {
+        None
+    }
+}
+
+/// The low / high 64-bit halves of XMM register `n`, modelled as two locations
+/// (the integer IR has no 128-bit value). Low half reuses the XMM register id
+/// (`16+n`, matching `reg_id`); the high half lives at `64+n`.
+fn xmm_lo(n: u16) -> Location {
+    Location::Reg(RegId(16 + n))
+}
+fn xmm_hi(n: u16) -> Location {
+    Location::Reg(RegId(64 + n))
+}
+
+/// Read operand `i` as a 128-bit value `(low64, high64)` — an XMM register or a
+/// 16-byte memory location.
+fn read_xmm128(ins: &Instruction, i: u32) -> Option<(Expr, Expr)> {
+    match ins.op_kind(i) {
+        OpKind::Register => {
+            let n = xmm_num(ins.op_register(i))?;
+            Some((Expr::Read(xmm_lo(n)), Expr::Read(xmm_hi(n))))
+        }
+        OpKind::Memory => {
+            if ins.segment_prefix() != Register::None {
+                return None;
+            }
+            // Build the two half addresses. For a rip-relative load use explicit
+            // constant addresses (`abs`, `abs+8`) so the read-only constant folder
+            // can replace both halves with literals.
+            let (lo_addr, hi_addr) = if ins.is_ip_rel_memory_operand() {
+                let a = ins.ip_rel_memory_address() as i128;
+                (konst(a), konst(a + 8))
+            } else {
+                let (addr, _) = mem_addr(ins)?;
+                (addr.clone(), bin(BinOp::Add, addr, konst(8)))
+            };
+            let lo = Expr::Load { addr: Box::new(lo_addr), ty: Ty::int(64) };
+            let hi = Expr::Load { addr: Box::new(hi_addr), ty: Ty::int(64) };
+            Some((lo, hi))
+        }
+        _ => None,
+    }
+}
+
+/// Write a 128-bit value `(low64, high64)` to operand 0 — an XMM register or a
+/// 16-byte memory location.
+fn write_xmm128(ins: &Instruction, lo: Expr, hi: Expr) -> Option<Vec<Stmt>> {
+    match ins.op_kind(0) {
+        OpKind::Register => {
+            let n = xmm_num(ins.op_register(0))?;
+            // Compute both halves into temporaries before assigning: a cross-half
+            // op (e.g. `punpcklwd`, whose high result depends on the low source)
+            // would otherwise see the half this same instruction just overwrote.
+            let base = (ins.ip() as u32).wrapping_mul(2);
+            let t_lo = Location::Temp(base);
+            let t_hi = Location::Temp(base.wrapping_add(1));
+            Some(vec![
+                Stmt::Set { dst: t_lo.clone(), expr: lo },
+                Stmt::Set { dst: t_hi.clone(), expr: hi },
+                Stmt::Set { dst: xmm_lo(n), expr: Expr::Read(t_lo) },
+                Stmt::Set { dst: xmm_hi(n), expr: Expr::Read(t_hi) },
+            ])
+        }
+        OpKind::Memory => {
+            if ins.segment_prefix() != Register::None {
+                return None;
+            }
+            // A rip-relative store targets a global by absolute address — the same
+            // form ARET emits for any `mov [global], reg`, so handle it likewise.
+            let (addr, _) = mem_addr(ins)?;
+            Some(vec![
+                Stmt::Store { addr: addr.clone(), value: lo, ty: Ty::int(64) },
+                Stmt::Store {
+                    addr: bin(BinOp::Add, addr, konst(8)),
+                    value: hi,
+                    ty: Ty::int(64),
+                },
+            ])
+        }
+        _ => None,
+    }
+}
+
+/// Write the result of a scalar-float op to operand 0.
+///
+/// A scalar SSE op updates only the low lane of its XMM destination and leaves
+/// the rest of the register unchanged: `ss` writes bits [31:0] (preserving
+/// [127:32]), `sd` writes [63:0] (preserving [127:64]). The lane width is the
+/// float width the helper produces — the trailing `32`/`64` of its name (the
+/// `…2si` helpers write an integer to a GP register, handled by `write_op0`).
+///
+/// Without preserving the upper bits a single-precision result would zero
+/// [63:32] of the low half, which diverges from hardware once that half is read
+/// back as a 64-bit lane (movq/movsd, packed ops).
+fn write_fp(name: &str, ins: &Instruction, value: Expr, bits: u32) -> Option<Vec<Stmt>> {
+    // Only a *single-precision* result into an XMM register needs the lane-merge
+    // (it must preserve [63:32]); every other case — a `sd` result (writes the
+    // whole low half), an integer destination (cvtt*2si), or a memory store —
+    // is the ordinary `write_op0`.
+    if ins.op_kind(0) == OpKind::Register
+        && ins.op_register(0).is_xmm()
+        && name.ends_with("32")
+    {
+        let n = xmm_num(ins.op_register(0))?;
+        let lo = xmm_lo(n);
+        // (lo & ~0xffffffff) | (value & 0xffffffff) — update [31:0], keep [63:32].
+        let keep = bin(BinOp::And, Expr::Read(lo.clone()), konst(!mask(32) & mask(64)));
+        let newbits = bin(BinOp::And, value, konst(mask(32)));
+        return Some(vec![Stmt::Set { dst: lo, expr: bin(BinOp::Or, keep, newbits) }]);
+    }
+    write_op0(ins, value, bits)
+}
+
+/// Lift a binary scalar-float op `dst = helper(dst, src)`.
+fn fbin(name: &str, ins: &Instruction, bits: u32) -> Option<Vec<Stmt>> {
+    let a = op_value(ins, 0)?;
+    let b = op_value(ins, 1)?;
+    write_fp(name, ins, fcall(name, vec![a, b]), bits)
+}
+
+/// Lift a unary scalar-float convert `dst = helper(src)` (`src` = operand 1).
+fn fcvt(name: &str, ins: &Instruction, bits: u32) -> Option<Vec<Stmt>> {
+    let a = op_value(ins, 1)?;
+    write_fp(name, ins, fcall(name, vec![a]), bits)
+}
+
+/// Bit width of operand `i` (register size, or memory access size).
+fn op_bits(ins: &Instruction, i: u32) -> u32 {
+    match ins.op_kind(i) {
+        OpKind::Register => (ins.op_register(i).size() * 8) as u32,
+        OpKind::Memory => (ins.memory_size().size() * 8) as u32,
+        _ => 64,
+    }
+}
+
+/// The switch index of an indexed indirect jump `jmp [base + idx*scale]`: a read
+/// of the index register (masked to its width). `None` if there is no index
+/// register (a computed `jmp reg`, which isn't a recoverable jump table here).
+pub(crate) fn switch_index(ins: &Instruction) -> Option<Expr> {
+    let idx = ins.memory_index();
+    if idx == Register::None {
+        return None;
+    }
+    read_reg(idx)
+}
+
+/// Read a register as an `Expr` (masked to its width) — for jump-table index
+/// recovery in `ir::build`.
+pub(crate) fn reg_value(r: Register) -> Option<Expr> {
+    read_reg(r)
+}
+
+fn read_reg(r: Register) -> Option<Expr> {
+    let id = reg_id(r)?;
+    let full = Expr::Read(Location::Reg(id));
+    if is_high_byte(r) {
+        // ah/bh/ch/dh are bits 8..=15 of the full register: (full >> 8) & 0xff.
+        return Some(Expr::Binary(
+            BinOp::And,
+            Box::new(Expr::Binary(BinOp::Shr, Box::new(full), Box::new(konst(8)))),
+            Box::new(konst(0xff)),
+        ));
+    }
+    let w = (r.size() * 8) as u32;
+    if w >= 64 {
+        Some(full)
+    } else {
+        Some(Expr::Binary(BinOp::And, Box::new(full), Box::new(konst(mask(w)))))
+    }
+}
+
+thread_local! {
+    /// When set, the lifter does not fold `[rbp+d]` operands into named `Frame`
+    /// slots (scalars). Enabled per-function for x87 code, whose 80-bit FPU
+    /// spills access those same stack bytes through opaque helpers: keeping every
+    /// frame access as raw `__frame` memory makes the two alias consistently.
+    static FRAMES_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Disable/enable named frame-slot folding for subsequent `lift` calls on this
+/// thread (set per-function by `ir::build`).
+pub(crate) fn set_frames_off(off: bool) {
+    FRAMES_OFF.with(|c| c.set(off));
+}
+
+/// Current frame-folding state (so `ir::build` can OR in a caller-forced value,
+/// e.g. the transpiler's shared-stack mode which needs every `[ebp+d]` to stay
+/// raw memory into the shared stack rather than a named local).
+pub(crate) fn frames_off() -> bool {
+    FRAMES_OFF.with(|c| c.get())
+}
+
+/// If operand `i` is a pure frame slot `[ebp/rbp ± disp]` (base = frame pointer,
+/// no index), return its displacement. These become named `Frame` locations.
+fn frame_disp(ins: &Instruction, i: u32) -> Option<i64> {
+    if FRAMES_OFF.with(|c| c.get()) {
+        return None;
+    }
+    if ins.op_kind(i) != OpKind::Memory || ins.is_ip_rel_memory_operand() {
+        return None;
+    }
+    // A segment override (`fs:`/`gs:` — e.g. the stack canary at `fs:0x28`, or
+    // TLS) changes the effective address; we don't model segment bases, so never
+    // treat such an operand as a plain frame slot.
+    if ins.segment_prefix() != Register::None {
+        return None;
+    }
+    let base = ins.memory_base();
+    if (base != Register::RBP && base != Register::EBP) || ins.memory_index() != Register::None {
+        return None;
+    }
+    Some(ins.memory_displacement64() as i64)
+}
+
+/// Build the address expression and access size (bits) of a memory operand.
+/// The segment-base helper call for an `fs:`/`gs:`-prefixed operand: `__aret_fs()`
+/// / `__aret_gs()` return the synthetic TEB base at runtime. Used (transpile/
+/// shared-stack mode only) to model `fs:[disp]` as a real load/store at
+/// `seg_base + disp` — so the Windows startup's TEB/PEB reads work natively.
+fn seg_base(ins: &Instruction) -> Option<Expr> {
+    let name = match ins.segment_prefix() {
+        Register::FS => "__aret_fs",
+        Register::GS => "__aret_gs",
+        _ => return None,
+    };
+    Some(Expr::Call {
+        target: CallTarget::Named(name.to_string()),
+        args: vec![],
+        ret: Ty::int(32),
+    })
+}
+
+fn mem_addr(ins: &Instruction) -> Option<(Expr, u32)> {
+    // Segment-overridden memory (`fs:`/`gs:`) has an effective address we don't
+    // model here — falling through would silently read the wrong (absolute)
+    // address. Callers that model segments (the TEB path) use `mem_addr_raw`.
+    if ins.segment_prefix() != Register::None {
+        return None;
+    }
+    mem_addr_raw(ins)
+}
+
+/// Effective address of a memory operand, *ignoring* any segment override.
+fn mem_addr_raw(ins: &Instruction) -> Option<(Expr, u32)> {
+    let size_bits = (ins.memory_size().size() * 8) as u32;
+    if ins.is_ip_rel_memory_operand() {
+        return Some((konst(ins.ip_rel_memory_address() as i128), size_bits));
+    }
+    let mut acc: Option<Expr> = None;
+    let base = ins.memory_base();
+    if base != Register::None {
+        acc = Some(read_reg(base)?);
+    }
+    let index = ins.memory_index();
+    if index != Register::None {
+        let idx = read_reg(index)?;
+        let scale = ins.memory_index_scale();
+        let scaled = if scale == 1 {
+            idx
+        } else {
+            Expr::Binary(BinOp::Mul, Box::new(idx), Box::new(konst(scale as i128)))
+        };
+        acc = Some(match acc {
+            Some(b) => Expr::Binary(BinOp::Add, Box::new(b), Box::new(scaled)),
+            None => scaled,
+        });
+    }
+    let disp = ins.memory_displacement64() as i64 as i128;
+    if disp != 0 || acc.is_none() {
+        let d = konst(disp);
+        acc = Some(match acc {
+            Some(b) => Expr::Binary(BinOp::Add, Box::new(b), Box::new(d)),
+            None => d,
+        });
+    }
+    Some((acc.unwrap(), size_bits))
+}
+
+/// Value of operand `i`.
+/// The loaded value of an indirect `jmp`/`call` through *memory* — the function
+/// pointer — as an Expr, for lifting `jmp [mem]` as an indirect tail call. Only
+/// for a non-indexed, non-segment memory operand (`jmp [imm32]`, `jmp [reg]`,
+/// `jmp [reg+disp]`); an *indexed* operand (`jmp [tbl+idx*4]`) is a jump table,
+/// handled elsewhere, and returns None here.
+pub(crate) fn mem_indirect_target(ins: &Instruction) -> Option<Expr> {
+    if ins.op0_kind() != OpKind::Memory
+        || ins.memory_index() != Register::None
+        || ins.segment_prefix() != Register::None
+    {
+        return None;
+    }
+    op_value(ins, 0)
+}
+
+fn op_value(ins: &Instruction, i: u32) -> Option<Expr> {
+    match ins.op_kind(i) {
+        OpKind::Register => read_reg(ins.op_register(i)),
+        OpKind::Immediate8
+        | OpKind::Immediate16
+        | OpKind::Immediate32
+        | OpKind::Immediate64
+        | OpKind::Immediate8to16
+        | OpKind::Immediate8to32
+        | OpKind::Immediate8to64
+        | OpKind::Immediate32to64 => Some(konst(ins.immediate(i) as i128)),
+        OpKind::Memory => {
+            // Segment-overridden memory (`fs:`/`gs:`) is TLS. Model every read as
+            // one consistent pseudo-value (0). The stack-protector stores
+            // `fs:[0x28]` to a local and later compares the reload to `fs:[0x28]`;
+            // with both reads equal, the check folds to a no-op (`0 - 0 == 0` →
+            // branch to the success path) — observationally identical to the real
+            // random canary, which always matches on a correct run. Without this
+            // the whole instruction degrades to `asm`, dropping the canary `je`
+            // terminator and breaking the function's structure.
+            if ins.segment_prefix() != Register::None {
+                // Transpile/shared-stack mode: model `fs:[ea]` as a real load from
+                // the synthetic TEB (`__aret_fs() + ea`), so the Windows startup's
+                // TEB/PEB reads work natively. Otherwise keep the consistent-0
+                // model (the stack canary folds to a no-op; see below).
+                if crate::emit::shared_stack() {
+                    if let (Some(base), Some((addr, sz))) = (seg_base(ins), mem_addr_raw(ins)) {
+                        let ea = Expr::Binary(BinOp::Add, Box::new(base), Box::new(addr));
+                        return Some(Expr::Load { addr: Box::new(ea), ty: Ty::int(sz as u8) });
+                    }
+                }
+                return Some(konst(0));
+            }
+            if let Some(d) = frame_disp(ins, i) {
+                let w = (ins.memory_size().size() * 8) as u32;
+                let full = Expr::Read(Location::Frame(d));
+                return Some(if w >= 64 {
+                    full
+                } else {
+                    Expr::Binary(BinOp::And, Box::new(full), Box::new(konst(mask(w))))
+                });
+            }
+            let (addr, sz) = mem_addr(ins)?;
+            Some(Expr::Load {
+                addr: Box::new(addr),
+                ty: Ty::int(sz as u8),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Width in bits of destination operand 0.
+fn op0_width(ins: &Instruction, bits: u32) -> u32 {
+    match ins.op_kind(0) {
+        OpKind::Register => (ins.op_register(0).size() * 8) as u32,
+        OpKind::Memory => (ins.memory_size().size() * 8) as u32,
+        _ => bits,
+    }
+}
+
+/// Combine a value into a destination register of width `w`, honouring x86
+/// partial-write semantics (32-bit writes zero the upper half on x64; 8/16-bit
+/// writes preserve the upper bits).
+fn combine_write(dst: &Location, w: u32, value: Expr, bits: u32) -> Expr {
+    if w >= 64 || w >= bits {
+        return value;
+    }
+    if w == 32 {
+        // x64: writing a 32-bit register zeroes the upper 32 bits.
+        return Expr::Binary(BinOp::And, Box::new(value), Box::new(konst(mask(32))));
+    }
+    let m = mask(w);
+    let keep = Expr::Binary(
+        BinOp::And,
+        Box::new(Expr::Read(dst.clone())),
+        Box::new(konst(!m & mask(64))),
+    );
+    let newbits = Expr::Binary(BinOp::And, Box::new(value), Box::new(konst(m)));
+    Expr::Binary(BinOp::Or, Box::new(keep), Box::new(newbits))
+}
+
+/// Assign `value` to a register operand, handling the high-byte registers
+/// (`ah`/`bh`/`ch`/`dh` — bits 8..=15 of the full register) as well as the normal
+/// width-masked case. Factored out so both operands of an `xchg` (either of which
+/// may be a high byte, e.g. `xchg al, ah`) share it.
+fn write_reg(r: Register, value: Expr, bits: u32) -> Option<Vec<Stmt>> {
+    let id = reg_id(r)?;
+    let dst = Location::Reg(id);
+    if is_high_byte(r) {
+        // dst = (dst & ~0xff00) | ((value & 0xff) << 8)
+        let keep = bin(BinOp::And, Expr::Read(dst.clone()), konst(!0xff00i128 & mask(64)));
+        let newbits = bin(BinOp::Shl, bin(BinOp::And, value, konst(0xff)), konst(8));
+        return Some(vec![Stmt::Set { dst, expr: bin(BinOp::Or, keep, newbits) }]);
+    }
+    let w = (r.size() * 8) as u32;
+    let expr = combine_write(&dst, w, value, bits);
+    Some(vec![Stmt::Set { dst, expr }])
+}
+
+/// Assign `value` to operand 0 (register or memory).
+fn write_op0(ins: &Instruction, value: Expr, bits: u32) -> Option<Vec<Stmt>> {
+    match ins.op_kind(0) {
+        OpKind::Register => write_reg(ins.op_register(0), value, bits),
+        OpKind::Memory => {
+            // A write through a segment override (`fs:`/`gs:`, TLS) is dropped:
+            // reads of TLS are modelled as a constant (see `op_value`), so a write
+            // has no observable effect in our model. This keeps canary/TLS-using
+            // functions fully lifted instead of degrading to `asm`.
+            if ins.segment_prefix() != Register::None {
+                // Transpile/shared-stack mode: store into the synthetic TEB so
+                // SEH / TLS writes are real. Otherwise drop the write (reads are
+                // modelled as a constant, so it has no observable effect).
+                if crate::emit::shared_stack() {
+                    if let (Some(base), Some((addr, sz))) = (seg_base(ins), mem_addr_raw(ins)) {
+                        let ea = Expr::Binary(BinOp::Add, Box::new(base), Box::new(addr));
+                        // A store to `fs:[0]` sets the SEH ExceptionList head. This is
+                        // either an ESTABLISH (installing a fresh EXCEPTION_REGISTRATION,
+                        // whose prev field was just linked to the old head) or a RESTORE
+                        // (popping the current head back to a saved prev). When the program
+                        // uses _except_handler3, emit — BEFORE the store — a marker carrying
+                        // the new head value; emit renders it as a runtime-guarded setjmp
+                        // (guard: `newframe->prev == current fs:[0]`, true only for an
+                        // establish) so _except_handler3 can longjmp to the __except block.
+                        // Gated on seh_active(), so every other program is byte-identical.
+                        let seh_fs0_store = crate::emit::seh_active()
+                            && ins.segment_prefix() == Register::FS
+                            && ins.memory_base() == Register::None
+                            && ins.memory_index() == Register::None
+                            && ins.memory_displacement64() == 0;
+                        let store = Stmt::Store { addr: ea, value: value.clone(), ty: Ty::int(sz as u8) };
+                        if seh_fs0_store {
+                            return Some(vec![
+                                Stmt::CallStmt(Expr::Call {
+                                    target: CallTarget::Named("__aret_seh_establish".to_string()),
+                                    args: vec![value],
+                                    ret: Ty::int(32),
+                                }),
+                                store,
+                            ]);
+                        }
+                        return Some(vec![store]);
+                    }
+                }
+                return Some(vec![Stmt::Nop]);
+            }
+            if let Some(d) = frame_disp(ins, 0) {
+                let dst = Location::Frame(d);
+                let w = (ins.memory_size().size() * 8) as u32;
+                let expr = combine_write(&dst, w, value, bits);
+                return Some(vec![Stmt::Set { dst, expr }]);
+            }
+            let (addr, sz) = mem_addr(ins)?;
+            Some(vec![Stmt::Store {
+                addr,
+                value,
+                ty: Ty::int(sz as u8),
+            }])
+        }
+        _ => None,
+    }
+}
+
+fn sign_neg(x: &Expr) -> Expr {
+    Expr::Binary(BinOp::Slt, Box::new(x.clone()), Box::new(konst(0)))
+}
+
+/// Bit `w-1` of `x` as a 0/1 value — the sign flag of a `w`-bit result. Width-
+/// aware on purpose: a 64-bit `Slt(r,0)` reads the wrong sign when `r` is a
+/// narrower C value. E.g. a 32-bit `cmp [mem],1` where `[mem]==0` computes the
+/// result as a `uint32_t` (`0u - 1 == 0xFFFFFFFF`), which a 64-bit signed test
+/// sees as *positive* — so `jle`/`jl`/`js` took the wrong edge. Reading bit
+/// `w-1` directly is correct whatever C width the operand happens to have.
+fn sign_bit(x: &Expr, w: u32) -> Expr {
+    bin(BinOp::And, bin(BinOp::Shr, x.clone(), konst((w - 1) as i128)), konst(1))
+}
+
+fn set_flag(k: FlagKind, e: Expr) -> Stmt {
+    Stmt::Set {
+        dst: Location::Flag(k),
+        expr: e,
+    }
+}
+
+fn read_flag(k: FlagKind) -> Expr {
+    Expr::Read(Location::Flag(k))
+}
+
+/// Shadow EFLAGS pseudo-register (integer, like the x87 status word `fsw`): carries the bits
+/// ARET does not model individually (IF, TF, ID, …) *across* a `pushfd`/`popfd` pair, so an
+/// idiom that toggles an untracked bit round-trips faithfully — chiefly the MSVC CRT's CPUID
+/// probe, which flips EFLAGS.ID (bit 21) via pushfd/pop/xor 0x200000/push/popfd and checks
+/// whether it stuck. Initialised to 0 (matches the cpudiff/Unicorn seed's untracked bits).
+fn eflags_shadow() -> Location {
+    Location::Reg(RegId(121))
+}
+
+/// The EFLAGS bits `pushfd` materialises directly, and `popfd` feeds back: the reserved bit 1
+/// (always 1) plus the seven tracked flags {CF=0, PF=2, AF=4, ZF=6, SF=7, DF=10, OF=11}.
+const EFLAGS_OWNED_MASK: i128 = 0xCD7;
+
+/// The 32-bit value `pushfd` stores: the untracked bits carried in the shadow, the reserved
+/// bit 1, and the tracked flags placed at their EFLAGS bit positions.
+fn assemble_eflags() -> Expr {
+    use FlagKind::*;
+    let bit = |k: FlagKind, b: i128| {
+        bin(BinOp::Shl, bin(BinOp::And, read_flag(k), konst(1)), konst(b))
+    };
+    let tracked = bin(
+        BinOp::Or,
+        bin(BinOp::Or, bin(BinOp::Or, bit(Cf, 0), bit(Pf, 2)), bin(BinOp::Or, bit(Af, 4), bit(Zf, 6))),
+        bin(BinOp::Or, bin(BinOp::Or, bit(Sf, 7), bit(Df, 10)), bit(Of, 11)),
+    );
+    let shadow_kept = bin(
+        BinOp::And,
+        Expr::Read(eflags_shadow()),
+        konst(!EFLAGS_OWNED_MASK & 0xffff_ffff),
+    );
+    bin(BinOp::Or, bin(BinOp::Or, shadow_kept, konst(0x2)), tracked)
+}
+
+/// Distribute a popped 32-bit EFLAGS value into the tracked flags and the shadow (which keeps
+/// the whole value; `assemble_eflags` masks the owned bits back out on the next push).
+fn distribute_eflags(v: Expr) -> Vec<Stmt> {
+    use FlagKind::*;
+    let getb = |b: i128| bin(BinOp::And, bin(BinOp::Shr, v.clone(), konst(b)), konst(1));
+    vec![
+        set_flag(Cf, getb(0)),
+        set_flag(Pf, getb(2)),
+        set_flag(Af, getb(4)),
+        set_flag(Zf, getb(6)),
+        set_flag(Sf, getb(7)),
+        set_flag(Df, getb(10)),
+        set_flag(Of, getb(11)),
+        Stmt::Set { dst: eflags_shadow(), expr: v },
+    ]
+}
+
+/// Logical negation of a 0/1 flag expression.
+fn lnot(e: Expr) -> Expr {
+    Expr::Binary(BinOp::Eq, Box::new(e), Box::new(konst(0)))
+}
+
+fn lor(a: Expr, b: Expr) -> Expr {
+    Expr::Binary(BinOp::Or, Box::new(a), Box::new(b))
+}
+
+/// The boolean condition of a `jcc`/`setcc`/`cmovcc`, expressed over the CPU
+/// flags. A later pass folds it back to a relational (`SF!=OF` → `a < b`, etc.).
+pub fn cc_to_cond(cc: ConditionCode) -> Expr {
+    use ConditionCode as C;
+    use FlagKind::*;
+    let ne = |a: Expr, b: Expr| Expr::Binary(BinOp::Ne, Box::new(a), Box::new(b));
+    match cc {
+        C::e => read_flag(Zf),
+        C::ne => lnot(read_flag(Zf)),
+        C::b => read_flag(Cf),
+        C::ae => lnot(read_flag(Cf)),
+        C::be => lor(read_flag(Cf), read_flag(Zf)),
+        C::a => lnot(lor(read_flag(Cf), read_flag(Zf))),
+        C::s => read_flag(Sf),
+        C::ns => lnot(read_flag(Sf)),
+        C::o => read_flag(Of),
+        C::no => lnot(read_flag(Of)),
+        C::p => read_flag(Pf),
+        C::np => lnot(read_flag(Pf)),
+        C::l => ne(read_flag(Sf), read_flag(Of)),
+        C::ge => lnot(ne(read_flag(Sf), read_flag(Of))),
+        C::le => lor(read_flag(Zf), ne(read_flag(Sf), read_flag(Of))),
+        C::g => lnot(lor(read_flag(Zf), ne(read_flag(Sf), read_flag(Of)))),
+        C::None => konst(1),
+    }
+}
+
+fn reads_access(a: OpAccess) -> bool {
+    matches!(
+        a,
+        OpAccess::Read | OpAccess::CondRead | OpAccess::ReadWrite | OpAccess::ReadCondWrite
+    )
+}
+
+fn writes_access(a: OpAccess) -> bool {
+    matches!(
+        a,
+        OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite
+    )
+}
+
+const FLAG_BITS: [(u32, FlagKind); 6] = [
+    (RflagsBits::ZF, FlagKind::Zf),
+    (RflagsBits::SF, FlagKind::Sf),
+    (RflagsBits::OF, FlagKind::Of),
+    (RflagsBits::CF, FlagKind::Cf),
+    (RflagsBits::PF, FlagKind::Pf),
+    (RflagsBits::AF, FlagKind::Af),
+];
+
+/// Sound fallback for an instruction we don't model: capture its real register/
+/// flag effects (via iced) so dataflow stays correct. The inputs are kept alive
+/// by an opaque call; each written location is clobbered to `Undef` so later
+/// reads get a fresh (honestly unknown) version rather than a stale one.
+fn asm_fallback(insn: &Insn) -> Vec<Stmt> {
+    let ins = &insn.raw;
+    let mut factory = InstructionInfoFactory::new();
+    let info = factory.info(ins);
+
+    let mut reads: Vec<Expr> = Vec::new();
+    let mut writes: Vec<Location> = Vec::new();
+    for ur in info.used_registers() {
+        if let Some(id) = reg_id(ur.register()) {
+            let loc = Location::Reg(id);
+            if reads_access(ur.access()) {
+                let r = Expr::Read(loc.clone());
+                if !reads.contains(&r) {
+                    reads.push(r);
+                }
+            }
+            if writes_access(ur.access()) && !writes.contains(&loc) {
+                writes.push(loc);
+            }
+        }
+    }
+    let (rr, rw) = (ins.rflags_read(), ins.rflags_written());
+    for (bit, k) in FLAG_BITS {
+        if rr & bit != 0 {
+            reads.push(Expr::Read(Location::Flag(k)));
+        }
+        if rw & bit != 0 && !writes.contains(&Location::Flag(k)) {
+            writes.push(Location::Flag(k));
+        }
+    }
+
+    let mut out = vec![Stmt::CallStmt(Expr::Call {
+        target: CallTarget::Named(format!("asm:{}", insn.text)),
+        args: reads,
+        ret: Ty::Unknown,
+    })];
+    for w in writes {
+        out.push(Stmt::Set {
+            dst: w,
+            expr: Expr::Undef,
+        });
+    }
+    out
+}
+
+/// Flags for a `w`-bit subtraction `a - b` with result `r` (covers `cmp`, `sub`,
+/// `neg`). Sign/overflow are read from bit `w-1` so they are correct whatever C
+/// width `r` is computed in (see `sign_bit`).
+/// PF — parity of the low byte of the result (1 if an even number of set bits).
+fn pf_flag(r: &Expr) -> Stmt {
+    set_flag(FlagKind::Pf, fcall("__ix_pf", vec![r.clone()]))
+}
+
+/// AF — carry/borrow out of bit 3 of `a (op) b` giving `r`: `(a ^ b ^ r) >> 4 & 1`.
+/// Defined for add/sub/adc/sbb/inc/dec/neg/cmp (undefined after logic ops, so it
+/// is not emitted there). `b` is the original operand and `r` includes any carry-
+/// in, so the low-nibble XOR yields the true auxiliary carry regardless of width.
+fn af_flag(a: &Expr, b: &Expr, r: &Expr) -> Stmt {
+    let x = bin(BinOp::Xor, bin(BinOp::Xor, a.clone(), b.clone()), r.clone());
+    set_flag(FlagKind::Af, bin(BinOp::And, bin(BinOp::Shr, x, konst(4)), konst(1)))
+}
+
+/// Set flag `f` to `val`, but keep its previous value when the shift count `c` is
+/// zero — x86 leaves *all* flags unchanged on a zero-count shift/rotate.
+fn flag_unless_zero(c: &Expr, f: FlagKind, val: Expr) -> Stmt {
+    set_flag(
+        f,
+        Expr::Select {
+            cond: Box::new(bin(BinOp::Eq, c.clone(), konst(0))),
+            then_: Box::new(read_flag(f)),
+            else_: Box::new(val),
+        },
+    )
+}
+
+fn sub_flags(a: &Expr, b: &Expr, r: &Expr, w: u32) -> Vec<Stmt> {
+    sub_flags_cin(a, b, &konst(0), r, w)
+}
+
+/// As `sub_flags`, with an explicit borrow-in `cin` (0/1) for `sbb`. The borrow
+/// is `a_w < b_w + cin` at full precision — folding the borrow into `b` and then
+/// masking would drop it when `b` is at the width maximum. `b` is the *original*
+/// operand (so ZF/CF/OF read its true value/sign, not `(b+cin)`'s).
+fn sub_flags_cin(a: &Expr, b: &Expr, cin: &Expr, r: &Expr, w: u32) -> Vec<Stmt> {
+    let of = Expr::Binary(
+        BinOp::And,
+        Box::new(Expr::Binary(
+            BinOp::Ne,
+            Box::new(sign_bit(a, w)),
+            Box::new(sign_bit(b, w)),
+        )),
+        Box::new(Expr::Binary(
+            BinOp::Ne,
+            Box::new(sign_bit(r, w)),
+            Box::new(sign_bit(a, w)),
+        )),
+    );
+    let am = if w >= 64 { a.clone() } else { bin(BinOp::And, a.clone(), konst(mask(w))) };
+    let bm0 = if w >= 64 { b.clone() } else { bin(BinOp::And, b.clone(), konst(mask(w))) };
+    let bm = bin(BinOp::Add, bm0, cin.clone()); // b_w + borrow-in
+    let rw = if w >= 64 { r.clone() } else { bin(BinOp::And, r.clone(), konst(mask(w))) };
+    return vec![
+        set_flag(FlagKind::Zf, Expr::Binary(BinOp::Eq, Box::new(rw), Box::new(konst(0)))),
+        set_flag(FlagKind::Sf, sign_bit(r, w)),
+        set_flag(FlagKind::Cf, Expr::Binary(BinOp::Ult, Box::new(am), Box::new(bm))),
+        set_flag(FlagKind::Of, of),
+        pf_flag(r),
+        af_flag(a, b, r),
+    ];
+}
+
+/// Flags for an addition `a + b` of width `w` bits, with result `r` (the raw,
+/// un-truncated sum). The operands are masked to `w` bits, so the carry-out is
+/// bit `w` of the sum — *not* `r < a`, which is always false when a `w<64` sum is
+/// computed in 64-bit and never wraps. Sign/zero/overflow use the `w`-bit result.
+fn add_flags(a: &Expr, b: &Expr, r: &Expr, w: u32) -> Vec<Stmt> {
+    add_flags_cin(a, b, &konst(0), r, w)
+}
+
+/// As `add_flags`, with an explicit carry-in `cin` (0/1) for `adc`. The carry-out
+/// must be computed from the *w-bit* operands **plus** the carry-in, all at full
+/// precision — folding the carry-in into `b` and then masking (`(b+cin) & mask`)
+/// drops it when `b` is at the width maximum (e.g. `adc r, -1` with CF=1), which
+/// also corrupts 64-bit arithmetic built from 32-bit `add`/`adc` pairs. `b` here
+/// is the *original* operand (so OF reads its true sign, not `(b+cin)`'s).
+fn add_flags_cin(a: &Expr, b: &Expr, cin: &Expr, r: &Expr, w: u32) -> Vec<Stmt> {
+    let m = if w >= 64 {
+        r.clone()
+    } else {
+        bin(BinOp::And, r.clone(), konst(mask(w)))
+    };
+    let signw = |x: &Expr| bin(BinOp::And, bin(BinOp::Shr, x.clone(), konst((w - 1) as i128)), konst(1));
+    let cf = if w >= 64 {
+        // 64-bit: r = a + b + cin wraps below a, or equals a exactly with a carry.
+        bin(BinOp::Or, bin(BinOp::Ult, r.clone(), a.clone()),
+            bin(BinOp::And, bin(BinOp::Eq, r.clone(), a.clone()), cin.clone()))
+    } else {
+        // Carry-out = bit `w` of (a_w + b_w + cin). Mask operands to `w` first (a
+        // sign-extended immediate would otherwise pollute the high bits).
+        let am = bin(BinOp::And, a.clone(), konst(mask(w)));
+        let bm = bin(BinOp::And, b.clone(), konst(mask(w)));
+        let sum = bin(BinOp::Add, bin(BinOp::Add, am, bm), cin.clone());
+        bin(BinOp::And, bin(BinOp::Shr, sum, konst(w as i128)), konst(1))
+    };
+    let of = bin(
+        BinOp::And,
+        bin(BinOp::Eq, signw(a), signw(b)),
+        bin(BinOp::Ne, signw(&m), signw(a)),
+    );
+    vec![
+        set_flag(FlagKind::Zf, bin(BinOp::Eq, m.clone(), konst(0))),
+        set_flag(FlagKind::Sf, signw(&m)),
+        set_flag(FlagKind::Cf, cf),
+        set_flag(FlagKind::Of, of),
+        pf_flag(r),
+        af_flag(a, b, r),
+    ]
+}
+
+/// Flags for a `w`-bit logical result `r` (covers `test`, `and`, `or`, `xor`):
+/// CF=OF=0; SF is bit `w-1` (width-aware, see `sign_bit`).
+fn logic_flags(r: &Expr, w: u32) -> Vec<Stmt> {
+    vec![
+        set_flag(FlagKind::Zf, Expr::Binary(BinOp::Eq, Box::new(r.clone()), Box::new(konst(0)))),
+        set_flag(FlagKind::Sf, sign_bit(r, w)),
+        set_flag(FlagKind::Cf, konst(0)),
+        set_flag(FlagKind::Of, konst(0)),
+        pf_flag(r),
+        // AF is architecturally undefined after a logic op — not emitted.
+    ]
+}
+
+fn bin(op: BinOp, a: Expr, b: Expr) -> Expr {
+    Expr::Binary(op, Box::new(a), Box::new(b))
+}
+
+/// The `rep` count register (`ecx`/`rcx`), masked to the address width. The
+/// 64-bit IR keeps a 32-bit `ecx` as a value whose high bits are *unmasked leftover*
+/// (only truncated when stored back to a register/memory); a `rep` uses the whole
+/// `rcx` as its iteration count, so an `add ecx,k` that carried into bit 32 would
+/// otherwise become a multi-billion-element fill (a real `sqlite3.exe` crash: a
+/// `rep stosb` count `0xffffffa0 + 0xa8` read as `0x100000048`). Mask it here.
+fn rep_count(bits: u32) -> Expr {
+    let rcx = Expr::Read(Location::Reg(RegId(1)));
+    if bits == 32 {
+        bin(BinOp::And, rcx, Expr::Const(0xffff_ffff, Ty::int(64)))
+    } else {
+        rcx
+    }
+}
+
+/// Lift one instruction's compute semantics into IR statements. `bits` is the
+/// target pointer width (32 or 64). Returns `[Asm]` for anything not modelled.
+pub fn lift(insn: &Insn, bits: u32) -> Vec<Stmt> {
+    let ins = &insn.raw;
+    let asm = || asm_fallback(insn);
+
+    // SSE/AVX vector instructions are not modelled in general. `reg_id` maps
+    // XMM/YMM/ZMM to a register id, so without this guard a packed op (e.g.
+    // `paddd`, `movdqu`) would be lifted as a *scalar* 64-bit operation —
+    // silently wrong. The scalar floating-point subset handled below (operating
+    // on bit patterns via runtime helpers) is exempt; everything else degrades to
+    // an honest `asm` fallback that flags the decompilation incomplete.
+    if uses_vector_reg(ins) && !is_scalar_float(ins) {
+        return asm();
+    }
+
+    // `rep movs`/`rep stos`: block copy / fill of `rcx` elements, leaving the
+    // pointer(s) advanced and rcx = 0. Direction from DF (`__rep_movs`/`__rep_stos`
+    // take a `back` flag: 0 forward, 1 backward = the `std; rep movs` overlap-copy
+    // and reverse-fill idioms). The register advance is the *signed* total
+    // `bytes * (1 - 2*DF)`. Handled here because the string `movsd` shares its
+    // mnemonic with the SSE scalar move — the rep prefix disambiguates.
+    if ins.has_rep_prefix() {
+        use Mnemonic::*;
+        // signed total displacement `bytes*(1-2*DF)` = bytes - 2*DF*bytes.
+        let df = || Expr::Read(Location::Flag(FlagKind::Df));
+        let signed = |bytes: &Expr| {
+            bin(BinOp::Sub, bytes.clone(),
+                bin(BinOp::Mul, bin(BinOp::Mul, konst(2), df()), bytes.clone()))
+        };
+        let (sz, mhelper): (i128, &str) = match ins.mnemonic() {
+            Movsb => (1, "__rep_movs8"),
+            Movsw => (2, "__rep_movs16"),
+            Movsd => (4, "__rep_movs32"),
+            Movsq => (8, "__rep_movs64"),
+            _ => (0, ""),
+        };
+        if sz != 0 {
+            let rdi = Location::Reg(RegId(7));
+            let rsi = Location::Reg(RegId(6));
+            let rcx = Location::Reg(RegId(1));
+            let bytes = bin(BinOp::Mul, rep_count(bits), konst(sz));
+            return vec![
+                Stmt::CallStmt(fcall(
+                    mhelper,
+                    vec![Expr::Read(rdi.clone()), Expr::Read(rsi.clone()), rep_count(bits), df()],
+                )),
+                Stmt::Set { dst: rdi.clone(), expr: bin(BinOp::Add, Expr::Read(rdi), signed(&bytes)) },
+                Stmt::Set { dst: rsi.clone(), expr: bin(BinOp::Add, Expr::Read(rsi), signed(&bytes)) },
+                Stmt::Set { dst: rcx, expr: konst(0) },
+            ];
+        }
+        let (ssz, helper): (i128, &str) = match ins.mnemonic() {
+            Stosb => (1, "__rep_stos8"),
+            Stosw => (2, "__rep_stos16"),
+            Stosd => (4, "__rep_stos32"),
+            Stosq => (8, "__rep_stos64"),
+            _ => (0, ""),
+        };
+        if ssz != 0 {
+            let rdi = Location::Reg(RegId(7));
+            let rax = Location::Reg(RegId(0));
+            let rcx = Location::Reg(RegId(1));
+            let bytes = bin(BinOp::Mul, rep_count(bits), konst(ssz));
+            return vec![
+                Stmt::CallStmt(fcall(
+                    helper,
+                    vec![Expr::Read(rdi.clone()), Expr::Read(rax), rep_count(bits), df()],
+                )),
+                Stmt::Set { dst: rdi.clone(), expr: bin(BinOp::Add, Expr::Read(rdi), signed(&bytes)) },
+                Stmt::Set { dst: rcx, expr: konst(0) },
+            ];
+        }
+    }
+
+    // `rep(ne) scas`: scan [edi] for the accumulator value, decrementing ecx and
+    // advancing edi, until ecx==0 or the compare condition ends the repeat
+    // (`repe`/F3 continues while equal, `repne`/F2 while not-equal). This is the
+    // ubiquitous MSVC inline-`strlen` idiom `xor eax,eax; or ecx,-1; repne scasb;
+    // not ecx` — without it ecx keeps its -1, `not ecx` yields 0, and a `strlen`
+    // reads as 0 (a real `sqlite3.exe` `malloc(0)` → "out of memory"). Forward
+    // (DF=0) assumed, as for `rep movs`. Handled for repne too (F2), which iced
+    // does not report via `has_rep_prefix()`.
+    {
+        use Mnemonic::*;
+        let (scsz, schelper): (i128, &str) = match ins.mnemonic() {
+            Scasb => (1, "__rep_scas8"),
+            Scasw => (2, "__rep_scas16"),
+            Scasd => (4, "__rep_scas32"),
+            _ => (0, ""),
+        };
+        if scsz != 0 && (ins.has_rep_prefix() || ins.has_repne_prefix()) {
+            let w = (scsz * 8) as u32;
+            let ty = Ty::int(w as u8);
+            let rdi = Location::Reg(RegId(7));
+            let rax = Location::Reg(RegId(0));
+            let rcx = Location::Reg(RegId(1));
+            // repe (F3) stops on the first mismatch; repne (F2) on the first match.
+            let repe: i128 = if ins.has_repne_prefix() { 0 } else { 1 };
+            let al = bin(BinOp::And, Expr::Read(rax), konst(mask(w)));
+            // Signed per-element step (DF): +size forward, -size backward.
+            let df = || Expr::Read(Location::Flag(FlagKind::Df));
+            let step = || bin(BinOp::Sub, konst(scsz), bin(BinOp::Mul, konst(2 * scsz), df()));
+            // Elements scanned (a pure read); stash in a per-instruction temp so
+            // the edi/ecx updates and the flag compare all see the same count.
+            let kt = Location::Temp((insn.address as u32).wrapping_mul(2).wrapping_add(1));
+            let k = fcall(
+                schelper,
+                vec![Expr::Read(rdi.clone()), al.clone(), rep_count(bits), konst(repe), df()],
+            );
+            let mut out = vec![Stmt::Set { dst: kt.clone(), expr: k }];
+            out.push(Stmt::Set {
+                dst: rdi.clone(),
+                expr: bin(BinOp::Add, Expr::Read(rdi.clone()), bin(BinOp::Mul, Expr::Read(kt.clone()), step())),
+            });
+            out.push(Stmt::Set {
+                dst: rcx,
+                expr: bin(BinOp::Sub, rep_count(bits), Expr::Read(kt)),
+            });
+            // Flags come from the last compared element, now at [edi - step].
+            let last = Expr::Load {
+                addr: Box::new(bin(BinOp::Sub, Expr::Read(rdi), step())),
+                ty,
+            };
+            let r = bin(BinOp::Sub, al.clone(), last.clone());
+            out.extend(sub_flags(&al, &last, &r, w));
+            return out;
+        }
+    }
+
+    // `rep(ne) cmps`: compare [esi] vs [edi], advancing both and decrementing ecx,
+    // until ecx==0 or the compare condition ends the repeat (`repe`/F3 continues
+    // while equal — the ubiquitous `memcmp`/`strcmp` idiom `repe cmpsb; je …`;
+    // `repne`/F2 while not-equal). Without it a `memcmp` reads as an opaque asm
+    // no-op and every comparison is "equal" (wrong). Forward (DF=0) assumed, as for
+    // `rep movs`/`scas`. Handled for repne too (F2), which iced does not report via
+    // `has_rep_prefix()`. (ecx==0 leaves flags per the last-element read like
+    // `scas`; the memcmp idiom guards n==0 upstream.)
+    {
+        use Mnemonic::*;
+        let (csz, chelper): (i128, &str) = match ins.mnemonic() {
+            Cmpsb => (1, "__rep_cmps8"),
+            Cmpsw => (2, "__rep_cmps16"),
+            Cmpsd => (4, "__rep_cmps32"),
+            _ => (0, ""),
+        };
+        if csz != 0 && (ins.has_rep_prefix() || ins.has_repne_prefix()) {
+            let w = (csz * 8) as u32;
+            let ty = Ty::int(w as u8);
+            let rsi = Location::Reg(RegId(6));
+            let rdi = Location::Reg(RegId(7));
+            let rcx = Location::Reg(RegId(1));
+            // repe (F3) stops on the first mismatch; repne (F2) on the first match.
+            let repe: i128 = if ins.has_repne_prefix() { 0 } else { 1 };
+            // Signed per-element step (DF): +size forward, -size backward.
+            let df = || Expr::Read(Location::Flag(FlagKind::Df));
+            let step = || bin(BinOp::Sub, konst(csz), bin(BinOp::Mul, konst(2 * csz), df()));
+            // Elements compared (a pure read); stash in a per-instruction temp so
+            // the esi/edi/ecx updates and the flag compare all see the same count.
+            let kt = Location::Temp((insn.address as u32).wrapping_mul(2).wrapping_add(1));
+            let k = fcall(
+                chelper,
+                vec![Expr::Read(rsi.clone()), Expr::Read(rdi.clone()), rep_count(bits), konst(repe), df()],
+            );
+            let mut out = vec![Stmt::Set { dst: kt.clone(), expr: k }];
+            out.push(Stmt::Set {
+                dst: rsi.clone(),
+                expr: bin(BinOp::Add, Expr::Read(rsi.clone()), bin(BinOp::Mul, Expr::Read(kt.clone()), step())),
+            });
+            out.push(Stmt::Set {
+                dst: rdi.clone(),
+                expr: bin(BinOp::Add, Expr::Read(rdi.clone()), bin(BinOp::Mul, Expr::Read(kt.clone()), step())),
+            });
+            out.push(Stmt::Set {
+                dst: rcx,
+                expr: bin(BinOp::Sub, rep_count(bits), Expr::Read(kt)),
+            });
+            // Flags come from the last compared pair, at [esi-step] and [edi-step].
+            let la = Expr::Load { addr: Box::new(bin(BinOp::Sub, Expr::Read(rsi), step())), ty: ty.clone() };
+            let lb = Expr::Load { addr: Box::new(bin(BinOp::Sub, Expr::Read(rdi), step())), ty };
+            let r = bin(BinOp::Sub, la.clone(), lb.clone());
+            out.extend(sub_flags(&la, &lb, &r, w));
+            return out;
+        }
+    }
+
+    // Single (non-rep) string instructions: operate on one element at [esi]/[edi]
+    // and advance the pointer(s). Forward (DF=0) is assumed — the ABI-default the
+    // compiler maintains (same assumption as `rep movs` above; a `std`/DF=1 region
+    // is left to a sound asm fallback, see `cld`/`std`). Handled here because the
+    // string `movsd`/`cmpsd` share a mnemonic with the SSE scalar ops; the
+    // `is_string_instruction` flag disambiguates. `rep cmps/lods` (rarer) are
+    // not modelled and fall through to a sound asm fallback.
+    if ins.is_string_instruction() && !ins.has_rep_prefix() {
+        use Mnemonic::*;
+        let size: i128 = match ins.mnemonic() {
+            Movsb | Stosb | Lodsb | Scasb | Cmpsb => 1,
+            Movsw | Stosw | Lodsw | Scasw | Cmpsw => 2,
+            Movsd | Stosd | Lodsd | Scasd | Cmpsd => 4,
+            Movsq | Stosq | Lodsq | Scasq | Cmpsq => 8,
+            _ => 0,
+        };
+        if size != 0 {
+            let w = (size * 8) as u32;
+            let ty = Ty::int(w as u8);
+            let rsi = Location::Reg(RegId(6));
+            let rdi = Location::Reg(RegId(7));
+            let rax = Location::Reg(RegId(0));
+            let ld = |loc: &Location| Expr::Load { addr: Box::new(Expr::Read(loc.clone())), ty: ty.clone() };
+            let amask = |e: Expr| if w >= 64 { e } else { bin(BinOp::And, e, konst(mask(w))) };
+            // Direction flag: forward (DF=0) advances by +size, backward (DF=1) by
+            // -size. step = size - 2*size*DF. DF reads 0 at entry (all SSA values
+            // init 0 = the ABI's DF=0), so a plain forward string op is unchanged.
+            let step = || {
+                let df = Expr::Read(Location::Flag(FlagKind::Df));
+                bin(BinOp::Sub, konst(size), bin(BinOp::Mul, konst(2 * size), df))
+            };
+            let adv = |loc: &Location| Stmt::Set {
+                dst: loc.clone(),
+                expr: bin(BinOp::Add, Expr::Read(loc.clone()), step()),
+            };
+            let mut out = Vec::new();
+            match ins.mnemonic() {
+                Movsb | Movsw | Movsd | Movsq => {
+                    out.push(Stmt::Store { addr: Expr::Read(rdi.clone()), value: ld(&rsi), ty: ty.clone() });
+                    out.push(adv(&rsi));
+                    out.push(adv(&rdi));
+                }
+                Stosb | Stosw | Stosd | Stosq => {
+                    out.push(Stmt::Store { addr: Expr::Read(rdi.clone()), value: amask(Expr::Read(rax)), ty: ty.clone() });
+                    out.push(adv(&rdi));
+                }
+                Lodsb | Lodsw | Lodsd | Lodsq => {
+                    out.push(Stmt::Set { dst: rax.clone(), expr: combine_write(&rax, w, ld(&rsi), bits) });
+                    out.push(adv(&rsi));
+                }
+                Scasb | Scasw | Scasd | Scasq => {
+                    let (a, b) = (amask(Expr::Read(rax)), ld(&rdi));
+                    let r = bin(BinOp::Sub, a.clone(), b.clone());
+                    out.extend(sub_flags(&a, &b, &r, w));
+                    out.push(adv(&rdi));
+                }
+                Cmpsb | Cmpsw | Cmpsd | Cmpsq => {
+                    let (a, b) = (ld(&rsi), ld(&rdi));
+                    let r = bin(BinOp::Sub, a.clone(), b.clone());
+                    out.extend(sub_flags(&a, &b, &r, w));
+                    out.push(adv(&rsi));
+                    out.push(adv(&rdi));
+                }
+                _ => return asm(),
+            }
+            return out;
+        }
+    }
+
+    // Helper to require Some or bail to Asm.
+    macro_rules! some_or_asm {
+        ($e:expr) => {
+            match $e {
+                Some(v) => v,
+                None => return asm(),
+            }
+        };
+    }
+
+    match ins.mnemonic() {
+        Mnemonic::Nop | Mnemonic::Endbr32 | Mnemonic::Endbr64
+        // Cache-prefetch hints and the spin-loop PAUSE have NO architectural effect
+        // (no register/memory/flag change) — a pure performance hint the CPU may ignore.
+        // The shared-stack model runs one fiber at a time, so PAUSE is likewise a no-op.
+        // Sound to drop (Unicorn treats them the same). Measured on ninja (`prefetcht0`).
+        | Mnemonic::Prefetcht0 | Mnemonic::Prefetcht1 | Mnemonic::Prefetcht2
+        | Mnemonic::Prefetchnta | Mnemonic::Prefetchw | Mnemonic::Pause => vec![Stmt::Nop],
+        // Preserve memory ordering rather than treating fences as performance hints.
+        // A sequentially consistent host fence is stronger than LFENCE/SFENCE and
+        // covers MFENCE. The browser currently runs translated code in one worker.
+        Mnemonic::Lfence | Mnemonic::Sfence | Mnemonic::Mfence =>
+            vec![Stmt::CallStmt(fcall("__aret_memory_fence", vec![]))],
+        // Direction flag: `cld` clears DF (forward), `std` sets it (backward). The
+        // string-op lifting reads DF to pick the element-advance sign, so both are
+        // real writes now (not no-ops). DF reads 0 at entry (SSA init) = the ABI's
+        // DF=0, so code that omits `cld` still runs forward.
+        Mnemonic::Cld => vec![set_flag(FlagKind::Df, konst(0))],
+        Mnemonic::Std => vec![set_flag(FlagKind::Df, konst(1))],
+
+        Mnemonic::Mov => {
+            let v = some_or_asm!(op_value(ins, 1));
+            some_or_asm!(write_op0(ins, v, bits))
+        }
+        Mnemonic::Movzx => {
+            // Source already masked to its width → zero-extended when stored wide.
+            let v = some_or_asm!(op_value(ins, 1));
+            some_or_asm!(write_op0(ins, v, bits))
+        }
+        Mnemonic::Xlatb => {
+            // XLAT reads the byte at (B/EB/RBX + unsigned AL), wrapping at
+            // the address size, and changes only AL. It does not set flags.
+            if ins.segment_prefix() != Register::None {
+                return asm();
+            }
+            // Iced also reports the implicit AL index as memory_index(), so
+            // reading mem_addr() here would add AL twice.
+            let base = some_or_asm!(read_reg(ins.memory_base()));
+            let index = some_or_asm!(read_reg(Register::AL));
+            let address_bits = (ins.memory_base().size() * 8) as u32;
+            let address = bin(BinOp::And, bin(BinOp::Add, base, index), konst(mask(address_bits)));
+            let value = Expr::Load { addr: Box::new(address), ty: Ty::int(8) };
+            some_or_asm!(write_reg(Register::AL, value, bits))
+        }
+        Mnemonic::Movsx | Mnemonic::Movsxd => {
+            let v = some_or_asm!(op_value(ins, 1));
+            let sv = Expr::Unary(UnOp::SignExtend, Box::new(v));
+            some_or_asm!(write_op0(ins, sv, bits))
+        }
+        Mnemonic::Lea => {
+            let addr = if let Some(d) = frame_disp(ins, 1) {
+                Expr::Addr(Location::Frame(d))
+            } else {
+                // `lea` computes the effective address only — it never adds the
+                // segment base — so a segment override (e.g. the `cs:` multi-byte
+                // NOP `lea esi,cs:[esi]`) is irrelevant; use the raw address.
+                some_or_asm!(mem_addr_raw(ins)).0
+            };
+            some_or_asm!(write_op0(ins, addr, bits))
+        }
+
+        Mnemonic::Add | Mnemonic::Sub | Mnemonic::And | Mnemonic::Or | Mnemonic::Xor => {
+            let a = some_or_asm!(op_value(ins, 0));
+            let b = some_or_asm!(op_value(ins, 1));
+            let (op, flags) = match ins.mnemonic() {
+                Mnemonic::Add => (BinOp::Add, None),
+                Mnemonic::Sub => (BinOp::Sub, Some(true)),
+                Mnemonic::And => (BinOp::And, Some(false)),
+                Mnemonic::Or => (BinOp::Or, Some(false)),
+                Mnemonic::Xor => (BinOp::Xor, Some(false)),
+                _ => unreachable!(),
+            };
+            let r = bin(op, a.clone(), b.clone());
+            let w = op0_width(ins, bits);
+            let mut out = match flags {
+                Some(true) => sub_flags(&a, &b, &r, w),  // sub
+                Some(false) => logic_flags(&r, w),       // and/or/xor
+                None => add_flags(&a, &b, &r, w),
+            };
+            out.extend(some_or_asm!(write_op0(ins, r, bits)));
+            out
+        }
+
+        // Subtract/add with borrow/carry: fold the carry flag into the second
+        // operand. `sbb dst,src` = dst - (src + CF); `adc dst,src` = dst + src + CF.
+        // The `sbb r,r` idiom (`(a<b) ? -1 : 0`) lifts to `r - (r + CF)` = -CF.
+        Mnemonic::Sbb => {
+            let a = some_or_asm!(op_value(ins, 0));
+            let b = some_or_asm!(op_value(ins, 1));
+            // Capture the *input* carry in a temp first: the destination and the
+            // CF-output both read `Cf`, and since the CF-set is emitted before the
+            // dst write, SSA would otherwise resolve the dst's carry-in to this
+            // instruction's own carry-out.
+            let cf = Location::Temp((insn.address as u32).wrapping_mul(2));
+            let cin = Expr::Read(cf.clone());
+            let bc = bin(BinOp::Add, b.clone(), cin.clone());
+            let r = bin(BinOp::Sub, a.clone(), bc);
+            let mut out = vec![Stmt::Set { dst: cf, expr: read_flag(FlagKind::Cf) }];
+            // Borrow-in handled at full precision (original `b`, separate `cin`).
+            out.extend(sub_flags_cin(&a, &b, &cin, &r, op0_width(ins, bits)));
+            out.extend(some_or_asm!(write_op0(ins, r, bits)));
+            out
+        }
+        Mnemonic::Adc => {
+            let a = some_or_asm!(op_value(ins, 0));
+            let b = some_or_asm!(op_value(ins, 1));
+            let cf = Location::Temp((insn.address as u32).wrapping_mul(2));
+            let cin = Expr::Read(cf.clone());
+            let bc = bin(BinOp::Add, b.clone(), cin.clone());
+            let r = bin(BinOp::Add, a.clone(), bc);
+            let mut out = vec![Stmt::Set { dst: cf, expr: read_flag(FlagKind::Cf) }];
+            // Carry-in handled at full precision (original `b`, separate `cin`).
+            out.extend(add_flags_cin(&a, &b, &cin, &r, op0_width(ins, bits)));
+            out.extend(some_or_asm!(write_op0(ins, r, bits)));
+            out
+        }
+
+        // --- scalar SSE floating point (via __fp_* bit-pattern helpers) -------
+        // Moves copy bit patterns; the helpers reinterpret only the relevant low
+        // bits, so an unmasked move is fine.
+        Mnemonic::Movss | Mnemonic::Movsd | Mnemonic::Movd | Mnemonic::Movq => {
+            let v = some_or_asm!(op_value(ins, 1));
+            some_or_asm!(write_op0(ins, v, bits))
+        }
+        // 128-bit moves: copy both 64-bit halves (register or 16-byte memory).
+        Mnemonic::Movaps | Mnemonic::Movapd | Mnemonic::Movups | Mnemonic::Movupd
+        | Mnemonic::Movdqa | Mnemonic::Movdqu => {
+            let (lo, hi) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_xmm128(ins, lo, hi))
+        }
+        // 128-bit lane-wise integer add/sub (no carry across 32-bit lanes).
+        Mnemonic::Paddd | Mnemonic::Psubd => {
+            let (alo, ahi) = some_or_asm!(read_xmm128(ins, 0));
+            let (blo, bhi) = some_or_asm!(read_xmm128(ins, 1));
+            let h = if ins.mnemonic() == Mnemonic::Paddd { "__pi_add32" } else { "__pi_sub32" };
+            let lo = fcall(h, vec![alo, blo]);
+            let hi = fcall(h, vec![ahi, bhi]);
+            some_or_asm!(write_xmm128(ins, lo, hi))
+        }
+        // Byte shift of the whole 128-bit value (right = psrldq, left = pslldq) by
+        // an immediate byte count. Modelled for any count 0..15 on a register operand.
+        Mnemonic::Psrldq | Mnemonic::Pslldq => {
+            let n = some_or_asm!(xmm_num(ins.op_register(0)));
+            let s = (ins.immediate(1) & 0xff).min(16) as i128 * 8; // bit shift (>=128 → 0)
+            let (lo0, hi0) = (Expr::Read(xmm_lo(n)), Expr::Read(xmm_hi(n)));
+            let m64 = konst(mask(64));
+            let right = ins.mnemonic() == Mnemonic::Psrldq;
+            let (lo, hi) = if s == 0 {
+                (lo0, hi0)
+            } else if s >= 128 {
+                (konst(0), konst(0))
+            } else if right && s < 64 {
+                // lo' = (lo>>s)|(hi<<(64-s)); hi' = hi>>s
+                (
+                    bin(BinOp::Or,
+                        bin(BinOp::Shr, lo0, konst(s)),
+                        bin(BinOp::And, bin(BinOp::Shl, hi0.clone(), konst(64 - s)), m64)),
+                    bin(BinOp::Shr, hi0, konst(s)),
+                )
+            } else if right {
+                // 64<=s<128: lo' = hi>>(s-64); hi' = 0
+                (bin(BinOp::Shr, hi0, konst(s - 64)), konst(0))
+            } else if s < 64 {
+                // pslldq, s<64: hi' = (hi<<s)|(lo>>(64-s)); lo' = lo<<s  (masked to 64)
+                (
+                    bin(BinOp::And, bin(BinOp::Shl, lo0.clone(), konst(s)), m64.clone()),
+                    bin(BinOp::Or,
+                        bin(BinOp::And, bin(BinOp::Shl, hi0, konst(s)), m64.clone()),
+                        bin(BinOp::Shr, lo0, konst(64 - s))),
+                )
+            } else {
+                // pslldq, 64<=s<128: hi' = lo<<(s-64); lo' = 0
+                (konst(0), bin(BinOp::And, bin(BinOp::Shl, lo0, konst(s - 64)), m64))
+            };
+            some_or_asm!(write_xmm128(ins, lo, hi))
+        }
+        // 128-bit bitwise (exact on both halves). `pandn dst,src` = ~dst & src.
+        Mnemonic::Pand | Mnemonic::Por | Mnemonic::Pandn => {
+            let (alo, ahi) = some_or_asm!(read_xmm128(ins, 0));
+            let (blo, bhi) = some_or_asm!(read_xmm128(ins, 1));
+            let (lo, hi) = match ins.mnemonic() {
+                Mnemonic::Pand => (bin(BinOp::And, alo, blo), bin(BinOp::And, ahi, bhi)),
+                Mnemonic::Por => (bin(BinOp::Or, alo, blo), bin(BinOp::Or, ahi, bhi)),
+                _ => (
+                    bin(BinOp::And, Expr::Unary(UnOp::Not, Box::new(alo)), blo),
+                    bin(BinOp::And, Expr::Unary(UnOp::Not, Box::new(ahi)), bhi),
+                ),
+            };
+            some_or_asm!(write_xmm128(ins, lo, hi))
+        }
+        // Lane-wise 32-bit compares producing all-ones / zero masks.
+        Mnemonic::Pcmpeqd | Mnemonic::Pcmpgtd => {
+            let (alo, ahi) = some_or_asm!(read_xmm128(ins, 0));
+            let (blo, bhi) = some_or_asm!(read_xmm128(ins, 1));
+            let h = if ins.mnemonic() == Mnemonic::Pcmpeqd { "__pi_eq32" } else { "__pi_gt32" };
+            some_or_asm!(write_xmm128(ins, fcall(h, vec![alo, blo]), fcall(h, vec![ahi, bhi])))
+        }
+        // Packed compare, byte/word lanes (SSE2 string scanners).
+        Mnemonic::Pcmpeqb | Mnemonic::Pcmpgtb | Mnemonic::Pcmpeqw => {
+            let (alo, ahi) = some_or_asm!(read_xmm128(ins, 0));
+            let (blo, bhi) = some_or_asm!(read_xmm128(ins, 1));
+            let h = match ins.mnemonic() {
+                Mnemonic::Pcmpeqb => "__pi_eq8",
+                Mnemonic::Pcmpgtb => "__pi_gt8",
+                _ => "__pi_eq16",
+            };
+            some_or_asm!(write_xmm128(ins, fcall(h, vec![alo, blo]), fcall(h, vec![ahi, bhi])))
+        }
+        // pmovmskb: high bit of each of the 16 bytes -> a 16-bit mask in a GP reg.
+        Mnemonic::Pmovmskb => {
+            let (lo, hi) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_op0(ins, fcall("__pi_mskb", vec![lo, hi]), bits))
+        }
+        // Lane-wise add: 16-bit (helper) and 64-bit (one per half).
+        Mnemonic::Paddw => {
+            let (alo, ahi) = some_or_asm!(read_xmm128(ins, 0));
+            let (blo, bhi) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_xmm128(
+                ins,
+                fcall("__pi_add16", vec![alo, blo]),
+                fcall("__pi_add16", vec![ahi, bhi])
+            ))
+        }
+        Mnemonic::Paddq => {
+            let (alo, ahi) = some_or_asm!(read_xmm128(ins, 0));
+            let (blo, bhi) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_xmm128(ins, bin(BinOp::Add, alo, blo), bin(BinOp::Add, ahi, bhi)))
+        }
+        // 16-bit lane signed compare (mask), unsigned 32x32->64 of even lanes,
+        // and 64-bit logical right shift by an immediate.
+        Mnemonic::Pcmpgtw => {
+            let (alo, ahi) = some_or_asm!(read_xmm128(ins, 0));
+            let (blo, bhi) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_xmm128(
+                ins,
+                fcall("__pi_gt16", vec![alo, blo]),
+                fcall("__pi_gt16", vec![ahi, bhi])
+            ))
+        }
+        Mnemonic::Psubusw => {
+            let (alo, ahi) = some_or_asm!(read_xmm128(ins, 0));
+            let (blo, bhi) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_xmm128(
+                ins,
+                fcall("__pi_subus16", vec![alo, blo]),
+                fcall("__pi_subus16", vec![ahi, bhi])
+            ))
+        }
+        Mnemonic::Pmuludq => {
+            let (dlo, dhi) = some_or_asm!(read_xmm128(ins, 0));
+            let (slo, shi) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_xmm128(
+                ins,
+                fcall("__pi_muludq", vec![dlo, slo]),
+                fcall("__pi_muludq", vec![dhi, shi])
+            ))
+        }
+        // Byte/word lane add-sub-mul (per-lane wrap), and quadword sub (64-bit wrap).
+        Mnemonic::Paddb | Mnemonic::Psubb | Mnemonic::Psubw | Mnemonic::Pmullw => {
+            let (alo, ahi) = some_or_asm!(read_xmm128(ins, 0));
+            let (blo, bhi) = some_or_asm!(read_xmm128(ins, 1));
+            let h = match ins.mnemonic() {
+                Mnemonic::Paddb => "__pi_add8",
+                Mnemonic::Psubb => "__pi_sub8",
+                Mnemonic::Psubw => "__pi_sub16",
+                _ => "__pi_mullw",
+            };
+            some_or_asm!(write_xmm128(ins, fcall(h, vec![alo, blo]), fcall(h, vec![ahi, bhi])))
+        }
+        Mnemonic::Psubq => {
+            let (alo, ahi) = some_or_asm!(read_xmm128(ins, 0));
+            let (blo, bhi) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_xmm128(ins, bin(BinOp::Sub, alo, blo), bin(BinOp::Sub, ahi, bhi)))
+        }
+        // Packed lane shifts by a scalar count (immediate or the low 64 bits of an
+        // XMM/mem operand). Same count for every lane; the helper handles count>=width.
+        Mnemonic::Pslld | Mnemonic::Psrld | Mnemonic::Psrad
+        | Mnemonic::Psllw | Mnemonic::Psrlw | Mnemonic::Psraw => {
+            let (lo, hi) = some_or_asm!(read_xmm128(ins, 0));
+            let count = match ins.op_kind(1) {
+                OpKind::Immediate8 => konst(ins.immediate(1) as i128),
+                OpKind::Register => Expr::Read(xmm_lo(some_or_asm!(xmm_num(ins.op_register(1))))),
+                _ => return asm(),
+            };
+            let h = match ins.mnemonic() {
+                Mnemonic::Pslld => "__pi_sll32",
+                Mnemonic::Psrld => "__pi_srl32",
+                Mnemonic::Psrad => "__pi_sra32",
+                Mnemonic::Psllw => "__pi_sll16",
+                Mnemonic::Psrlw => "__pi_srl16",
+                _ => "__pi_sra16",
+            };
+            some_or_asm!(write_xmm128(
+                ins,
+                fcall(h, vec![lo, count.clone()]),
+                fcall(h, vec![hi, count])
+            ))
+        }
+        // Pack with saturation: the low result half comes from operand 0's words/
+        // dwords, the high half from operand 1's.
+        Mnemonic::Packuswb | Mnemonic::Packssdw => {
+            let (dlo, dhi) = some_or_asm!(read_xmm128(ins, 0));
+            let (slo, shi) = some_or_asm!(read_xmm128(ins, 1));
+            let h = if ins.mnemonic() == Mnemonic::Packuswb { "__pi_packuswb" } else { "__pi_packssdw" };
+            some_or_asm!(write_xmm128(
+                ins,
+                fcall(h, vec![dlo, dhi]),
+                fcall(h, vec![slo, shi])
+            ))
+        }
+        // Interleave the low (punpcklbw) / high (punpckhbw) 8 bytes of dst and src.
+        Mnemonic::Punpcklbw | Mnemonic::Punpckhbw => {
+            let (dlo, dhi) = some_or_asm!(read_xmm128(ins, 0));
+            let (slo, shi) = some_or_asm!(read_xmm128(ins, 1));
+            let (d, s) = if ins.mnemonic() == Mnemonic::Punpcklbw { (dlo, slo) } else { (dhi, shi) };
+            some_or_asm!(write_xmm128(
+                ins,
+                fcall("__pi_unpcklbw_lo", vec![d.clone(), s.clone()]),
+                fcall("__pi_unpcklbw_hi", vec![d, s])
+            ))
+        }
+        // Extract one of the 8 16-bit lanes (imm & 7) into a GP register, zero-extended.
+        Mnemonic::Pextrw => {
+            let n = (ins.immediate(2) & 7) as u32;
+            let (lo, hi) = some_or_asm!(read_xmm128(ins, 1));
+            let half = if n < 4 { lo } else { hi };
+            let word = bin(
+                BinOp::And,
+                bin(BinOp::Shr, half, konst(((n & 3) * 16) as i128)),
+                konst(0xffff),
+            );
+            some_or_asm!(write_op0(ins, word, 32))
+        }
+        // Both logical quadword shifts use the low 64 bits of the source as
+        // the count. Counts >= 64 produce zero, rather than C shift UB.
+        Mnemonic::Psrlq | Mnemonic::Psllq => {
+            let (lo, hi) = some_or_asm!(read_xmm128(ins, 0));
+            let count = if ins.op_kind(1) == OpKind::Immediate8 {
+                konst(ins.immediate(1) as i128)
+            } else {
+                some_or_asm!(read_xmm128(ins, 1)).0
+            };
+            let op = if ins.mnemonic() == Mnemonic::Psllq { BinOp::Shl } else { BinOp::Shr };
+            let shift = |value| Expr::Select {
+                cond: Box::new(bin(BinOp::Ult, count.clone(), konst(64))),
+                then_: Box::new(bin(op, value, count.clone())),
+                else_: Box::new(konst(0)),
+            };
+            some_or_asm!(write_xmm128(ins, shift(lo), shift(hi)))
+        }
+        // pinsrw: insert a 16-bit word (from a GP reg's low half or m16) into lane imm&7.
+        Mnemonic::Pinsrw => {
+            let n = (ins.immediate(2) & 7) as u32;
+            let (lo, hi) = some_or_asm!(read_xmm128(ins, 0));
+            let src = some_or_asm!(op_value(ins, 1));
+            let shift = ((n & 3) * 16) as i128;
+            let word = bin(BinOp::Shl, bin(BinOp::And, src, konst(0xffff)), konst(shift));
+            let clear = konst(!(0xffff_i128 << shift));
+            if n < 4 {
+                some_or_asm!(write_xmm128(ins, bin(BinOp::Or, bin(BinOp::And, lo, clear), word), hi))
+            } else {
+                some_or_asm!(write_xmm128(ins, lo, bin(BinOp::Or, bin(BinOp::And, hi, clear), word)))
+            }
+        }
+        // pinsrd (SSE4.1): insert a 32-bit dword (GP reg or m32) into lane imm&3.
+        Mnemonic::Pinsrd => {
+            let n = (ins.immediate(2) & 3) as u32;
+            let (lo, hi) = some_or_asm!(read_xmm128(ins, 0));
+            let src = some_or_asm!(op_value(ins, 1));
+            let shift = ((n & 1) * 32) as i128;
+            let dword = bin(BinOp::Shl, bin(BinOp::And, src, konst(0xffff_ffff)), konst(shift));
+            let clear = konst(!(0xffff_ffff_i128 << shift));
+            if n < 2 {
+                some_or_asm!(write_xmm128(ins, bin(BinOp::Or, bin(BinOp::And, lo, clear), dword), hi))
+            } else {
+                some_or_asm!(write_xmm128(ins, lo, bin(BinOp::Or, bin(BinOp::And, hi, clear), dword)))
+            }
+        }
+        // cvtdq2pd: convert the LOW two int32 of the source to two doubles.
+        // __fp_i32_64 already does (double)(int32_t)low32; the high lane takes bits 32..63.
+        Mnemonic::Cvtdq2pd => {
+            let (slo, _) = some_or_asm!(read_xmm128(ins, 1));
+            let hi = bin(BinOp::Shr, slo.clone(), konst(32));
+            some_or_asm!(write_xmm128(
+                ins,
+                fcall("__fp_i32_64", vec![slo]),
+                fcall("__fp_i32_64", vec![hi])
+            ))
+        }
+        // Unpack/interleave. The *high* variants are the low ones applied to the
+        // high halves; the quadword unpacks are pure half selection.
+        Mnemonic::Punpcklwd | Mnemonic::Punpckhwd => {
+            let (dlo, dhi) = some_or_asm!(read_xmm128(ins, 0));
+            let (slo, shi) = some_or_asm!(read_xmm128(ins, 1));
+            let (d, s) = if ins.mnemonic() == Mnemonic::Punpcklwd { (dlo, slo) } else { (dhi, shi) };
+            some_or_asm!(write_xmm128(
+                ins,
+                fcall("__pi_unpcklwd_lo", vec![d.clone(), s.clone()]),
+                fcall("__pi_unpcklwd_hi", vec![d, s])
+            ))
+        }
+        // unpcklps/unpckhps interleave 32-bit lanes exactly like punpckldq/hdq.
+        Mnemonic::Punpckldq | Mnemonic::Punpckhdq | Mnemonic::Unpcklps | Mnemonic::Unpckhps => {
+            let (dlo, dhi) = some_or_asm!(read_xmm128(ins, 0));
+            let (slo, shi) = some_or_asm!(read_xmm128(ins, 1));
+            let low = matches!(ins.mnemonic(), Mnemonic::Punpckldq | Mnemonic::Unpcklps);
+            let (d, s) = if low { (dlo, slo) } else { (dhi, shi) };
+            some_or_asm!(write_xmm128(
+                ins,
+                fcall("__pi_unpckldq_lo", vec![d.clone(), s.clone()]),
+                fcall("__pi_unpckldq_hi", vec![d, s])
+            ))
+        }
+        Mnemonic::Punpcklqdq => {
+            let (dlo, _) = some_or_asm!(read_xmm128(ins, 0));
+            let (slo, _) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_xmm128(ins, dlo, slo))
+        }
+        Mnemonic::Punpckhqdq => {
+            let (_, dhi) = some_or_asm!(read_xmm128(ins, 0));
+            let (_, shi) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_xmm128(ins, dhi, shi))
+        }
+        // Packed single-precision arithmetic/min/max: two floats per 64-bit half,
+        // bit-exact via the `__ps_*` helpers.
+        Mnemonic::Addps | Mnemonic::Subps | Mnemonic::Mulps | Mnemonic::Divps
+        | Mnemonic::Minps | Mnemonic::Maxps => {
+            let h = match ins.mnemonic() {
+                Mnemonic::Addps => "__ps_add",
+                Mnemonic::Subps => "__ps_sub",
+                Mnemonic::Mulps => "__ps_mul",
+                Mnemonic::Divps => "__ps_div",
+                Mnemonic::Minps => "__ps_min",
+                _ => "__ps_max",
+            };
+            let (alo, ahi) = some_or_asm!(read_xmm128(ins, 0));
+            let (blo, bhi) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_xmm128(ins, fcall(h, vec![alo, blo]), fcall(h, vec![ahi, bhi])))
+        }
+        Mnemonic::Sqrtps => {
+            let (lo, hi) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_xmm128(ins, fcall("__ps_sqrt", vec![lo]), fcall("__ps_sqrt", vec![hi])))
+        }
+        Mnemonic::Cvtdq2ps => {
+            let (lo, hi) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_xmm128(ins, fcall("__ps_cvtdq", vec![lo]), fcall("__ps_cvtdq", vec![hi])))
+        }
+        Mnemonic::Cvtps2pd => {
+            // Two float32 lanes in the low 64 bits become two float64 lanes.
+            let src = some_or_asm!(op_value(ins, 1));
+            let lo = fcall("__fp_32_64", vec![src.clone()]);
+            let hi = fcall("__fp_32_64", vec![bin(BinOp::Shr, src, konst(32))]);
+            some_or_asm!(write_xmm128(ins, lo, hi))
+        }
+        Mnemonic::Cvtpd2ps => {
+            // The converted pair occupies low64; legacy SSE clears high64.
+            let (lo, hi) = some_or_asm!(read_xmm128(ins, 1));
+            let lo = fcall("__fp_64_32", vec![lo]);
+            let hi = fcall("__fp_64_32", vec![hi]);
+            some_or_asm!(write_xmm128(ins, bin(BinOp::Or, lo,
+                bin(BinOp::Shl, hi, konst(32))), konst(0)))
+        }
+        // cmpps with the imm8 predicate (`cmpltps`/`cmpleps`/`cmpeqps`… aliases).
+        Mnemonic::Cmpps => {
+            let (alo, ahi) = some_or_asm!(read_xmm128(ins, 0));
+            let (blo, bhi) = some_or_asm!(read_xmm128(ins, 1));
+            let p = konst(ins.immediate(2) as i128);
+            some_or_asm!(write_xmm128(
+                ins,
+                fcall("__ps_cmp", vec![alo, blo, p.clone()]),
+                fcall("__ps_cmp", vec![ahi, bhi, p])
+            ))
+        }
+        // Legacy packed-double comparison: the low three immediate bits
+        // select an ordered predicate or its unordered-inclusive complement.
+        Mnemonic::Cmppd => {
+            let (alo, ahi) = some_or_asm!(read_xmm128(ins, 0));
+            let (blo, bhi) = some_or_asm!(read_xmm128(ins, 1));
+            let predicate = ins.immediate(2) & 7;
+            let compare = |a: Expr, b: Expr| {
+                let eq = || fcall("__fp_eq64", vec![a.clone(), b.clone()]);
+                let lt = || fcall("__fp_lt64", vec![a.clone(), b.clone()]);
+                let un = || fcall("__fp_un64", vec![a.clone(), b.clone()]);
+                let result = match predicate {
+                    0 => eq(),
+                    1 => lt(),
+                    2 => bin(BinOp::Or, lt(), eq()),
+                    3 => un(),
+                    4 => bin(BinOp::Eq, eq(), konst(0)),
+                    5 => bin(BinOp::Eq, lt(), konst(0)),
+                    6 => bin(BinOp::Eq, bin(BinOp::Or, lt(), eq()), konst(0)),
+                    _ => bin(BinOp::Eq, un(), konst(0)),
+                };
+                bin(BinOp::Sub, konst(0), result)
+            };
+            some_or_asm!(write_xmm128(ins, compare(alo, blo), compare(ahi, bhi)))
+        }
+        // Bitwise packed-float logic: operate on the raw 128-bit halves.
+        // Packed bitwise and/or/andnot — the *ps and *pd forms are bit-identical
+        // (whole-128-bit bitwise op; the float width is irrelevant to the bits).
+        Mnemonic::Andps | Mnemonic::Orps | Mnemonic::Andnps
+        | Mnemonic::Andpd | Mnemonic::Orpd | Mnemonic::Andnpd => {
+            let (alo, ahi) = some_or_asm!(read_xmm128(ins, 0));
+            let (blo, bhi) = some_or_asm!(read_xmm128(ins, 1));
+            let (lo, hi) = match ins.mnemonic() {
+                Mnemonic::Andps | Mnemonic::Andpd => {
+                    (bin(BinOp::And, alo, blo), bin(BinOp::And, ahi, bhi))
+                }
+                Mnemonic::Orps | Mnemonic::Orpd => {
+                    (bin(BinOp::Or, alo, blo), bin(BinOp::Or, ahi, bhi))
+                }
+                _ => (
+                    bin(BinOp::And, Expr::Unary(UnOp::Not, Box::new(alo)), blo),
+                    bin(BinOp::And, Expr::Unary(UnOp::Not, Box::new(ahi)), bhi),
+                ),
+            };
+            some_or_asm!(write_xmm128(ins, lo, hi))
+        }
+        // pshufb (SSSE3): shuffle bytes of the destination by the source control mask —
+        // each result byte i is dst[ctrl[i] & 15] across the FULL 16-byte register, or 0
+        // when ctrl[i] bit 7 is set. Not lane-separable (an index reaches either half),
+        // so the helper takes both dst halves and one control half per output half.
+        Mnemonic::Pshufb => {
+            let (dlo, dhi) = some_or_asm!(read_xmm128(ins, 0));
+            let (clo, chi) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_xmm128(
+                ins,
+                fcall("__pi_pshufb", vec![dlo.clone(), dhi.clone(), clo]),
+                fcall("__pi_pshufb", vec![dlo, dhi, chi])
+            ))
+        }
+        // shufps: low two lanes from dst, high two from src (imm8 lane selectors).
+        // Reuses the dword-shuffle helpers (same 32-bit lane permutation).
+        Mnemonic::Shufps => {
+            let (dlo, dhi) = some_or_asm!(read_xmm128(ins, 0));
+            let (slo, shi) = some_or_asm!(read_xmm128(ins, 1));
+            let imm = konst(ins.immediate(2) as i128);
+            some_or_asm!(write_xmm128(
+                ins,
+                fcall("__pi_shuf_lo", vec![dlo, dhi, imm.clone()]),
+                fcall("__pi_shuf_hi", vec![slo, shi, imm])
+            ))
+        }
+        // Extract the 4 lane sign bits into a GP register.
+        Mnemonic::Movmskps => {
+            let (lo, hi) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_op0(ins, fcall("__ps_movmsk", vec![lo, hi]), bits))
+        }
+
+        // MOVMSKPD packs the two lane sign bits into bits 0 and 1.
+        Mnemonic::Movmskpd => {
+            let (lo, hi) = some_or_asm!(read_xmm128(ins, 1));
+            let mask = bin(BinOp::Or, bin(BinOp::Shr, lo, konst(63)),
+                bin(BinOp::Shl, bin(BinOp::Shr, hi, konst(63)), konst(1)));
+            some_or_asm!(write_op0(ins, mask, bits))
+        }
+        // Legacy BLENDVPD uses implicit XMM0; only each lane's sign bit
+        // selects its source. Other mask bits do not affect the selection.
+        Mnemonic::Blendvpd => {
+            let (alo, ahi) = some_or_asm!(read_xmm128(ins, 0));
+            let (blo, bhi) = some_or_asm!(read_xmm128(ins, 1));
+            let blend = |a, b, mask| Expr::Select {
+                cond: Box::new(bin(BinOp::Shr, mask, konst(63))),
+                then_: Box::new(b), else_: Box::new(a),
+            };
+            some_or_asm!(write_xmm128(ins,
+                blend(alo, blo, Expr::Read(xmm_lo(0))),
+                blend(ahi, bhi, Expr::Read(xmm_hi(0)))))
+        }
+
+        // Packed double arithmetic: each 64-bit half is one IEEE-754 double,
+        // computed bit-exactly via the scalar `__fp_*64` helpers.
+        Mnemonic::Addpd | Mnemonic::Subpd | Mnemonic::Mulpd | Mnemonic::Divpd => {
+            let h = match ins.mnemonic() {
+                Mnemonic::Addpd => "__fp_add64",
+                Mnemonic::Subpd => "__fp_sub64",
+                Mnemonic::Mulpd => "__fp_mul64",
+                _ => "__fp_div64",
+            };
+            let (alo, ahi) = some_or_asm!(read_xmm128(ins, 0));
+            let (blo, bhi) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_xmm128(ins, fcall(h, vec![alo, blo]), fcall(h, vec![ahi, bhi])))
+        }
+        // Double-precision unpack: pure 64-bit half selection.
+        Mnemonic::Unpcklpd => {
+            // dst.low unchanged, dst.high = src.low.
+            let (dlo, _) = some_or_asm!(read_xmm128(ins, 0));
+            let (slo, _) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_xmm128(ins, dlo, slo))
+        }
+        Mnemonic::Unpckhpd => {
+            // dst.low = dst.high, dst.high = src.high.
+            let (_, dhi) = some_or_asm!(read_xmm128(ins, 0));
+            let (_, shi) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_xmm128(ins, dhi, shi))
+        }
+        // 64-bit half moves between XMM registers (no memory operand).
+        Mnemonic::Movhlps => {
+            // dst.low = src.high; dst.high unchanged.
+            let (_, dhi) = some_or_asm!(read_xmm128(ins, 0));
+            let (_, shi) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_xmm128(ins, shi, dhi))
+        }
+        Mnemonic::Movlhps => {
+            // dst.high = src.low; dst.low unchanged.
+            let (dlo, _) = some_or_asm!(read_xmm128(ins, 0));
+            let (slo, _) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_xmm128(ins, dlo, slo))
+        }
+        // Move a 64-bit half to/from memory. `movhps`/`movhpd` use the high half,
+        // `movlps`/`movlpd` the low half; the other half is preserved.
+        Mnemonic::Movhps | Mnemonic::Movhpd | Mnemonic::Movlps | Mnemonic::Movlpd => {
+            let high = matches!(ins.mnemonic(), Mnemonic::Movhps | Mnemonic::Movhpd);
+            if ins.segment_prefix() != Register::None {
+                return asm();
+            }
+            match (ins.op_kind(0), ins.op_kind(1)) {
+                // Load m64 into the selected half of the destination register.
+                (OpKind::Register, OpKind::Memory) => {
+                    let (addr, _) = some_or_asm!(mem_addr(ins));
+                    let m = Expr::Load { addr: Box::new(addr), ty: Ty::int(64) };
+                    let (dlo, dhi) = some_or_asm!(read_xmm128(ins, 0));
+                    if high {
+                        some_or_asm!(write_xmm128(ins, dlo, m))
+                    } else {
+                        some_or_asm!(write_xmm128(ins, m, dhi))
+                    }
+                }
+                // Store the selected half of the source register to m64.
+                (OpKind::Memory, OpKind::Register) => {
+                    let (addr, _) = some_or_asm!(mem_addr(ins));
+                    let (slo, shi) = some_or_asm!(read_xmm128(ins, 1));
+                    let v = if high { shi } else { slo };
+                    vec![Stmt::Store { addr, value: v, ty: Ty::int(64) }]
+                }
+                _ => return asm(),
+            }
+        }
+        // Select one 64-bit lane from each source per the imm8 (bit0 → dst low
+        // from dst, bit1 → dst high from src).
+        Mnemonic::Shufpd => {
+            let (dlo, dhi) = some_or_asm!(read_xmm128(ins, 0));
+            let (slo, shi) = some_or_asm!(read_xmm128(ins, 1));
+            let imm = ins.immediate(2);
+            let lo = if imm & 1 != 0 { dhi } else { dlo };
+            let hi = if imm & 2 != 0 { shi } else { slo };
+            some_or_asm!(write_xmm128(ins, lo, hi))
+        }
+        // Shuffle the four 32-bit lanes per the imm8 selector.
+        Mnemonic::Pshufd => {
+            let (lo, hi) = some_or_asm!(read_xmm128(ins, 1));
+            let imm = konst(ins.immediate(2) as i128);
+            let nlo = fcall("__pi_shuf_lo", vec![lo.clone(), hi.clone(), imm.clone()]);
+            let nhi = fcall("__pi_shuf_hi", vec![lo, hi, imm]);
+            some_or_asm!(write_xmm128(ins, nlo, nhi))
+        }
+        // Shuffle the four 16-bit words in the low (pshuflw) or high (pshufhw)
+        // 64-bit half; the other half is copied unchanged.
+        Mnemonic::Pshuflw | Mnemonic::Pshufhw => {
+            let (lo, hi) = some_or_asm!(read_xmm128(ins, 1));
+            let imm = konst(ins.immediate(2) as i128);
+            if ins.mnemonic() == Mnemonic::Pshuflw {
+                some_or_asm!(write_xmm128(ins, fcall("__pi_shufw", vec![lo, imm]), hi))
+            } else {
+                some_or_asm!(write_xmm128(ins, lo, fcall("__pi_shufw", vec![hi, imm])))
+            }
+        }
+        Mnemonic::Addss => some_or_asm!(fbin("__fp_add32", ins, bits)),
+        Mnemonic::Subss => some_or_asm!(fbin("__fp_sub32", ins, bits)),
+        Mnemonic::Mulss => some_or_asm!(fbin("__fp_mul32", ins, bits)),
+        Mnemonic::Divss => some_or_asm!(fbin("__fp_div32", ins, bits)),
+        Mnemonic::Addsd => some_or_asm!(fbin("__fp_add64", ins, bits)),
+        Mnemonic::Subsd => some_or_asm!(fbin("__fp_sub64", ins, bits)),
+        Mnemonic::Mulsd => some_or_asm!(fbin("__fp_mul64", ins, bits)),
+        Mnemonic::Divsd => some_or_asm!(fbin("__fp_div64", ins, bits)),
+        Mnemonic::Minss | Mnemonic::Maxss | Mnemonic::Minsd | Mnemonic::Maxsd => {
+            let a = some_or_asm!(op_value(ins, 0));
+            let b = some_or_asm!(op_value(ins, 1));
+            let single = matches!(ins.mnemonic(), Mnemonic::Minss | Mnemonic::Maxss);
+            let maximum = matches!(ins.mnemonic(), Mnemonic::Maxss | Mnemonic::Maxsd);
+            let helper = if single { "__fp_lt32" } else { "__fp_lt64" };
+            // SSE chooses the source operand on equality or unordered inputs.
+            // Select the original bits to preserve NaN payloads and signed zero.
+            let cmp_args = if maximum { vec![b.clone(), a.clone()] }
+                else { vec![a.clone(), b.clone()] };
+            let selected = Expr::Select {
+                cond: Box::new(fcall(helper, cmp_args)),
+                then_: Box::new(a), else_: Box::new(b),
+            };
+            some_or_asm!(write_fp(helper, ins, selected, bits))
+        }
+        Mnemonic::Sqrtss => some_or_asm!(fcvt("__fp_sqrt32", ins, bits)),
+        Mnemonic::Sqrtsd => some_or_asm!(fcvt("__fp_sqrt64", ins, bits)),
+        Mnemonic::Cvtsi2ss => {
+            let n = if op_bits(ins, 1) >= 64 { "__fp_i64_32" } else { "__fp_i32_32" };
+            some_or_asm!(fcvt(n, ins, bits))
+        }
+        Mnemonic::Cvtsi2sd => {
+            let n = if op_bits(ins, 1) >= 64 { "__fp_i64_64" } else { "__fp_i32_64" };
+            some_or_asm!(fcvt(n, ins, bits))
+        }
+        Mnemonic::Cvttss2si => {
+            let n = if op_bits(ins, 0) >= 64 { "__fp_32_i64" } else { "__fp_32_i32" };
+            some_or_asm!(fcvt(n, ins, bits))
+        }
+        Mnemonic::Cvttsd2si => {
+            let n = if op_bits(ins, 0) >= 64 { "__fp_64_i64" } else { "__fp_64_i32" };
+            some_or_asm!(fcvt(n, ins, bits))
+        }
+        Mnemonic::Cvtss2si => {
+            let n = if op_bits(ins, 0) >= 64 { "__ssert_cvt32_i64" } else { "__ssert_cvt32_i32" };
+            some_or_asm!(fcvt(n, ins, bits))
+        }
+        Mnemonic::Cvtsd2si => {
+            let n = if op_bits(ins, 0) >= 64 { "__ssert_cvt64_i64" } else { "__ssert_cvt64_i32" };
+            some_or_asm!(fcvt(n, ins, bits))
+        }
+        Mnemonic::Cvtss2sd => some_or_asm!(fcvt("__fp_32_64", ins, bits)),
+        Mnemonic::Cvtsd2ss => some_or_asm!(fcvt("__fp_64_32", ins, bits)),
+        Mnemonic::Comiss | Mnemonic::Ucomiss | Mnemonic::Comisd | Mnemonic::Ucomisd => {
+            let a = some_or_asm!(op_value(ins, 0));
+            let b = some_or_asm!(op_value(ins, 1));
+            let is32 = matches!(ins.mnemonic(), Mnemonic::Comiss | Mnemonic::Ucomiss);
+            let (lt, eq, un) = if is32 {
+                ("__fp_lt32", "__fp_eq32", "__fp_un32")
+            } else {
+                ("__fp_lt64", "__fp_eq64", "__fp_un64")
+            };
+            // comiss flags: CF=a<b|unord, ZF=a==b|unord, PF=unord, SF=OF=0.
+            let unord = fcall(un, vec![a.clone(), b.clone()]);
+            vec![
+                set_flag(FlagKind::Cf, bin(BinOp::Or, fcall(lt, vec![a.clone(), b.clone()]), unord.clone())),
+                set_flag(FlagKind::Zf, bin(BinOp::Or, fcall(eq, vec![a.clone(), b.clone()]), unord.clone())),
+                set_flag(FlagKind::Pf, unord),
+                set_flag(FlagKind::Sf, konst(0)),
+                set_flag(FlagKind::Of, konst(0)),
+            ]
+        }
+        Mnemonic::Pxor | Mnemonic::Xorps | Mnemonic::Xorpd => {
+            // Full 128-bit xor on both halves (the `xorps xmm,xmm` zeroing idiom
+            // folds to 0). Zeroing *both* halves matters: the high half feeds
+            // later packed ops, so zeroing only the low half corrupts them.
+            let (alo, ahi) = some_or_asm!(read_xmm128(ins, 0));
+            let (blo, bhi) = some_or_asm!(read_xmm128(ins, 1));
+            some_or_asm!(write_xmm128(ins, bin(BinOp::Xor, alo, blo), bin(BinOp::Xor, ahi, bhi)))
+        }
+
+        // Carry-flag direct manipulation.
+        Mnemonic::Stc => vec![set_flag(FlagKind::Cf, konst(1))],
+        Mnemonic::Clc => vec![set_flag(FlagKind::Cf, konst(0))],
+        Mnemonic::Cmc => vec![set_flag(
+            FlagKind::Cf,
+            bin(BinOp::Xor, Expr::Read(Location::Flag(FlagKind::Cf)), konst(1)),
+        )],
+        Mnemonic::Lahf => {
+            // AH = SF:ZF:0:AF:0:PF:1:CF; retain every other accumulator bit.
+            let mut ah = konst(2);
+            for (flag, shift) in [(FlagKind::Cf, 0), (FlagKind::Pf, 2),
+                (FlagKind::Af, 4), (FlagKind::Zf, 6), (FlagKind::Sf, 7)] {
+                ah = bin(BinOp::Or, ah, bin(BinOp::Shl,
+                    bin(BinOp::And, read_flag(flag), konst(1)), konst(shift)));
+            }
+            let dst = Location::Reg(RegId(0));
+            let keep = bin(BinOp::And, Expr::Read(dst.clone()), konst(!0xff00i128 & mask(64)));
+            vec![Stmt::Set { dst, expr: bin(BinOp::Or, keep, bin(BinOp::Shl, ah, konst(8))) }]
+        }
+
+        // sahf: load CPU flags from AH (CF=AH.0, PF=AH.2, AF=AH.4, ZF=AH.6,
+        // SF=AH.7). Completes the x87 `fcom; fnstsw ax; sahf` compare idiom.
+        Mnemonic::Sahf => {
+            let ah = bin(BinOp::Shr, Expr::Read(Location::Reg(RegId(0))), konst(8));
+            let bit = |n: i128| bin(BinOp::And, bin(BinOp::Shr, ah.clone(), konst(n)), konst(1));
+            vec![
+                set_flag(FlagKind::Cf, bin(BinOp::And, ah.clone(), konst(1))),
+                set_flag(FlagKind::Pf, bit(2)),
+                set_flag(FlagKind::Af, bit(4)),
+                set_flag(FlagKind::Zf, bit(6)),
+                set_flag(FlagKind::Sf, bit(7)),
+            ]
+        }
+
+        Mnemonic::Cmp => {
+            let a = some_or_asm!(op_value(ins, 0));
+            let b = some_or_asm!(op_value(ins, 1));
+            let r = bin(BinOp::Sub, a.clone(), b.clone());
+            sub_flags(&a, &b, &r, op0_width(ins, bits))
+        }
+        Mnemonic::Test => {
+            let a = some_or_asm!(op_value(ins, 0));
+            let b = some_or_asm!(op_value(ins, 1));
+            let r = bin(BinOp::And, a, b);
+            logic_flags(&r, op0_width(ins, bits))
+        }
+
+        Mnemonic::Inc | Mnemonic::Dec => {
+            let w = op0_width(ins, bits);
+            let a = some_or_asm!(op_value(ins, 0));
+            let is_inc = ins.mnemonic() == Mnemonic::Inc;
+            let op = if is_inc { BinOp::Add } else { BinOp::Sub };
+            let r = bin(op, a.clone(), konst(1));
+            // ZF/SF read the w-bit result (inc of 0xff is 0 in 8 bits, not 0x100).
+            // inc/dec leave CF untouched but *do* set OF: inc overflows only at
+            // +max_signed (sign 0->1), dec only at min_signed (sign 1->0).
+            let m = bin(BinOp::And, r.clone(), konst(mask(w)));
+            let of = if is_inc {
+                bin(BinOp::And, bin(BinOp::Eq, sign_bit(&a, w), konst(0)), bin(BinOp::Eq, sign_bit(&m, w), konst(1)))
+            } else {
+                bin(BinOp::And, bin(BinOp::Eq, sign_bit(&a, w), konst(1)), bin(BinOp::Eq, sign_bit(&m, w), konst(0)))
+            };
+            let mut out = vec![
+                set_flag(FlagKind::Zf, bin(BinOp::Eq, m.clone(), konst(0))),
+                set_flag(FlagKind::Sf, sign_bit(&m, w)),
+                set_flag(FlagKind::Of, of),
+                pf_flag(&r),
+                af_flag(&a, &konst(1), &r),
+            ];
+            out.extend(some_or_asm!(write_op0(ins, r, bits)));
+            out
+        }
+        Mnemonic::Neg => {
+            let a = some_or_asm!(op_value(ins, 0));
+            let r = bin(BinOp::Sub, konst(0), a.clone());
+            let mut out = sub_flags(&konst(0), &a, &r, op0_width(ins, bits));
+            out.extend(some_or_asm!(write_op0(ins, r, bits)));
+            out
+        }
+        Mnemonic::Not => {
+            let a = some_or_asm!(op_value(ins, 0));
+            let r = Expr::Unary(UnOp::Not, Box::new(a));
+            some_or_asm!(write_op0(ins, r, bits))
+        }
+        // 2-operand `imul dst, src` and 3-operand `imul dst, src, imm`.
+        // (1-operand form writes a double-width result -> Asm fallback.)
+        Mnemonic::Imul if ins.op_count() == 2 => {
+            let r = bin(BinOp::Mul, some_or_asm!(op_value(ins, 0)), some_or_asm!(op_value(ins, 1)));
+            some_or_asm!(write_op0(ins, r, bits))
+        }
+        Mnemonic::Imul if ins.op_count() == 3 => {
+            let r = bin(BinOp::Mul, some_or_asm!(op_value(ins, 1)), some_or_asm!(op_value(ins, 2)));
+            some_or_asm!(write_op0(ins, r, bits))
+        }
+        // 1-operand mul/div/idiv (implicit edx:eax). 32-bit form only: the
+        // 64-bit-wide result fits a 64-bit IR value. 64-bit operands would need
+        // 128-bit arithmetic -> Asm fallback (sound).
+        Mnemonic::Mul | Mnemonic::Imul | Mnemonic::Div | Mnemonic::Idiv if ins.op_count() == 1 => {
+            let w = op0_width(ins, bits);
+            // 64-bit form: rdx:rax is a 128-bit operand — use __int128 helpers.
+            if w == 64 {
+                let src = some_or_asm!(op_value(ins, 0));
+                let rax = Location::Reg(RegId(0));
+                let rdx = Location::Reg(RegId(2));
+                let ra = Expr::Read(rax.clone());
+                let rd = Expr::Read(rdx.clone());
+                let t_lo = Location::Temp((insn.address as u32).wrapping_mul(2));
+                let t_hi = Location::Temp((insn.address as u32).wrapping_mul(2).wrapping_add(1));
+                let (lo_e, hi_e) = match ins.mnemonic() {
+                    Mnemonic::Mul => (
+                        bin(BinOp::Mul, ra.clone(), src.clone()),
+                        fcall("__ix_mul64hi", vec![ra, src]),
+                    ),
+                    Mnemonic::Imul => (
+                        bin(BinOp::Mul, ra.clone(), src.clone()),
+                        fcall("__ix_imul64hi", vec![ra, src]),
+                    ),
+                    Mnemonic::Div => (
+                        fcall("__ix_udiv", vec![rd.clone(), ra.clone(), src.clone()]),
+                        fcall("__ix_umod", vec![rd, ra, src]),
+                    ),
+                    _ => (
+                        fcall("__ix_idiv", vec![rd.clone(), ra.clone(), src.clone()]),
+                        fcall("__ix_imod", vec![rd, ra, src]),
+                    ),
+                };
+                return vec![
+                    Stmt::Set { dst: t_lo.clone(), expr: lo_e },
+                    Stmt::Set { dst: t_hi.clone(), expr: hi_e },
+                    Stmt::Set { dst: rax, expr: Expr::Read(t_lo) },
+                    Stmt::Set { dst: rdx, expr: Expr::Read(t_hi) },
+                ];
+            }
+            if w != 32 {
+                return asm();
+            }
+            let src = some_or_asm!(op_value(ins, 0));
+            let rax = Location::Reg(RegId(0));
+            let rdx = Location::Reg(RegId(2));
+            let m32 = || konst(mask(32));
+            let eax = bin(BinOp::And, Expr::Read(rax.clone()), m32());
+            let edx = bin(BinOp::And, Expr::Read(rdx.clone()), m32());
+            let lo = |e: Expr| combine_write(&rax, 32, bin(BinOp::And, e, m32()), bits);
+            let hi = |e: Expr| combine_write(&rdx, 32, bin(BinOp::And, e, m32()), bits);
+            // Both results depend on the *original* edx:eax. Compute them into
+            // temporaries first, then assign — otherwise the second write would
+            // read the register the first write already changed.
+            let t_lo = Location::Temp((insn.address as u32).wrapping_mul(2));
+            let t_hi = Location::Temp((insn.address as u32).wrapping_mul(2).wrapping_add(1));
+            let (lo_expr, hi_expr) = match ins.mnemonic() {
+                Mnemonic::Mul => {
+                    let p = bin(BinOp::Mul, eax, src); // <= 64 bits
+                    (p.clone(), bin(BinOp::Shr, p, konst(32)))
+                }
+                Mnemonic::Imul => {
+                    // Signed 32×32→64 product: sign-extend both operands first.
+                    let a = Expr::Unary(UnOp::SignExtend, Box::new(eax));
+                    let b = Expr::Unary(UnOp::SignExtend, Box::new(src));
+                    let p = bin(BinOp::Mul, a, b);
+                    (bin(BinOp::And, p.clone(), konst(mask(32))), bin(BinOp::Shr, p, konst(32)))
+                }
+                Mnemonic::Div => {
+                    // Via helpers that reproduce the x86 #DE on a zero divisor or a
+                    // quotient that overflows eax (a 64/32 `/` in C would silently
+                    // truncate the wide quotient instead of faulting).
+                    let d = bin(BinOp::Or, bin(BinOp::Shl, edx, konst(32)), eax);
+                    (
+                        fcall("__ix_udiv32", vec![d.clone(), src.clone()]),
+                        fcall("__ix_umod32", vec![d, src]),
+                    )
+                }
+                _ => {
+                    // idiv: signed; dividend is the signed 64-bit edx:eax.
+                    let d = bin(BinOp::Or, bin(BinOp::Shl, edx, konst(32)), eax);
+                    (
+                        fcall("__ix_idiv32", vec![d.clone(), src.clone()]),
+                        fcall("__ix_imod32", vec![d, src]),
+                    )
+                }
+            };
+            vec![
+                Stmt::Set { dst: t_lo.clone(), expr: lo_expr },
+                Stmt::Set { dst: t_hi.clone(), expr: hi_expr },
+                Stmt::Set { dst: rax.clone(), expr: lo(Expr::Read(t_lo)) },
+                Stmt::Set { dst: rdx.clone(), expr: hi(Expr::Read(t_hi)) },
+            ]
+        }
+
+        // cdq/cltd: EDX = sign-extension of EAX (all-ones if negative else 0).
+        Mnemonic::Cdq => {
+            let rax = Location::Reg(RegId(0));
+            let rdx = Location::Reg(RegId(2));
+            let eax = bin(BinOp::And, Expr::Read(rax), konst(mask(32)));
+            let sign = bin(BinOp::And, bin(BinOp::Sar, eax, konst(31)), konst(mask(32)));
+            vec![Stmt::Set { dst: rdx.clone(), expr: combine_write(&rdx, 32, sign, bits) }]
+        }
+        // cpuid: leaf in eax, subleaf in ecx -> eax/ebx/ecx/edx. Run the real host
+        // cpuid via __ix_cpuid (a user-mode instruction; the transpiled binary
+        // executes on this host, so its features are the correct answer). Compute
+        // all four into temps first — eax/ecx are both inputs *and* outputs.
+        Mnemonic::Cpuid => {
+            let leaf = bin(BinOp::And, Expr::Read(Location::Reg(RegId(0))), konst(mask(32)));
+            let sub = bin(BinOp::And, Expr::Read(Location::Reg(RegId(1))), konst(mask(32)));
+            let t = |i: u32| Location::Temp((insn.address as u32).wrapping_mul(4).wrapping_add(i));
+            let call = |w: i128| fcall("__ix_cpuid", vec![leaf.clone(), sub.clone(), konst(w)]);
+            vec![
+                Stmt::Set { dst: t(0), expr: call(0) },
+                Stmt::Set { dst: t(1), expr: call(1) },
+                Stmt::Set { dst: t(2), expr: call(2) },
+                Stmt::Set { dst: t(3), expr: call(3) },
+                Stmt::Set { dst: Location::Reg(RegId(0)), expr: Expr::Read(t(0)) }, // eax
+                Stmt::Set { dst: Location::Reg(RegId(3)), expr: Expr::Read(t(1)) }, // ebx
+                Stmt::Set { dst: Location::Reg(RegId(1)), expr: Expr::Read(t(2)) }, // ecx
+                Stmt::Set { dst: Location::Reg(RegId(2)), expr: Expr::Read(t(3)) }, // edx
+            ]
+        }
+        // xgetbv: read extended control register XCR[ecx] into edx:eax. The CRT
+        // reads XCR0 after cpuid to confirm the OS has enabled AVX state. We defer
+        // to the host XGETBV (real XCR0); see __ix_xgetbv in the C prelude.
+        Mnemonic::Xgetbv => {
+            let ecx = bin(BinOp::And, Expr::Read(Location::Reg(RegId(1))), konst(mask(32)));
+            let t = Location::Temp((insn.address as u32).wrapping_mul(4).wrapping_add(8));
+            vec![
+                Stmt::Set { dst: t.clone(), expr: fcall("__ix_xgetbv", vec![ecx]) },
+                // eax = XCR0[31:0]
+                Stmt::Set {
+                    dst: Location::Reg(RegId(0)),
+                    expr: bin(BinOp::And, Expr::Read(t.clone()), konst(mask(32))),
+                },
+                // edx = XCR0[63:32]
+                Stmt::Set {
+                    dst: Location::Reg(RegId(2)),
+                    expr: bin(BinOp::And, bin(BinOp::Shr, Expr::Read(t), konst(32)), konst(mask(32))),
+                },
+            ]
+        }
+        // Keep the physical SSE control/status register across calls. The rounded
+        // integer conversions read its mode and accumulate exception flags.
+        Mnemonic::Ldmxcsr | Mnemonic::Vldmxcsr => vec![Stmt::CallStmt(fcall(
+            "__ssert_setcsr", vec![some_or_asm!(op_value(ins, 0))]))],
+        Mnemonic::Stmxcsr | Mnemonic::Vstmxcsr => {
+            some_or_asm!(write_op0(ins, fcall("__ssert_getcsr", vec![]), bits))
+        }
+        // cqo: RDX = sign-extension of RAX (64-bit).
+        Mnemonic::Cqo => {
+            let rax = Location::Reg(RegId(0));
+            let rdx = Location::Reg(RegId(2));
+            vec![Stmt::Set { dst: rdx, expr: bin(BinOp::Sar, Expr::Read(rax), konst(63)) }]
+        }
+
+        // cbw/cwde/cdqe: sign-extend the accumulator in place (al->ax, ax->eax,
+        // eax->rax).
+        Mnemonic::Cbw | Mnemonic::Cwde | Mnemonic::Cdqe => {
+            let (sw, dw) = match ins.mnemonic() {
+                Mnemonic::Cbw => (8u32, 16u32),
+                Mnemonic::Cwde => (16, 32),
+                _ => (32, 64), // Cdqe
+            };
+            let rax = Location::Reg(RegId(0));
+            let src = bin(BinOp::And, Expr::Read(rax.clone()), konst(mask(sw)));
+            let sv = Expr::Unary(UnOp::SignExtend, Box::new(src));
+            vec![Stmt::Set { dst: rax.clone(), expr: combine_write(&rax, dw, sv, bits) }]
+        }
+
+        // Bit test (+ complement/set/reset): `CF = (dst >> (idx mod width)) & 1`,
+        // and the variants toggle/set/clear that bit. Handled for a register
+        // destination (any index) and for a *memory* destination with an
+        // **immediate** index — there the bit stays within the addressed operand
+        // (`idx mod width`), a plain load/modify/store. The memory form with a
+        // *register* index is excluded: it addresses a bit *string* (effective
+        // address shifts by idx/8), which this does not model.
+        // Memory bit-base with a *register* bit offset (`bt [arr], eax` — the
+        // bit-array idiom). The register offset is NOT masked to the operand
+        // width; instead it shifts the effective address: the accessed element is
+        // at `base + SAR(idx, log2 w) * (w/8)` and the tested bit is `idx & (w-1)`.
+        // The offset is signed, so sign-extend it with shl/sar (SignExtend is not
+        // modelled by the cpudiff interp) before the arithmetic. Segment-overridden
+        // bases fall to a sound asm abort (mem_addr returns None).
+        Mnemonic::Bt | Mnemonic::Btc | Mnemonic::Bts | Mnemonic::Btr
+            if ins.op_kind(0) == OpKind::Memory && ins.op_kind(1) == OpKind::Register =>
+        {
+            let (base, w) = some_or_asm!(mem_addr(ins));
+            let idx = some_or_asm!(op_value(ins, 1));
+            let (log2w, bytes): (i128, i128) = match w {
+                16 => (4, 2),
+                32 => (5, 4),
+                64 => (6, 8),
+                _ => return asm(),
+            };
+            let ty = Ty::int(w as u8);
+            // Sign-extend idx from w bits to the interpreter's 64-bit width.
+            let s = (64 - w) as i128;
+            let idx_s = bin(BinOp::Sar, bin(BinOp::Shl, idx.clone(), konst(s)), konst(s));
+            let byteoff = bin(BinOp::Mul, bin(BinOp::Sar, idx_s, konst(log2w)), konst(bytes));
+            // Snapshot the adjusted address into a temp so the CF read and the
+            // read-modify-write store address it once, consistently.
+            let at = Location::Temp((insn.address as u32).wrapping_mul(2));
+            let load = Expr::Load { addr: Box::new(Expr::Read(at.clone())), ty: ty.clone() };
+            let pos = bin(BinOp::And, idx, konst((w - 1) as i128));
+            let bit = bin(BinOp::And, bin(BinOp::Shr, load.clone(), pos.clone()), konst(1));
+            let mut out = vec![
+                Stmt::Set { dst: at.clone(), expr: bin(BinOp::Add, base, byteoff) },
+                set_flag(FlagKind::Cf, bit),
+            ];
+            if ins.mnemonic() != Mnemonic::Bt {
+                let m = bin(BinOp::Shl, konst(1), pos);
+                let nv = match ins.mnemonic() {
+                    Mnemonic::Bts => bin(BinOp::Or, load, m),
+                    Mnemonic::Btr => bin(BinOp::And, load, Expr::Unary(UnOp::Not, Box::new(m))),
+                    _ => bin(BinOp::Xor, load, m), // Btc
+                };
+                out.push(Stmt::Store { addr: Expr::Read(at), value: nv, ty });
+            }
+            out
+        }
+        Mnemonic::Bt | Mnemonic::Btc | Mnemonic::Bts | Mnemonic::Btr
+            if ins.op_kind(0) == OpKind::Register || ins.op_kind(1) == OpKind::Immediate8 =>
+        {
+            let w = op0_width(ins, bits);
+            let dst = some_or_asm!(op_value(ins, 0));
+            let idx = some_or_asm!(op_value(ins, 1));
+            let pos = bin(BinOp::And, idx, konst((w - 1) as i128));
+            let bit = bin(BinOp::And, bin(BinOp::Shr, dst.clone(), pos.clone()), konst(1));
+            let mut out = vec![set_flag(FlagKind::Cf, bit)];
+            if ins.mnemonic() != Mnemonic::Bt {
+                let m = bin(BinOp::Shl, konst(1), pos);
+                let nv = match ins.mnemonic() {
+                    Mnemonic::Bts => bin(BinOp::Or, dst, m),
+                    Mnemonic::Btr => bin(BinOp::And, dst, Expr::Unary(UnOp::Not, Box::new(m))),
+                    _ => bin(BinOp::Xor, dst, m), // Btc
+                };
+                out.extend(some_or_asm!(write_op0(ins, nv, bits)));
+            }
+            out
+        }
+        // Byte swap (endianness reversal) of a 32- or 64-bit register.
+        Mnemonic::Bswap => {
+            let w = op0_width(ins, bits);
+            let v = some_or_asm!(op_value(ins, 0));
+            let h = if w == 64 { "__ix_bswap64" } else { "__ix_bswap32" };
+            some_or_asm!(write_op0(ins, fcall(h, vec![v]), bits))
+        }
+        // Bit scan forward/reverse: index of lowest/highest set bit; sets ZF when
+        // the source is zero (the destination is then undefined — modelled as 0).
+        Mnemonic::Bsf | Mnemonic::Bsr => {
+            let w = op0_width(ins, bits);
+            let src = some_or_asm!(op_value(ins, 1));
+            let h = match (ins.mnemonic(), w) {
+                (Mnemonic::Bsf, 64) => "__ix_bsf64",
+                (Mnemonic::Bsf, _) => "__ix_bsf32",
+                (_, 64) => "__ix_bsr64",
+                (_, _) => "__ix_bsr32",
+            };
+            let mut out = vec![set_flag(FlagKind::Zf, bin(BinOp::Eq, src.clone(), konst(0)))];
+            out.extend(some_or_asm!(write_op0(ins, fcall(h, vec![src]), bits)));
+            out
+        }
+
+        // tzcnt/lzcnt (BMI, defined at 0 → width) and popcnt. CF = (src == 0)
+        // for tz/lzcnt (an over-approximation of their exact flag rules, but the
+        // count result is exact); popcnt sets ZF = (src == 0).
+        Mnemonic::Tzcnt | Mnemonic::Lzcnt | Mnemonic::Popcnt => {
+            let w = op0_width(ins, bits);
+            let src = some_or_asm!(op_value(ins, 1));
+            let h = match (ins.mnemonic(), w) {
+                (Mnemonic::Tzcnt, 64) => "__ix_tzcnt64",
+                (Mnemonic::Tzcnt, _) => "__ix_tzcnt32",
+                (Mnemonic::Lzcnt, 64) => "__ix_lzcnt64",
+                (Mnemonic::Lzcnt, _) => "__ix_lzcnt32",
+                (_, 64) => "__ix_popcnt64",
+                (_, _) => "__ix_popcnt32",
+            };
+            let zf = bin(BinOp::Eq, src.clone(), konst(0));
+            let flag = if ins.mnemonic() == Mnemonic::Popcnt { FlagKind::Zf } else { FlagKind::Cf };
+            let mut out = vec![set_flag(flag, zf)];
+            out.extend(some_or_asm!(write_op0(ins, fcall(h, vec![src]), bits)));
+            out
+        }
+
+        // leave: mov rsp, rbp ; pop rbp.
+        Mnemonic::Leave => {
+            let ptr = (bits / 8) as i128;
+            let sp = Location::Reg(RegId(4));
+            let bp = Location::Reg(RegId(5));
+            vec![
+                Stmt::Set { dst: sp.clone(), expr: Expr::Read(bp.clone()) },
+                Stmt::Set {
+                    dst: bp,
+                    expr: Expr::Load {
+                        addr: Box::new(Expr::Read(sp.clone())),
+                        ty: Ty::int(bits as u8),
+                    },
+                },
+                Stmt::Set { dst: sp.clone(), expr: bin(BinOp::Add, Expr::Read(sp), konst(ptr)) },
+            ]
+        }
+
+        // Double-precision shift: shift `dst` by `cnt`, filling from `src`.
+        // `shld dst,src,c` = (dst<<c)|(src>>(w-c)); `shrd` = (dst>>c)|(src<<(w-c)).
+        // Immediate count only (the CL form bails to a sound `asm`); a zero count
+        // is a documented no-op. Sets ZF from the result (CF/SF left, as for the
+        // ordinary shifts above).
+        Mnemonic::Shld | Mnemonic::Shrd if ins.op_kind(2) == OpKind::Immediate8 => {
+            let w = op0_width(ins, bits);
+            if !(w == 16 || w == 32 || w == 64) {
+                return asm();
+            }
+            let cnt = (ins.immediate(2) as u32) & (w - 1);
+            let dst = some_or_asm!(op_value(ins, 0));
+            if cnt == 0 {
+                return some_or_asm!(write_op0(ins, dst, bits)); // no-op
+            }
+            let src = some_or_asm!(op_value(ins, 1));
+            let val = if ins.mnemonic() == Mnemonic::Shld {
+                bin(BinOp::Or, bin(BinOp::Shl, dst, konst(cnt as i128)), bin(BinOp::Shr, src, konst((w - cnt) as i128)))
+            } else {
+                bin(BinOp::Or, bin(BinOp::Shr, dst, konst(cnt as i128)), bin(BinOp::Shl, src, konst((w - cnt) as i128)))
+            };
+            let val = bin(BinOp::And, val, konst(mask(w)));
+            let mut out = vec![
+                set_flag(FlagKind::Zf, bin(BinOp::Eq, val.clone(), konst(0))),
+                set_flag(FlagKind::Sf, sign_bit(&val, w)),
+                pf_flag(&val),
+            ];
+            out.extend(some_or_asm!(write_op0(ins, val, bits)));
+            out
+        }
+        // shld/shrd with a variable (CL) count. Count is taken mod `w`; a zero
+        // count is a no-op (selected explicitly, so the shift-by-w in the other
+        // branch is never evaluated). The complement shift is masked to avoid UB.
+        Mnemonic::Shld | Mnemonic::Shrd => {
+            let w = op0_width(ins, bits);
+            if !(w == 16 || w == 32 || w == 64) {
+                return asm();
+            }
+            let dst = some_or_asm!(op_value(ins, 0));
+            let src = some_or_asm!(op_value(ins, 1));
+            let c = bin(BinOp::And, some_or_asm!(op_value(ins, 2)), konst((w - 1) as i128));
+            let wc = bin(BinOp::And, bin(BinOp::Sub, konst(w as i128), c.clone()), konst((w - 1) as i128));
+            let shifted = if ins.mnemonic() == Mnemonic::Shld {
+                bin(BinOp::Or, bin(BinOp::Shl, dst.clone(), c.clone()), bin(BinOp::Shr, src, wc))
+            } else {
+                bin(BinOp::Or, bin(BinOp::Shr, dst.clone(), c.clone()), bin(BinOp::Shl, src, wc))
+            };
+            let shifted = bin(BinOp::And, shifted, konst(mask(w)));
+            let val = Expr::Select {
+                cond: Box::new(bin(BinOp::Eq, c.clone(), konst(0))),
+                then_: Box::new(bin(BinOp::And, dst, konst(mask(w)))),
+                else_: Box::new(shifted),
+            };
+            // ZF unchanged on a zero count (x86 leaves flags untouched then).
+            let zf = Expr::Select {
+                cond: Box::new(bin(BinOp::Eq, c.clone(), konst(0))),
+                then_: Box::new(read_flag(FlagKind::Zf)),
+                else_: Box::new(bin(BinOp::Eq, val.clone(), konst(0))),
+            };
+            let mut out = vec![
+                set_flag(FlagKind::Zf, zf),
+                flag_unless_zero(&c, FlagKind::Sf, sign_bit(&val, w)),
+                flag_unless_zero(&c, FlagKind::Pf, fcall("__ix_pf", vec![val.clone()])),
+            ];
+            out.extend(some_or_asm!(write_op0(ins, val, bits)));
+            out
+        }
+
+        // Shifts. CF is the last bit shifted out (a zero count leaves CF
+        // unchanged) — needed by the `shl;rcl` / `shr;rcr` multi-word idioms.
+        Mnemonic::Shl => {
+            let w = op0_width(ins, bits);
+            let a = some_or_asm!(op_value(ins, 0));
+            let b = some_or_asm!(op_value(ins, 1));
+            // x86 masks the shift count to 5 bits (6 with a 64-bit operand): `shl
+            // eax, 32` shifts by 0, not 32. Shifting by the raw count instead lets a
+            // 64-bit-on-32-bit shift produce e.g. `1 << 32` and silently corrupt the
+            // result. The result must use this masked count, not the raw operand.
+            let cmask = if w == 64 { 63 } else { 31 };
+            let c = bin(BinOp::And, b, konst(cmask));
+            let r = bin(BinOp::Shl, a.clone(), c.clone());
+            let cf = Expr::Select {
+                cond: Box::new(bin(BinOp::Eq, c.clone(), konst(0))),
+                then_: Box::new(read_flag(FlagKind::Cf)),
+                else_: Box::new(bin(BinOp::And, bin(BinOp::Shr, a, bin(BinOp::Sub, konst(w as i128), c.clone())), konst(1))),
+            };
+            // x86 leaves *all* flags unchanged when the masked count is 0, so ZF
+            // (like CF above) must be preserved in that case — else a `shl r, cl`
+            // with cl==0 (the count is often a runtime value, e.g. Lua's
+            // luaV_shiftl) wrongly clears/sets ZF and a later branch misfires.
+            // ZF reads the *w-bit* result: `shl` can push bits above the operand
+            // width (e.g. `0x80000000 << 1` = 0 in 32 bits but 0x100000000 raw),
+            // and the register write is masked, so ZF must mask too.
+            let zf = Expr::Select {
+                cond: Box::new(bin(BinOp::Eq, c.clone(), konst(0))),
+                then_: Box::new(read_flag(FlagKind::Zf)),
+                else_: Box::new(bin(BinOp::Eq, bin(BinOp::And, r.clone(), konst(mask(w))), konst(0))),
+            };
+            let mut out = vec![
+                set_flag(FlagKind::Zf, zf),
+                set_flag(FlagKind::Cf, cf),
+                flag_unless_zero(&c, FlagKind::Sf, sign_bit(&r, w)),
+                flag_unless_zero(&c, FlagKind::Pf, fcall("__ix_pf", vec![r.clone()])),
+            ];
+            out.extend(some_or_asm!(write_op0(ins, r, bits)));
+            out
+        }
+        Mnemonic::Shr | Mnemonic::Sar => {
+            let w = op0_width(ins, bits);
+            let a = some_or_asm!(op_value(ins, 0));
+            let b = some_or_asm!(op_value(ins, 1));
+            let op = if ins.mnemonic() == Mnemonic::Shr {
+                BinOp::Shr
+            } else {
+                BinOp::Sar
+            };
+            // Count masked to 5 bits (6 with a 64-bit operand), as x86 requires.
+            let cmask = if w == 64 { 63 } else { 31 };
+            let c = bin(BinOp::And, b, konst(cmask));
+            let r = bin(op, a.clone(), c.clone());
+            // CF = bit (c-1) of the source (the last bit shifted out the bottom).
+            let cf = Expr::Select {
+                cond: Box::new(bin(BinOp::Eq, c.clone(), konst(0))),
+                then_: Box::new(read_flag(FlagKind::Cf)),
+                else_: Box::new(bin(BinOp::And, bin(BinOp::Shr, a, bin(BinOp::Sub, c.clone(), konst(1))), konst(1))),
+            };
+            // ZF unchanged on a zero count (see Shl).
+            let zf = Expr::Select {
+                cond: Box::new(bin(BinOp::Eq, c.clone(), konst(0))),
+                then_: Box::new(read_flag(FlagKind::Zf)),
+                else_: Box::new(bin(BinOp::Eq, r.clone(), konst(0))),
+            };
+            let mut out = vec![
+                set_flag(FlagKind::Zf, zf),
+                set_flag(FlagKind::Cf, cf),
+                flag_unless_zero(&c, FlagKind::Sf, sign_bit(&r, w)),
+                flag_unless_zero(&c, FlagKind::Pf, fcall("__ix_pf", vec![r.clone()])),
+            ];
+            out.extend(some_or_asm!(write_op0(ins, r, bits)));
+            out
+        }
+
+        // Rotate left/right. Models the value and CF (the bit rotated out); the
+        // x86 spec leaves OF *undefined* for multi-bit rotates, so no correct
+        // compiler branches on it — left untouched (sound). ZF/SF/PF/AF are not
+        // affected by rotates. The complement count is masked (`(w-c)&(w-1)`) to
+        // avoid C's shift-by-width UB when the count is 0.
+        Mnemonic::Rol | Mnemonic::Ror => {
+            let w = op0_width(ins, bits);
+            if w == 0 || (w & (w - 1)) != 0 {
+                return asm();
+            }
+            let x = bin(BinOp::And, some_or_asm!(op_value(ins, 0)), konst(mask(w)));
+            let c = bin(BinOp::And, some_or_asm!(op_value(ins, 1)), konst((w - 1) as i128));
+            let wc = bin(BinOp::And, bin(BinOp::Sub, konst(w as i128), c.clone()), konst((w - 1) as i128));
+            let val = if ins.mnemonic() == Mnemonic::Rol {
+                bin(BinOp::Or, bin(BinOp::Shl, x.clone(), c.clone()), bin(BinOp::Shr, x, wc))
+            } else {
+                bin(BinOp::Or, bin(BinOp::Shr, x.clone(), c.clone()), bin(BinOp::Shl, x, wc))
+            };
+            let val = bin(BinOp::And, val, konst(mask(w)));
+            // CF = LSB (rol) / MSB (ror) of the rotated result — but a zero count
+            // leaves flags unchanged (x86), so preserve old CF then.
+            let cf_bit = if ins.mnemonic() == Mnemonic::Rol {
+                bin(BinOp::And, val.clone(), konst(1))
+            } else {
+                bin(BinOp::And, bin(BinOp::Shr, val.clone(), konst((w - 1) as i128)), konst(1))
+            };
+            let cf = Expr::Select {
+                cond: Box::new(bin(BinOp::Eq, c.clone(), konst(0))),
+                then_: Box::new(read_flag(FlagKind::Cf)),
+                else_: Box::new(cf_bit),
+            };
+            let mut out = vec![set_flag(FlagKind::Cf, cf)];
+            out.extend(some_or_asm!(write_op0(ins, val, bits)));
+            out
+        }
+
+        // Rotate through carry: a (w+1)-bit rotate of {CF:dst}. Immediate count
+        // only (CL form bails); width ≤ 32 so the (w+1)-bit value fits in 64 bits.
+        // Models the result and CF (out); OF is undefined for multi-bit, left.
+        Mnemonic::Rcl | Mnemonic::Rcr if ins.op_kind(1) == OpKind::Immediate8 => {
+            let w = op0_width(ins, bits);
+            if !(w == 8 || w == 16 || w == 32) {
+                return asm();
+            }
+            let c = (ins.immediate(1) as u32) % (w + 1);
+            let dst = bin(BinOp::And, some_or_asm!(op_value(ins, 0)), konst(mask(w)));
+            if c == 0 {
+                return some_or_asm!(write_op0(ins, dst, bits)); // no-op (CF unchanged)
+            }
+            // Capture the input carry first: the result and the carry-out both read
+            // `Cf`, and the carry-out set is emitted before the dst write, so SSA
+            // would otherwise resolve the result's carry-in to the carry-out.
+            let cf_in = Location::Temp((insn.address as u32).wrapping_mul(2));
+            // v = (CF << w) | dst  — the (w+1)-bit value.
+            let v = bin(
+                BinOp::Or,
+                bin(BinOp::Shl, Expr::Read(cf_in.clone()), konst(w as i128)),
+                dst,
+            );
+            let rot = if ins.mnemonic() == Mnemonic::Rcl {
+                bin(BinOp::Or, bin(BinOp::Shl, v.clone(), konst(c as i128)), bin(BinOp::Shr, v, konst((w + 1 - c) as i128)))
+            } else {
+                bin(BinOp::Or, bin(BinOp::Shr, v.clone(), konst(c as i128)), bin(BinOp::Shl, v, konst((w + 1 - c) as i128)))
+            };
+            let rot = bin(BinOp::And, rot, konst(mask(w + 1)));
+            let val = bin(BinOp::And, rot.clone(), konst(mask(w)));
+            let cf = bin(BinOp::And, bin(BinOp::Shr, rot, konst(w as i128)), konst(1));
+            let mut out = vec![
+                Stmt::Set { dst: cf_in, expr: read_flag(FlagKind::Cf) },
+                set_flag(FlagKind::Cf, cf),
+            ];
+            out.extend(some_or_asm!(write_op0(ins, val, bits)));
+            out
+        }
+        // Exchange. Register/register or memory/register (`xchg [m], r`, incl. the
+        // `lock` prefix — atomicity isn't expressible in sequential C, but the
+        // single-threaded value semantics are exact). Sequenced through a temp so
+        // each side sees the other's original value.
+        Mnemonic::Xchg
+            if ins.op_kind(1) == OpKind::Register
+                && (ins.op_kind(0) == OpKind::Register || ins.op_kind(0) == OpKind::Memory) =>
+        {
+            // Either operand may be a high byte (`xchg al, ah` byte-swaps `ax`, used
+            // by MSVC's `hex()`/endian helpers); `write_reg` handles the ah/bh/ch/dh
+            // position, so op1 no longer needs the low-byte-only `combine_write`.
+            let v0 = some_or_asm!(op_value(ins, 0));
+            let v1 = some_or_asm!(op_value(ins, 1));
+            let t = Location::Temp((insn.address as u32).wrapping_mul(2));
+            let mut out = vec![Stmt::Set { dst: t.clone(), expr: v0 }];
+            out.extend(some_or_asm!(write_op0(ins, v1, bits)));
+            out.extend(some_or_asm!(write_reg(ins.op_register(1), Expr::Read(t), bits)));
+            out
+        }
+        // xadd dst, src: src gets dst's old value; dst = dst + src (atomic add-and-
+        // exchange, used for reference counting). `src` is always a register.
+        Mnemonic::Xadd if ins.op_kind(1) == OpKind::Register && !is_high_byte(ins.op_register(1)) => {
+            let w = op0_width(ins, bits);
+            let old = some_or_asm!(op_value(ins, 0));
+            let s = some_or_asm!(op_value(ins, 1));
+            let sum = bin(BinOp::Add, old.clone(), s.clone());
+            let t = Location::Temp((insn.address as u32).wrapping_mul(2));
+            let id1 = some_or_asm!(reg_id(ins.op_register(1)));
+            let w1 = (ins.op_register(1).size() * 8) as u32;
+            let dst1 = Location::Reg(id1);
+            let mut out = vec![Stmt::Set { dst: t.clone(), expr: old.clone() }];
+            out.extend(add_flags(&old, &s, &sum, w));
+            out.extend(some_or_asm!(write_op0(ins, sum, bits)));
+            out.push(Stmt::Set { dst: dst1.clone(), expr: combine_write(&dst1, w1, Expr::Read(t), bits) });
+            out
+        }
+        // cmpxchg dst, src: if acc == dst { dst = src; ZF=1 } else { acc = dst;
+        // ZF=0 }. The compare sets the flags; `acc` is al/ax/eax/rax for the width.
+        Mnemonic::Cmpxchg if ins.op_kind(1) == OpKind::Register => {
+            let w = op0_width(ins, bits);
+            let acc_full = Location::Reg(RegId(0));
+            let acc = bin(BinOp::And, Expr::Read(acc_full.clone()), konst(mask(w)));
+            // Capture the old destination first so the `acc = dst` path (emitted
+            // after the store) reads the pre-store value, not the new one.
+            let t = Location::Temp((insn.address as u32).wrapping_mul(2));
+            let d = Expr::Read(t.clone());
+            let s = some_or_asm!(op_value(ins, 1));
+            let mut out = vec![Stmt::Set { dst: t.clone(), expr: some_or_asm!(op_value(ins, 0)) }];
+            let eq = bin(BinOp::Eq, acc.clone(), d.clone());
+            let r = bin(BinOp::Sub, acc.clone(), d.clone());
+            out.extend(sub_flags(&acc, &d, &r, w));
+            let dst_new = Expr::Select { cond: Box::new(eq.clone()), then_: Box::new(s), else_: Box::new(d.clone()) };
+            out.extend(some_or_asm!(write_op0(ins, dst_new, bits)));
+            let eax_new = Expr::Select { cond: Box::new(eq), then_: Box::new(acc), else_: Box::new(d) };
+            out.push(Stmt::Set { dst: acc_full.clone(), expr: combine_write(&acc_full, w, eax_new, bits) });
+            out
+        }
+
+        Mnemonic::Push => {
+            let v = some_or_asm!(op_value(ins, 0));
+            // Slot = operand size, not a hardcoded word: `push word` (66-prefix)
+            // lowers esp by 2 and stores 2 bytes, `push dword` by 4. iced's
+            // stack-pointer delta is the authoritative size (`bits/8` mis-sized the
+            // 16-bit push — esp off by 2 and a 4-byte store).
+            let spinc = ins.stack_pointer_increment();
+            let ptr = if spinc != 0 { (-spinc) as i128 } else { (bits / 8) as i128 };
+            let opbits = (ptr * 8) as u8;
+            let sp = Location::Reg(RegId(4)); // rsp/esp family
+            let new_sp = bin(BinOp::Sub, Expr::Read(sp.clone()), konst(ptr));
+            // A `push [esp+d]` source must be read with the *pre*-decrement esp:
+            // x86 evaluates the memory operand, then lowers esp, then stores.
+            // Emitting the source expr directly into the `Store` (which follows
+            // `esp -= slot`) would resolve its `Read(esp)` to the decremented
+            // value — off by the slot size (`push [esp+8]` reads `[esp+4]`). When
+            // the source is esp-relative, snapshot it into a temp first. Other
+            // pushes (reg/imm/non-esp mem) keep the two-statement form unchanged.
+            let sp_reg = if bits == 64 { Register::RSP } else { Register::ESP };
+            // The source reads esp when it is esp-relative memory (`push [esp+d]`)
+            // OR the esp register itself (`push esp` must push the *pre*-decrement
+            // value — 286+ semantics). Either way, snapshot before lowering esp.
+            let src_uses_sp = (ins.op0_kind() == OpKind::Memory
+                && (ins.memory_base() == sp_reg || ins.memory_index() == sp_reg))
+                || (ins.op0_kind() == OpKind::Register && ins.op0_register() == sp_reg);
+            if src_uses_sp {
+                let t = Location::Temp((insn.address as u32).wrapping_mul(2));
+                vec![
+                    Stmt::Set { dst: t.clone(), expr: v },
+                    Stmt::Set { dst: sp.clone(), expr: new_sp },
+                    Stmt::Store {
+                        addr: Expr::Read(sp),
+                        value: Expr::Read(t),
+                        ty: Ty::int(opbits),
+                    },
+                ]
+            } else {
+                vec![
+                    Stmt::Set { dst: sp.clone(), expr: new_sp },
+                    Stmt::Store {
+                        addr: Expr::Read(sp),
+                        value: v,
+                        ty: Ty::int(opbits),
+                    },
+                ]
+            }
+        }
+        Mnemonic::Pop => {
+            // Slot/operand size from the instruction (2 for `pop word`, else the
+            // address width) — see `push` above.
+            let spinc = ins.stack_pointer_increment();
+            let ptr = if spinc != 0 { spinc as i128 } else { (bits / 8) as i128 };
+            let opbits = (ptr * 8) as u32;
+            let sp = Location::Reg(RegId(4));
+            let load = Expr::Load {
+                addr: Box::new(Expr::Read(sp.clone())),
+                ty: Ty::int(opbits as u8),
+            };
+            let sp_reg = if bits == 64 { Register::RSP } else { Register::ESP };
+            // `pop esp` writes the popped value straight into esp; the increment is
+            // superseded (final esp = [old esp], not +slot).
+            let dest_is_sp = ins.op0_kind() == OpKind::Register
+                && ins.op0_register().full_register() == Register::RSP;
+            // `pop [esp+d]`: x86 computes the destination effective address *after*
+            // incrementing esp, so it stores to `[new esp + d]`. Snapshot the popped
+            // value (read at the old esp) into a temp, bump esp, then write — so the
+            // store's `[esp+d]` resolves to the incremented esp (mirror of push).
+            let dest_uses_sp = ins.op0_kind() == OpKind::Memory
+                && (ins.memory_base() == sp_reg || ins.memory_index() == sp_reg);
+            if dest_uses_sp {
+                let t = Location::Temp((insn.address as u32).wrapping_mul(2).wrapping_add(1));
+                let mut out = vec![
+                    Stmt::Set { dst: t.clone(), expr: load },
+                    Stmt::Set {
+                        dst: sp.clone(),
+                        expr: bin(BinOp::Add, Expr::Read(sp.clone()), konst(ptr)),
+                    },
+                ];
+                out.extend(some_or_asm!(write_op0(ins, Expr::Read(t), bits)));
+                out
+            } else {
+                let mut out = some_or_asm!(write_op0(ins, load, bits));
+                if !dest_is_sp {
+                    out.push(Stmt::Set {
+                        dst: sp.clone(),
+                        expr: bin(BinOp::Add, Expr::Read(sp), konst(ptr)),
+                    });
+                }
+                out
+            }
+        }
+
+        // `pushfd` / `popfd` — save/restore the 32-bit EFLAGS. ARET tracks flags
+        // individually, so pushfd re-assembles them (plus the shadow's untracked bits) and
+        // popfd distributes back. The shadow makes the CPUID EFLAGS.ID probe round-trip.
+        Mnemonic::Pushfd => {
+            let sp = Location::Reg(RegId(4));
+            vec![
+                Stmt::Set { dst: sp.clone(), expr: bin(BinOp::Sub, Expr::Read(sp.clone()), konst(4)) },
+                Stmt::Store { addr: Expr::Read(sp), value: assemble_eflags(), ty: Ty::int(32) },
+            ]
+        }
+        Mnemonic::Popfd => {
+            let sp = Location::Reg(RegId(4));
+            let t = Location::Temp((insn.address as u32).wrapping_mul(2).wrapping_add(7));
+            let load = Expr::Load { addr: Box::new(Expr::Read(sp.clone())), ty: Ty::int(32) };
+            let mut out = vec![Stmt::Set { dst: t.clone(), expr: load }];
+            out.extend(distribute_eflags(Expr::Read(t)));
+            out.push(Stmt::Set { dst: sp.clone(), expr: bin(BinOp::Add, Expr::Read(sp), konst(4)) });
+            out
+        }
+
+        Mnemonic::Call => {
+            // A defined target resolves to its address (`sub_<addr>`); a call
+            // relocated to an undefined external (object files) is emitted by
+            // name (`strlen`); otherwise it is an indirect call.
+            let target = match insn.target {
+                Some(t) => CallTarget::Direct(t),
+                None => match &insn.call_name {
+                    Some(name) => CallTarget::Named(name.clone()),
+                    None => match op_value(ins, 0) {
+                        Some(e) => CallTarget::Indirect(Box::new(e)),
+                        None => return asm(),
+                    },
+                },
+            };
+            // 64-bit: pass the SysV integer argument registers (read at their
+            // pre-call versions). Over-approximate (all 6); a later prune drops
+            // trailing never-defined ones. 32-bit cdecl args are on the stack
+            // (recovered by the text pipeline) — left empty here for now.
+            let args = if bits == 64 {
+                [7u16, 6, 2, 1, 8, 9]
+                    .iter()
+                    .map(|&r| Expr::Read(Location::Reg(RegId(r))))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let call = Expr::Call {
+                target,
+                args,
+                ret: Ty::int(bits as u8),
+            };
+            // The call returns its value in rax; caller-saved registers are
+            // undefined afterwards. Modelling this lets later reads of the
+            // result use the call, and prevents stale reads of clobbered regs.
+            let mut out = vec![Stmt::Set { dst: Location::Reg(RegId(0)), expr: call }];
+            // 32-bit cdecl returns a 64-bit value in the edx:eax pair: split the
+            // result so a caller that needs the high half (a `long long` result)
+            // reads it from edx, while eax holds the low half. The callee combines
+            // them in `ir::build`'s `Return`. (A 32-bit-returning callee leaves a
+            // scratch high half here, but such a caller reads only eax.)
+            if bits == 32 {
+                let ret = Expr::Read(Location::Reg(RegId(0)));
+                // edx FIRST (reads the full call result), then mask eax — otherwise
+                // edx would read the already-truncated eax and be a constant 0.
+                out.push(Stmt::Set {
+                    dst: Location::Reg(RegId(2)),
+                    expr: Expr::Binary(BinOp::Shr, Box::new(ret.clone()), Box::new(Expr::konst(32, 64))),
+                });
+                out.push(Stmt::Set {
+                    dst: Location::Reg(RegId(0)),
+                    expr: Expr::Binary(BinOp::And, Box::new(ret), Box::new(Expr::konst(0xffff_ffff, 64))),
+                });
+                // ecx is caller-saved, but only clobber it if the callee may write
+                // it: a function GCC proved preserves ecx (it never touches it) lets
+                // the caller keep a live value across the call (see compute_call_
+                // clobbers). edx needs no such guard — the edx:eax return split above
+                // restores a preserved edx automatically (the callee returns it in
+                // the high half). Unknown target → clobber (the safe default).
+                let preserves_ecx =
+                    matches!(insn.target.and_then(crate::ir::build::call_clobber_mask), Some(m) if m & 1 == 0);
+                if !preserves_ecx {
+                    out.push(Stmt::Set { dst: Location::Reg(RegId(1)), expr: Expr::Undef }); // ecx scratch
+                }
+                return out;
+            }
+            let clobbers: &[u16] = if bits == 64 {
+                &[1, 2, 6, 7, 8, 9, 10, 11] // rcx,rdx,rsi,rdi,r8-r11 (SysV caller-saved)
+            } else {
+                &[1, 2] // ecx,edx (cdecl caller-saved scratch)
+            };
+            for &r in clobbers {
+                out.push(Stmt::Set {
+                    dst: Location::Reg(RegId(r)),
+                    expr: Expr::Undef,
+                });
+            }
+            out
+        }
+        Mnemonic::Ret => vec![Stmt::Return(None)],
+
+        _ => {
+            let cc = ins.condition_code();
+            if cc != ConditionCode::None && insn.flow == crate::disasm::Flow::Fallthrough {
+                // setcc: single byte destination from a condition.
+                if ins.op_count() == 1 {
+                    if let Some(s) = write_op0(ins, cc_to_cond(cc), bits) {
+                        return s;
+                    }
+                }
+                // cmovcc dst, src:  dst = cond ? src : dst
+                if ins.op_count() == 2 {
+                    if let (Some(src), Some(cur)) = (op_value(ins, 1), op_value(ins, 0)) {
+                        let sel = Expr::Select {
+                            cond: Box::new(cc_to_cond(cc)),
+                            then_: Box::new(src),
+                            else_: Box::new(cur),
+                        };
+                        if let Some(s) = write_op0(ins, sel, bits) {
+                            return s;
+                        }
+                    }
+                }
+            }
+            asm()
+        }
+    }
+}
+
+// ===========================================================================
+// x87 FPU (80-bit extended-precision floating point)
+// ===========================================================================
+//
+// The x87 stack is modelled with a *statically tracked* top-of-stack: the
+// analysis in `ir::build` computes the stack depth (`sp_in`) at every FPU
+// instruction (bailing the whole function if the depth is ambiguous), so each
+// `st(i)` reference resolves to a concrete physical slot. Slot d (0 = oldest
+// live value) is `RegId(96+d)`; `RegId(104)` is a swap scratch. Those values are
+// emitted as native `long double` — which on x86-64 *is* the 80-bit x87 format,
+// so the recompiled C re-lowers to equivalent x87 code: bit-exact by
+// construction. Arithmetic/loads/stores/compares are bit-exact regardless of
+// rounding mode; only `fistp`/`fist` (float→int) depend on it, so those are
+// emitted only when the analysis proves truncation mode (the `(int)x` idiom) or
+// the instruction is `fisttp` (always truncates). Anything else bails to `Asm`.
+
+/// x87 FPU stack slot at absolute depth `d` (0 = oldest live value).
+fn fpr(d: i32) -> Option<Location> {
+    if (0..8).contains(&d) {
+        Some(Location::Reg(RegId(96 + d as u16)))
+    } else {
+        None
+    }
+}
+
+/// Long-double scratch register (for `fxch` swaps).
+fn fpr_scratch() -> Location {
+    Location::Reg(RegId(104))
+}
+
+/// The x87 FPU status word (the condition bits C0/C2/C3), modelled as an integer
+/// pseudo-register. `fcom`/`fucom` set it; `fnstsw` copies it to AX, after which
+/// `sahf` (or a `test ah, imm`) turns it into CPU flags. Not an fp80 value.
+fn fsw() -> Location {
+    Location::Reg(RegId(120))
+}
+
+/// A call to a `long double` x87 runtime helper.
+fn x87call(name: &str, args: Vec<Expr>) -> Expr {
+    Expr::Call { target: CallTarget::Named(name.to_string()), args, ret: Ty::Unknown }
+}
+
+/// The x87 stack slot at absolute depth `d` (st(0) = depth 0), so `ir::build` can
+/// connect a call's fp result and a fp-returning function's `ret` to the shared
+/// st(0) return channel.
+pub(crate) fn x87_slot(d: i32) -> Option<Location> {
+    fpr(d)
+}
+
+/// Store `v` (the x87 top of stack) into the fp return channel — emitted before a
+/// fp-returning function's `ret`.
+pub(crate) fn x87_ret_store(v: Expr) -> Stmt {
+    Stmt::CallStmt(x87call("__x87_retstore", vec![v]))
+}
+
+/// A bare `CallStmt` to a no-arg runtime x87 helper — for `build.rs` to emit the
+/// runtime-fallback fp-return handoff (`__x87rt_reset`/`pushret`/`retstore`).
+pub(crate) fn x87rt_stmt(name: &str) -> Stmt {
+    Stmt::CallStmt(x87call(name, vec![]))
+}
+
+/// Read the fp return channel (st(0)) — emitted after a call to a fp-returning
+/// function, to recover the result the x87 ABI left in st(0).
+pub(crate) fn x87_ret_load() -> Expr {
+    x87call("__x87_retload", vec![])
+}
+
+/// Helper name for loading a memory operand of `ms` as a `long double`.
+fn x87_load_helper(ms: MemorySize) -> Option<&'static str> {
+    Some(match ms {
+        MemorySize::Float32 => "__x87_ld32",
+        MemorySize::Float64 => "__x87_ld64",
+        MemorySize::Float80 => "__x87_ld80",
+        MemorySize::Int16 => "__x87_ild16",
+        MemorySize::Int32 => "__x87_ild32",
+        MemorySize::Int64 => "__x87_ild64",
+        _ => return None,
+    })
+}
+
+/// Read operand `i` (an `st(j)` register or a memory float/int) as `long double`.
+fn x87_src(ins: &Instruction, i: u32, sp: i32) -> Option<Expr> {
+    match ins.op_kind(i) {
+        OpKind::Register => {
+            let r = ins.op_register(i);
+            if !r.is_st() {
+                return None;
+            }
+            Some(Expr::Read(fpr(sp - 1 - r.number() as i32)?))
+        }
+        OpKind::Memory => {
+            if ins.segment_prefix() != Register::None {
+                return None;
+            }
+            let (addr, _) = mem_addr(ins)?;
+            Some(x87call(x87_load_helper(ins.memory_size())?, vec![addr]))
+        }
+        _ => None,
+    }
+}
+
+/// Is this an x87 FPU instruction (modelled or not)? Routes lifting to
+/// `lift_x87` when the per-function stack analysis succeeded.
+pub(crate) fn is_x87(ins: &Instruction) -> bool {
+    let m = ins.mnemonic();
+    // iced groups all FPU mnemonics in a contiguous range starting at `Fld`.
+    use Mnemonic::*;
+    if matches!(
+        m,
+        Fabs | Fadd | Faddp | Fiadd | Fbld | Fbstp | Fchs | Fnclex | Fclex | Fcom | Fcomp | Fcompp
+            | Fcomi | Fcomip | Fcos | Fdecstp | Fdiv | Fdivp | Fidiv | Fdivr | Fdivrp | Fidivr
+            | Ffree | Ffreep | Ficom | Ficomp | Fild | Fincstp | Finit | Fninit | Fist | Fistp
+            | Fisttp | Fisub | Fisubr | Fimul | Fld | Fld1 | Fldcw | Fldenv | Fldl2e | Fldl2t
+            | Fldlg2 | Fldln2 | Fldpi | Fldz | Fmul | Fmulp | Fnop | Fpatan | Fprem | Fprem1
+            | Fptan | Frndint | Frstor | Fnsave | Fsave | Fscale | Fsin | Fsincos | Fsqrt | Fst
+            | Fstp | Fnstcw | Fstcw | Fnstenv | Fstenv | Fnstsw | Fstsw | Fsub | Fsubp | Fsubr
+            | Fsubrp | Ftst | Fucom | Fucomp | Fucompp | Fucomi | Fucomip | Fxam | Fxch | Fxtract
+            | Fyl2x | Fyl2xp1 | F2xm1 | Wait
+    ) {
+        return true;
+    }
+    (0..ins.op_count()).any(|i| ins.op_register(i).is_st())
+}
+
+/// Net x87 stack-depth change of a *modelled* FPU instruction, or `None` if the
+/// instruction is not modelled (so the function's x87 analysis must bail).
+pub(crate) fn x87_delta(ins: &Instruction) -> Option<i32> {
+    use Mnemonic::*;
+    Some(match ins.mnemonic() {
+        Fld | Fild | Fld1 | Fldz => 1,
+        Fstp | Fistp | Fisttp => -1,
+        Faddp | Fsubp | Fsubrp | Fmulp | Fdivp | Fdivrp => -1,
+        Fcomip | Fucomip => -1,
+        Fst | Fist => 0,
+        Fadd | Fsub | Fsubr | Fmul | Fdiv | Fdivr => 0,
+        Fiadd | Fisub | Fisubr | Fimul | Fidiv | Fidivr => 0,
+        Fabs | Fchs | Fsqrt | Fxch | Frndint => 0,
+        Fprem | Fprem1 => 0,
+        Fcomi | Fucomi => 0,
+        // Status-word compares (32-bit float idiom) + status-word store.
+        // `ftst` compares st(0) against an implicit 0.0 (no pop).
+        Fcom | Fucom | Ficom | Ftst => 0,
+        Fcomp | Fucomp | Ficomp => -1,
+        Fcompp | Fucompp => -2,
+        Fnstsw | Fstsw => 0,
+        // `fxam` classifies st(0) into the FPU condition codes (no stack change).
+        Fxam => 0,
+        Fcmovb | Fcmovbe | Fcmove | Fcmovu | Fcmovnb | Fcmovnbe | Fcmovne | Fcmovnu => 0,
+        // `finit`/`fninit` empty the x87 stack; the depth pass resets sp to 0 for
+        // them (a plain delta can't express that), but they are *modelled* here so
+        // a CRT-startup `fninit` does not bail the whole function to asm.
+        Finit | Fninit => 0,
+        Fldcw | Fnstcw | Fstcw | Fnclex | Fclex | Fnop | Wait => 0,
+        _ => return None,
+    })
+}
+
+/// Build a `long double` arithmetic result via a helper, honouring the
+/// non-commutative reverse forms (`fsubr`/`fdivr`: `src - dst`, `src / dst`).
+fn x87_arith(op: &str, rev: bool, dst: Expr, src: Expr) -> Expr {
+    let (a, b) = if rev { (src, dst) } else { (dst, src) };
+    x87call(&format!("__x87_{}", op), vec![a, b])
+}
+
+/// The x87 rounding mode the depth analysis proved is active at an instruction,
+/// from the control-word (RC bits) the surrounding code installed. `frndint`
+/// honours all four; `fist`/`fistp` require `Trunc` (else the store bails).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RoundMode {
+    Nearest,
+    Down,  // -inf: floor
+    Up,    // +inf: ceil
+    Trunc, // toward zero
+}
+
+/// Lift one x87 FPU instruction given the statically-tracked stack depth
+/// `sp_in` (number of live values *before* it) and the proven rounding `mode`
+/// (for `frndint`/`fist`). Falls back to a sound `Asm` for anything outside the
+/// proven-bit-exact subset.
+pub(crate) fn lift_x87(insn: &Insn, sp_in: u32, mode: RoundMode) -> Vec<Stmt> {
+    x87_try(insn, sp_in as i32, mode).unwrap_or_else(|| asm_fallback(insn))
+}
+
+/// Lower an x87 instruction against the RUNTIME FPU-stack model (`__x87rt_*`),
+/// the fallback used when a function's static stack-depth analysis bailed. No
+/// compile-time depth is needed: the stack lives in runtime state, so this is
+/// correct by construction. Each op is one *impure* `CallStmt` (the optimiser
+/// never drops/reorders it). Ops not modelled here (compares, status word,
+/// transcendentals) stay a sound `Asm`/abort. Only call for `is_x87` insns.
+pub(crate) fn lift_x87_runtime(insn: &Insn) -> Vec<Stmt> {
+    x87_rt_try(insn).unwrap_or_else(|| asm_fallback(insn))
+}
+
+/// Metadata belongs to the original guest instruction, not the generated C.
+pub(crate) fn lift_x87_runtime_with_metadata(insn: &Insn, opcode: u16) -> Vec<Stmt> {
+    use Mnemonic::*;
+    let mut statements = lift_x87_runtime(insn);
+    if !matches!(insn.raw.mnemonic(), Fldcw | Fnstcw | Fstcw | Fldenv | Fnstenv | Fstenv | Fnstsw | Fstsw | Finit | Fninit | Fnclex | Fclex | Fnop | Wait) {
+        let memory = (0..insn.raw.op_count()).any(|i| insn.raw.op_kind(i)==OpKind::Memory);
+        let address = if memory { mem_addr(&insn.raw).map(|(a,_)|a).unwrap_or_else(||konst(0)) } else { konst(0) };
+        statements.insert(0, Stmt::CallStmt(x87call("__x87rt_note", vec![konst(insn.address as i128),konst(opcode as i128),address,konst(memory as i128)])));
+    }
+    statements
+}
+
+fn x87_rt_try(insn: &Insn) -> Option<Vec<Stmt>> {
+    use Mnemonic::*;
+    let ins = &insn.raw;
+    let mn = ins.mnemonic();
+    let rt = |name: &str, args: Vec<Expr>| Stmt::CallStmt(x87call(name, args));
+    Some(match mn {
+        // pushes: memory load, or duplicate st(i)
+        Fld | Fild => {
+            if ins.op_kind(0) == OpKind::Memory {
+                if ins.segment_prefix() != Register::None {
+                    return None;
+                }
+                let (addr, _) = mem_addr(ins)?;
+                let h = match (mn, ins.memory_size()) {
+                    (Fld, MemorySize::Float32) => "__x87rt_ld32",
+                    (Fld, MemorySize::Float64) => "__x87rt_ld64",
+                    (Fld, MemorySize::Float80) => "__x87rt_ld80",
+                    (Fild, MemorySize::Int16) => "__x87rt_ild16",
+                    (Fild, MemorySize::Int32) => "__x87rt_ild32",
+                    (Fild, MemorySize::Int64) => "__x87rt_ild64",
+                    _ => return None,
+                };
+                vec![rt(h, vec![addr])]
+            } else {
+                let r = ins.op_register(0);
+                if !r.is_st() {
+                    return None;
+                }
+                vec![rt("__x87rt_ldi", vec![konst(r.number() as i128)])]
+            }
+        }
+        Fld1 => vec![rt("__x87rt_ld1", vec![])],
+        Fldz => vec![rt("__x87rt_ldz", vec![])],
+
+        // stores (optionally popping)
+        Fst | Fstp | Fist | Fistp => {
+            let pop = konst(matches!(mn, Fstp | Fistp) as i128);
+            match ins.op_kind(0) {
+                OpKind::Register => {
+                    let r = ins.op_register(0);
+                    if !r.is_st() || !matches!(mn, Fst | Fstp) {
+                        return None;
+                    }
+                    vec![rt("__x87rt_sti", vec![konst(r.number() as i128), pop])]
+                }
+                OpKind::Memory => {
+                    if ins.segment_prefix() != Register::None {
+                        return None;
+                    }
+                    let (addr, _) = mem_addr(ins)?;
+                    let h = match (mn, ins.memory_size()) {
+                        (Fst | Fstp, MemorySize::Float32) => "__x87rt_st32",
+                        (Fst | Fstp, MemorySize::Float64) => "__x87rt_st64",
+                        (Fst | Fstp, MemorySize::Float80) => "__x87rt_st80",
+                        // fist/fistp honour the runtime rounding mode (rc) — no
+                        // need to prove it statically, we track it at runtime.
+                        (Fist | Fistp, MemorySize::Int16) => "__x87rt_ist16",
+                        (Fist | Fistp, MemorySize::Int32) => "__x87rt_ist32",
+                        (Fist | Fistp, MemorySize::Int64) => "__x87rt_ist64",
+                        _ => return None,
+                    };
+                    vec![rt(h, vec![addr, pop])]
+                }
+                _ => return None,
+            }
+        }
+
+        // arithmetic: memory operand (st0 = st0 OP mem) or register form
+        Fadd | Faddp | Fiadd | Fmul | Fmulp | Fimul | Fsub | Fsubp | Fisub | Fsubr | Fsubrp
+        | Fisubr | Fdiv | Fdivp | Fidiv | Fdivr | Fdivrp | Fidivr => {
+            let op: i128 = match mn {
+                Fadd | Faddp | Fiadd => 0,
+                Fsub | Fsubp | Fisub => 1,
+                Fsubr | Fsubrp | Fisubr => 2,
+                Fmul | Fmulp | Fimul => 3,
+                Fdiv | Fdivp | Fidiv => 4,
+                _ => 5, // divr
+            };
+            let is_p = matches!(mn, Faddp | Fsubp | Fsubrp | Fmulp | Fdivp | Fdivrp);
+            let is_i = matches!(mn, Fiadd | Fisub | Fisubr | Fimul | Fidiv | Fidivr);
+            if ins.op_kind(0) == OpKind::Memory {
+                if ins.segment_prefix() != Register::None {
+                    return None;
+                }
+                let (addr, _) = mem_addr(ins)?;
+                let h = match (is_i, ins.memory_size()) {
+                    (false, MemorySize::Float32) => "__x87rt_am32",
+                    (false, MemorySize::Float64) => "__x87rt_am64",
+                    (true, MemorySize::Int16) => "__x87rt_ami16",
+                    (true, MemorySize::Int32) => "__x87rt_ami32",
+                    _ => return None,
+                };
+                vec![rt(h, vec![konst(op), addr])]
+            } else if is_p {
+                let ai = if ins.op_count() >= 1 && ins.op_register(0).is_st() {
+                    ins.op_register(0).number() as i128
+                } else {
+                    1
+                };
+                vec![rt("__x87rt_ar", vec![konst(op), konst(ai), konst(0), konst(1)])]
+            } else {
+                let (r0, r1) = (ins.op_register(0), ins.op_register(1));
+                if !r0.is_st() || !r1.is_st() {
+                    return None;
+                }
+                vec![rt(
+                    "__x87rt_ar",
+                    vec![konst(op), konst(r0.number() as i128), konst(r1.number() as i128), konst(0)],
+                )]
+            }
+        }
+
+        Fxch => {
+            let di = (0..ins.op_count())
+                .map(|k| ins.op_register(k))
+                .filter(|r| r.is_st())
+                .map(|r| r.number() as i128)
+                .find(|&n| n != 0)
+                .unwrap_or(1);
+            vec![rt("__x87rt_xch", vec![konst(di)])]
+        }
+        Fabs => vec![rt("__x87rt_abs", vec![])],
+        Fchs => vec![rt("__x87rt_chs", vec![])],
+        Fsqrt => vec![rt("__x87rt_sqrt", vec![])],
+        Frndint => vec![rt("__x87rt_rndint", vec![])],
+        Fldcw => {
+            let (addr, _) = mem_addr(ins)?;
+            vec![rt("__x87rt_ldcw", vec![addr])]
+        }
+        Fnstenv | Fstenv | Fldenv => {
+            let (addr, _) = mem_addr(ins)?;
+            let size = match ins.memory_size() { MemorySize::FpuEnv14 => 14, MemorySize::FpuEnv28 => 28, _ => return None };
+            vec![rt(if mn == Fldenv { "__x87rt_ldenv" } else { "__x87rt_stenv" }, vec![addr, konst(size)])]
+        }
+        Fnstcw | Fstcw => {
+            let (addr, _) = mem_addr(ins)?;
+            vec![rt("__x87rt_stcw", vec![addr])]
+        }
+
+        // comparisons setting EFLAGS (fcomi family).
+        Fcomi | Fcomip | Fucomi | Fucomip => {
+            let (r0, r1) = (ins.op_register(0), ins.op_register(1));
+            if !r0.is_st() || !r1.is_st() {
+                return None;
+            }
+            let i = konst(r1.number() as i128);
+            let un = x87call("__x87rt_un", vec![i.clone()]);
+            let mut v = vec![
+                set_flag(FlagKind::Cf, bin(BinOp::Or, x87call("__x87rt_lt", vec![i.clone()]), un.clone())),
+                set_flag(FlagKind::Zf, bin(BinOp::Or, x87call("__x87rt_eq", vec![i]), un.clone())),
+                set_flag(FlagKind::Pf, un),
+                set_flag(FlagKind::Sf, konst(0)),
+                set_flag(FlagKind::Of, konst(0)),
+            ];
+            if matches!(mn, Fcomip | Fucomip) {
+                v.push(rt("__x87rt_free", vec![]));
+            }
+            v
+        }
+        // status-word comparisons (fcom/fucom/ftst) — set C0/C2/C3, then `fnstsw`.
+        Ftst => vec![rt("__x87rt_tst", vec![])],
+        Fcom | Fcomp | Fcompp | Fucom | Fucomp | Fucompp => {
+            if matches!(mn, Fcompp | Fucompp) {
+                vec![rt("__x87rt_com", vec![konst(1), konst(1)]), rt("__x87rt_free", vec![])]
+            } else {
+                let pop = konst(matches!(mn, Fcomp | Fucomp) as i128);
+                if ins.op_count() >= 1 && ins.op_kind(0) == OpKind::Memory {
+                    if ins.segment_prefix() != Register::None {
+                        return None;
+                    }
+                    let (addr, _) = mem_addr(ins)?;
+                    let h = match ins.memory_size() {
+                        MemorySize::Float32 => "__x87rt_comm32",
+                        MemorySize::Float64 => "__x87rt_comm64",
+                        _ => return None,
+                    };
+                    vec![rt(h, vec![addr, pop])]
+                } else {
+                    // The compared register is the LAST operand: iced models
+                    // `fucom st(i)` as two operands — the implicit ST0 accumulator
+                    // (op0) plus ST(i) (op1) — so reading op0 always yields ST0
+                    // (i=0), comparing st(0) with itself (always equal, C3=1) and
+                    // making every `x == 0` test succeed (BusyBox awk's `a/b` then
+                    // always raised "Division by zero"). A bare `fucom`/`fucompp`
+                    // (op_count 0) is an implicit st(1). Mirrors the static x87_try.
+                    let i = if ins.op_count() >= 1
+                        && ins.op_register(ins.op_count() - 1).is_st()
+                    {
+                        ins.op_register(ins.op_count() - 1).number() as i128
+                    } else {
+                        1
+                    };
+                    vec![rt("__x87rt_com", vec![konst(i), pop])]
+                }
+            }
+        }
+        Fxam => vec![rt("__x87rt_fxam", vec![])],
+        Fnstsw | Fstsw => match ins.op_kind(0) {
+            OpKind::Register => {
+                let rax = Location::Reg(RegId(0));
+                vec![Stmt::Set {
+                    dst: rax.clone(),
+                    expr: combine_write(&rax, 16, x87call("__x87rt_getsw", vec![]), 64),
+                }]
+            }
+            OpKind::Memory => {
+                if ins.segment_prefix() != Register::None {
+                    return None;
+                }
+                let (addr, _) = mem_addr(ins)?;
+                vec![Stmt::Store { addr, value: x87call("__x87rt_getsw", vec![]), ty: Ty::int(16) }]
+            }
+            _ => return None,
+        },
+        Fcmovb | Fcmovbe | Fcmove | Fcmovu | Fcmovnb | Fcmovnbe | Fcmovne | Fcmovnu => {
+            let ri = ins.op_register(1);
+            if !ri.is_st() {
+                return None;
+            }
+            let cc = match mn {
+                Fcmovb => ConditionCode::b,
+                Fcmovbe => ConditionCode::be,
+                Fcmove => ConditionCode::e,
+                Fcmovu => ConditionCode::p,
+                Fcmovnb => ConditionCode::ae,
+                Fcmovnbe => ConditionCode::a,
+                Fcmovne => ConditionCode::ne,
+                _ => ConditionCode::np,
+            };
+            vec![Stmt::CallStmt(x87call(
+                "__x87rt_cmov",
+                vec![cc_to_cond(cc), konst(ri.number() as i128)],
+            ))]
+        }
+        // transcendentals & constant loads (host long double = the x87 IEEE ops).
+        Fyl2x => vec![rt("__x87rt_yl2x", vec![])],
+        Fyl2xp1 => vec![rt("__x87rt_yl2xp1", vec![])],
+        F2xm1 => vec![rt("__x87rt_2xm1", vec![])],
+        Fscale => vec![rt("__x87rt_scale", vec![])],
+        Fsin => vec![rt("__x87rt_sin", vec![])],
+        Fcos => vec![rt("__x87rt_cos", vec![])],
+        Fsincos => vec![rt("__x87rt_sincos", vec![])],
+        Fptan => vec![rt("__x87rt_ptan", vec![])],
+        Fpatan => vec![rt("__x87rt_patan", vec![])],
+        Fprem | Fprem1 => vec![rt("__x87rt_prem", vec![])],
+        Fldpi => vec![rt("__x87rt_ldpi", vec![])],
+        Fldl2e => vec![rt("__x87rt_ldl2e", vec![])],
+        Fldl2t => vec![rt("__x87rt_ldl2t", vec![])],
+        Fldlg2 => vec![rt("__x87rt_ldlg2", vec![])],
+        Fldln2 => vec![rt("__x87rt_ldln2", vec![])],
+        Fnclex | Fclex => vec![rt("__x87rt_clear", vec![])],
+        Finit | Fninit => vec![rt("__x87rt_reset", vec![])],
+        Fnop | Wait => vec![Stmt::Nop],
+
+        _ => return None,
+    })
+}
+
+fn x87_try(insn: &Insn, sp: i32, mode: RoundMode) -> Option<Vec<Stmt>> {
+    use Mnemonic::*;
+    let ins = &insn.raw;
+    let mn = ins.mnemonic();
+    let st0 = sp - 1; // depth of current top of stack
+
+    Some(match mn {
+        // --- pushes -------------------------------------------------------
+        Fld | Fild => {
+            let v = x87_src(ins, 0, sp)?;
+            vec![Stmt::Set { dst: fpr(sp)?, expr: v }]
+        }
+        Fld1 => vec![Stmt::Set { dst: fpr(sp)?, expr: x87call("__x87_one", vec![]) }],
+        Fldz => vec![Stmt::Set { dst: fpr(sp)?, expr: x87call("__x87_zero", vec![]) }],
+
+        // --- stores (and pops) -------------------------------------------
+        Fst | Fstp | Fist | Fistp | Fisttp => {
+            let value = Expr::Read(fpr(st0)?);
+            match ins.op_kind(0) {
+                OpKind::Register => {
+                    let r = ins.op_register(0);
+                    if !r.is_st() {
+                        return None;
+                    }
+                    vec![Stmt::Set { dst: fpr(sp - 1 - r.number() as i32)?, expr: value }]
+                }
+                OpKind::Memory => {
+                    if ins.segment_prefix() != Register::None {
+                        return None;
+                    }
+                    let (addr, _) = mem_addr(ins)?;
+                    let h = match (mn, ins.memory_size()) {
+                        (Fst | Fstp, MemorySize::Float32) => "__x87_st32",
+                        (Fst | Fstp, MemorySize::Float64) => "__x87_st64",
+                        (Fst | Fstp, MemorySize::Float80) => "__x87_st80",
+                        // Integer stores truncate; only emitted when proven so.
+                        (Fist | Fistp, MemorySize::Int16) if mode == RoundMode::Trunc => "__x87_ist16",
+                        (Fist | Fistp, MemorySize::Int32) if mode == RoundMode::Trunc => "__x87_ist32",
+                        (Fist | Fistp, MemorySize::Int64) if mode == RoundMode::Trunc => "__x87_ist64",
+                        (Fisttp, MemorySize::Int16) => "__x87_ist16",
+                        (Fisttp, MemorySize::Int32) => "__x87_ist32",
+                        (Fisttp, MemorySize::Int64) => "__x87_ist64",
+                        _ => return None,
+                    };
+                    vec![Stmt::CallStmt(x87call(h, vec![addr, value]))]
+                }
+                _ => return None,
+            }
+        }
+
+        // --- arithmetic ---------------------------------------------------
+        Fadd | Faddp | Fiadd | Fmul | Fmulp | Fimul | Fsub | Fsubp | Fisub | Fsubr | Fsubrp
+        | Fisubr | Fdiv | Fdivp | Fidiv | Fdivr | Fdivrp | Fidivr => {
+            let (op, rev) = match mn {
+                Fadd | Faddp | Fiadd => ("add", false),
+                Fmul | Fmulp | Fimul => ("mul", false),
+                Fsub | Fsubp | Fisub => ("sub", false),
+                Fsubr | Fsubrp | Fisubr => ("sub", true),
+                _ => ("div", matches!(mn, Fdivr | Fdivrp | Fidivr)),
+            };
+            let is_p = matches!(mn, Faddp | Fsubp | Fsubrp | Fmulp | Fdivp | Fdivrp);
+            if is_p {
+                // `fXXXp st(i), st0`: st(i) = st(i) op st0, then pop. Default st1.
+                let di = if ins.op_count() >= 1 && ins.op_register(0).is_st() {
+                    ins.op_register(0).number() as i32
+                } else {
+                    1
+                };
+                let d = sp - 1 - di;
+                let res = x87_arith(op, rev, Expr::Read(fpr(d)?), Expr::Read(fpr(st0)?));
+                vec![Stmt::Set { dst: fpr(d)?, expr: res }]
+            } else if ins.op_kind(0) == OpKind::Memory {
+                // `fadd m` / `fiadd m`: st0 = st0 op mem.
+                let src = x87_src(ins, 0, sp)?;
+                let res = x87_arith(op, rev, Expr::Read(fpr(st0)?), src);
+                vec![Stmt::Set { dst: fpr(st0)?, expr: res }]
+            } else {
+                // `fadd st0, st(i)` or `fadd st(i), st0`: dst is op0.
+                let r0 = ins.op_register(0);
+                let r1 = ins.op_register(1);
+                if !r0.is_st() || !r1.is_st() {
+                    return None;
+                }
+                let d0 = sp - 1 - r0.number() as i32;
+                let d1 = sp - 1 - r1.number() as i32;
+                let res = x87_arith(op, rev, Expr::Read(fpr(d0)?), Expr::Read(fpr(d1)?));
+                vec![Stmt::Set { dst: fpr(d0)?, expr: res }]
+            }
+        }
+
+        // --- unary on st0 -------------------------------------------------
+        Fabs => vec![Stmt::Set { dst: fpr(st0)?, expr: x87call("__x87_abs", vec![Expr::Read(fpr(st0)?)]) }],
+        Fchs => vec![Stmt::Set { dst: fpr(st0)?, expr: x87call("__x87_neg", vec![Expr::Read(fpr(st0)?)]) }],
+        Fsqrt => vec![Stmt::Set { dst: fpr(st0)?, expr: x87call("__x87_sqrt", vec![Expr::Read(fpr(st0)?)]) }],
+        // Round st0 to an integer per the proven rounding mode: floor (-inf),
+        // ceil (+inf), truncate (toward zero), or round-to-nearest-even. The
+        // surrounding control-word setup (`floor`/`ceil`/`(int)x`) selects it.
+        Frndint => {
+            let h = match mode {
+                RoundMode::Down => "__x87_floor",
+                RoundMode::Up => "__x87_ceil",
+                RoundMode::Trunc => "__x87_trunc",
+                RoundMode::Nearest => "__x87_rint",
+            };
+            vec![Stmt::Set { dst: fpr(st0)?, expr: x87call(h, vec![Expr::Read(fpr(st0)?)]) }]
+        }
+        // Partial remainder st0 = st0 - st1*trunc(st0/st1). The hardware reduces by
+        // a bounded amount per execution and re-runs in a `do { fprem } while(C2)`
+        // loop; we compute the *full* fmod in one step and clear C2 (status bit 10)
+        // so the completion loop — `fnstsw; sahf; jp` — exits at once.
+        Fprem | Fprem1 => vec![
+            Stmt::Set {
+                dst: fpr(st0)?,
+                expr: x87call("__x87_fmod", vec![Expr::Read(fpr(st0)?), Expr::Read(fpr(sp - 2)?)]),
+            },
+            Stmt::Set { dst: fsw(), expr: konst(0) },
+        ],
+
+        // --- exchange st0, st(i) (default st1) ----------------------------
+        Fxch => {
+            // iced renders `fxch st(i)` as two operands (`st0, st(i)`); the swap
+            // partner is the operand that is not st0.
+            let di = (0..ins.op_count())
+                .map(|k| ins.op_register(k))
+                .filter(|r| r.is_st())
+                .map(|r| r.number() as i32)
+                .find(|&n| n != 0)
+                .unwrap_or(1);
+            let d = sp - 1 - di;
+            let scratch = fpr_scratch();
+            vec![
+                Stmt::Set { dst: scratch.clone(), expr: Expr::Read(fpr(st0)?) },
+                Stmt::Set { dst: fpr(st0)?, expr: Expr::Read(fpr(d)?) },
+                Stmt::Set { dst: fpr(d)?, expr: Expr::Read(scratch) },
+            ]
+        }
+
+        // --- comparisons setting EFLAGS (P6 fcomi family) -----------------
+        Fcomi | Fcomip | Fucomi | Fucomip => {
+            let r0 = ins.op_register(0);
+            let r1 = ins.op_register(1);
+            if !r0.is_st() || !r1.is_st() {
+                return None;
+            }
+            let a = Expr::Read(fpr(sp - 1 - r0.number() as i32)?);
+            let b = Expr::Read(fpr(sp - 1 - r1.number() as i32)?);
+            let un = x87call("__x87_un", vec![a.clone(), b.clone()]);
+            // comi flags: CF=a<b|unord, ZF=a==b|unord, PF=unord, SF=OF=0.
+            vec![
+                set_flag(FlagKind::Cf, bin(BinOp::Or, x87call("__x87_lt", vec![a.clone(), b.clone()]), un.clone())),
+                set_flag(FlagKind::Zf, bin(BinOp::Or, x87call("__x87_eq", vec![a, b]), un.clone())),
+                set_flag(FlagKind::Pf, un),
+                set_flag(FlagKind::Sf, konst(0)),
+                set_flag(FlagKind::Of, konst(0)),
+            ]
+        }
+
+        // --- status-word compare (32-bit float idiom) ---------------------
+        // `fcom`/`fucom` set the FPU condition bits C0/C2/C3; `fnstsw ax` then
+        // copies them to AX and `sahf`/`test ah` derives the branch. Encode the
+        // bits at their hardware positions (C0=bit8, C2=bit10, C3=bit14) so that
+        // both `sahf` (CF=C0, ZF=C3, PF=C2) and `test ah, imm` read them right.
+        Fcom | Fcomp | Fcompp | Fucom | Fucomp | Fucompp | Ficom | Ficomp | Ftst => {
+            let a = Expr::Read(fpr(st0)?);
+            let b = if ins.mnemonic() == Ftst {
+                x87call("__x87_zero", vec![]) // ftst: compare st(0) against 0.0
+            } else if ins.op_count() == 0 {
+                Expr::Read(fpr(st0 - 1)?) // st1
+            } else {
+                x87_src(ins, ins.op_count() - 1, sp)?
+            };
+            let lt = x87call("__x87_lt", vec![a.clone(), b.clone()]);
+            let eq = x87call("__x87_eq", vec![a.clone(), b.clone()]);
+            let un = x87call("__x87_un", vec![a, b]);
+            let c0 = bin(BinOp::Or, lt, un.clone()); // less | unordered
+            let c3 = bin(BinOp::Or, eq, un.clone()); // equal | unordered
+            let c2 = un; // unordered
+            let word = bin(
+                BinOp::Or,
+                bin(BinOp::Or, bin(BinOp::Shl, c0, konst(8)), bin(BinOp::Shl, c2, konst(10))),
+                bin(BinOp::Shl, c3, konst(14)),
+            );
+            vec![Stmt::Set { dst: fsw(), expr: word }]
+        }
+        // --- classify st(0) into the condition codes (fxam) ----------------
+        // `fxam` sets C3/C2/C1/C0 in the status word to the IEEE class of st(0)
+        // (NaN/Inf/zero/normal/denormal) and C1 to its sign, leaving the stack
+        // unchanged. A following `fnstsw ax; and ax,0x4500; cmp/test` reads them
+        // (e.g. `__sqrt`'s NaN/negative special-casing). The helper encodes the
+        // bits at their hardware positions (C0=bit8, C2=bit10, C1=bit9, C3=bit14),
+        // matching the `fcom` idiom above so `fnstsw` reads them consistently.
+        Fxam => vec![Stmt::Set { dst: fsw(), expr: x87call("__x87_fxam", vec![Expr::Read(fpr(st0)?)]) }],
+        // --- conditional fp move (fcmovcc) --------------------------------
+        // `fcmovcc st(0), st(i)`: st(0) = cond ? st(i) : st(0). The condition reads
+        // the EFLAGS a preceding `fucomi`/`fcomi`/`cmp`/`test` set (CF/ZF/PF). iced's
+        // `condition_code()` does *not* cover the FCMOVcc family (it returns None →
+        // an always-true move), so map the mnemonic to its condition explicitly.
+        Fcmovb | Fcmovbe | Fcmove | Fcmovu | Fcmovnb | Fcmovnbe | Fcmovne | Fcmovnu => {
+            let ri = ins.op_register(1);
+            if !ri.is_st() { return None; }
+            let cc = match mn {
+                Fcmovb => ConditionCode::b,    // CF=1
+                Fcmovbe => ConditionCode::be,  // CF=1 | ZF=1
+                Fcmove => ConditionCode::e,    // ZF=1
+                Fcmovu => ConditionCode::p,    // PF=1 (unordered)
+                Fcmovnb => ConditionCode::ae,  // CF=0
+                Fcmovnbe => ConditionCode::a,  // CF=0 & ZF=0
+                Fcmovne => ConditionCode::ne,  // ZF=0
+                _ => ConditionCode::np,        // Fcmovnu: PF=0
+            };
+            let src = Expr::Read(fpr(sp - 1 - ri.number() as i32)?);
+            let cur = Expr::Read(fpr(st0)?);
+            vec![Stmt::Set { dst: fpr(st0)?, expr: Expr::Select { cond: Box::new(cc_to_cond(cc)), then_: Box::new(src), else_: Box::new(cur) } }]
+        }
+
+        // Store the FPU status word to AX (or memory).
+        Fnstsw | Fstsw => match ins.op_kind(0) {
+            OpKind::Register => {
+                let rax = Location::Reg(RegId(0));
+                vec![Stmt::Set { dst: rax.clone(), expr: combine_write(&rax, 16, Expr::Read(fsw()), 64) }]
+            }
+            OpKind::Memory => {
+                if ins.segment_prefix() != Register::None {
+                    return None;
+                }
+                let (addr, _) = mem_addr(ins)?;
+                vec![Stmt::Store { addr, value: Expr::Read(fsw()), ty: Ty::int(16) }]
+            }
+            _ => return None,
+        },
+
+        // `fstcw`/`fnstcw` store the 16-bit x87 control word. A `Nop` left the
+        // destination unwritten, so a caller reading it back got uninitialised stack
+        // — silently wrong (`_control87`/`_controlfp` returned garbage; found by
+        // funcdiff on dxfix). Store the reset default `0x037F` (all exceptions masked,
+        // extended precision, round-to-nearest) — the value a Linux/ELF process's x87
+        // control word actually holds, so `_control87` reads the correct default. A
+        // pure constant (no runtime FPU state), hence portable (WASM) and safe for the
+        // decompile link (no global reference). The rounding mode a program installs
+        // via `fldcw` is still tracked at compile time by the depth analysis for
+        // `frndint`/`fist`; only reading the *live* CW back through a custom `fldcw`
+        // is unmodelled (rare) — no longer silent garbage.
+        Fnstcw | Fstcw => {
+            let (addr, _) = mem_addr(ins)?;
+            vec![Stmt::Store { addr, value: konst(0x037f), ty: Ty::int(16) }]
+        }
+        // --- control word load / wait / FPU reset: no value the model tracks ----
+        Fldcw | Fnclex | Fclex | Fnop | Wait | Finit | Fninit => vec![Stmt::Nop],
+
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decode a single instruction from raw bytes and lift it.
+    fn one(bytes: &[u8], bits: u32) -> Vec<Stmt> {
+        use iced_x86::{Decoder, DecoderOptions};
+        let mut dec = Decoder::with_ip(bits, bytes, 0x1000, DecoderOptions::NONE);
+        let mut raw = Instruction::default();
+        dec.decode_out(&mut raw);
+        let insn = crate::disasm::Insn {
+            address: 0x1000,
+            len: raw.len(),
+            text: format!("{:?}", raw.mnemonic()),
+            flow: crate::disasm::Flow::Fallthrough,
+            target: None,
+            call_name: None,
+            raw,
+        };
+        lift(&insn, bits)
+    }
+
+    #[test]
+    fn mov_reg_reg() {
+        // mov eax, ebx  (89 d8) in 32-bit
+        let s = one(&[0x89, 0xd8], 32);
+        assert!(matches!(s.as_slice(), [Stmt::Set { .. }]));
+    }
+
+    #[test]
+    fn xlat_updates_only_al_and_rejects_unmodelled_segments() {
+        for (bytes, bits) in [(&[0xd7][..], 16), (&[0xd7][..], 32),
+                              (&[0xd7][..], 64), (&[0x67, 0xd7][..], 32),
+                              (&[0x67, 0xd7][..], 64)] {
+            let statements = one(bytes, bits);
+            assert!(matches!(statements.as_slice(), [Stmt::Set { dst: Location::Reg(RegId(0)), .. }]));
+        }
+        assert!(one(&[0x64, 0xd7], 32).iter().any(|statement| matches!(statement,
+            Stmt::CallStmt(Expr::Call { target: CallTarget::Named(name), .. }) if name.starts_with("asm:"))));
+    }
+
+    #[test]
+    fn xlat_unsigned_index_wraps_address_and_preserves_upper_accumulator() {
+        fn evaluate(expr: &Expr, accumulator: i128, base: i128, address: i128, byte: i128) -> i128 {
+            match expr {
+                Expr::Const(value, _) => *value,
+                Expr::Read(Location::Reg(RegId(0))) => accumulator,
+                Expr::Read(Location::Reg(RegId(3))) => base,
+                Expr::Binary(op, left, right) => {
+                    let a = evaluate(left, accumulator, base, address, byte);
+                    let b = evaluate(right, accumulator, base, address, byte);
+                    match op { BinOp::And => a & b, BinOp::Or => a | b, BinOp::Add => a + b,
+                        other => panic!("unexpected XLAT operation: {other:?}") }
+                }
+                Expr::Load { addr, ty } => {
+                    assert_eq!(*ty, Ty::int(8));
+                    assert_eq!(evaluate(addr, accumulator, base, address, byte), address);
+                    byte
+                }
+                other => panic!("unexpected XLAT expression: {other:?}"),
+            }
+        }
+        for (bytes, bits, address_bits) in [(&[0xd7][..], 16, 16), (&[0xd7][..], 32, 32),
+            (&[0xd7][..], 64, 64), (&[0x67, 0xd7][..], 32, 16), (&[0x67, 0xd7][..], 64, 32)] {
+            let statements = one(bytes, bits);
+            let [Stmt::Set { dst: Location::Reg(RegId(0)), expr }] = statements.as_slice() else { panic!("unexpected XLAT writes") };
+            let base = mask(address_bits) - 127;
+            for index in 0..256i128 {
+                let accumulator = (0x123456789abcde00i128 & mask(bits)) | index;
+                let address = (base + index) & mask(address_bits);
+                let byte = index ^ 0xa5;
+                assert_eq!(evaluate(expr, accumulator, base, address, byte), (accumulator & !0xff) | byte);
+            }
+        }
+    }
+
+    #[test]
+    fn cmp_sets_flags() {
+        // cmp eax, ebx (39 d8): six flag definitions (ZF/SF/CF/OF/PF/AF), no
+        // register write.
+        let s = one(&[0x39, 0xd8], 32);
+        assert_eq!(s.len(), 6);
+        assert!(s.iter().all(|st| matches!(
+            st,
+            Stmt::Set { dst: Location::Flag(_), .. }
+        )));
+    }
+
+    #[test]
+    fn lea_is_address_not_load() {
+        // lea eax, [ebx+4]  (8d 43 04)
+        let s = one(&[0x8d, 0x43, 0x04], 32);
+        match s.as_slice() {
+            [Stmt::Set { expr, .. }] => {
+                // address arithmetic, not a Load
+                assert!(!matches!(expr, Expr::Load { .. }));
+            }
+            _ => panic!("expected single Set, got {:?}", s),
+        }
+    }
+}

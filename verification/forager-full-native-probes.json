@@ -1,0 +1,155 @@
+[
+  {
+    "name": "probe-browser-rvalue-compare.mjs",
+    "result": {
+      "results": [
+        {
+          "counter": 0,
+          "bound": 19,
+          "actual": -1,
+          "expected": -1,
+          "matches": true
+        },
+        {
+          "counter": 18,
+          "bound": 19,
+          "actual": -1,
+          "expected": -1,
+          "matches": true
+        },
+        {
+          "counter": 19,
+          "bound": 19,
+          "actual": 0,
+          "expected": 0,
+          "matches": true
+        },
+        {
+          "counter": 20,
+          "bound": 19,
+          "actual": 1,
+          "expected": 1,
+          "matches": true
+        },
+        {
+          "counter": 100000,
+          "bound": 19,
+          "actual": 1,
+          "expected": 1,
+          "matches": true
+        }
+      ],
+      "matches": true,
+      "scope": "Actual translated RValue comparison; no game entry or simulated conversion"
+    }
+  },
+  {
+    "name": "probe-browser-thread-context.mjs",
+    "result": {
+      "main": {
+        "index": 0,
+        "teb": 61009152,
+        "threadId": 1,
+        "error": 111,
+        "tls": 4660,
+        "depth": 3,
+        "seh": 17767,
+        "x87Control": 3967,
+        "x87Tags": 65343,
+        "x87Top": 3,
+        "x87Ip": 4113,
+        "x87Dp": 8209,
+        "x87Opcode": 505,
+        "fpControl": 525087,
+        "mxcsr": 32640,
+        "x87Byte": 17,
+        "sseByte": 238
+      },
+      "fresh": {
+        "index": 1,
+        "teb": 72365712,
+        "threadId": 2,
+        "error": 0,
+        "tls": 0,
+        "depth": 0,
+        "seh": 0,
+        "x87Control": 895,
+        "x87Tags": 65535,
+        "x87Top": 0,
+        "x87Ip": 0,
+        "x87Dp": 0,
+        "x87Opcode": 0,
+        "fpControl": 524319,
+        "mxcsr": 8064,
+        "x87Byte": 0,
+        "sseByte": 0
+      },
+      "secondary": {
+        "index": 1,
+        "teb": 72365712,
+        "threadId": 2,
+        "error": 222,
+        "tls": 43981,
+        "depth": 5,
+        "seh": 39030,
+        "x87Control": 1919,
+        "x87Tags": 62463,
+        "x87Top": 5,
+        "x87Ip": 4130,
+        "x87Dp": 8226,
+        "x87Opcode": 522,
+        "fpControl": 524575,
+        "mxcsr": 16256,
+        "x87Byte": 34,
+        "sseByte": 221
+      },
+      "alternatingRestores": 24,
+      "recreated": true,
+      "preserved": true
+    }
+  },
+  {
+    "name": "probe-browser-native-input.mjs",
+    "result": {
+      "passed": true,
+      "scope": "Actual native input APIs in the complete translated module, without starting game code",
+      "checks": [
+        "foreground activation succeeds",
+        "active window follows activation",
+        "foreground window follows activation",
+        "activation assigns keyboard focus",
+        "invalid foreground window rejected",
+        "failed activation preserves active window",
+        "show without activation preserves active window",
+        "normal show activates window",
+        "normal show assigns focus",
+        "accepted event 0,87,17,0,1",
+        "asynchronous press",
+        "asynchronous held",
+        "queued state before removal",
+        "peek retains state",
+        "message removal applies held state",
+        "accepted event 0,87,17,0,0",
+        "physical release",
+        "queued state retains key until removal",
+        "queued release",
+        "accepted event 1,0,50,30,0",
+        "client mouse coordinates",
+        "screen message x",
+        "screen message y",
+        "cursor x",
+        "cursor y",
+        "accepted event 2,1,50,30,1",
+        "left mouse held",
+        "accepted event 2,1,50,30,0",
+        "left mouse released",
+        "accepted event 0,160,42,0,1",
+        "accepted event 0,161,54,0,1",
+        "accepted event 0,160,42,0,0",
+        "second shift remains held",
+        "accepted event 0,161,54,0,0",
+        "both shift released"
+      ]
+    }
+  }
+]

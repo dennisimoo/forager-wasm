@@ -1,0 +1,13 @@
+{
+  "chunks": 75,
+  "frames": 444032,
+  "channels": 2,
+  "rate": 44100,
+  "seconds": 10.06875283446712,
+  "gapSeconds": 0,
+  "peak": 0.04268497973680496,
+  "rms": 0.004988761659437464,
+  "mean": -9.493170133189306e-7,
+  "clippedSamples": 0,
+  "maxChunkBoundaryJump": 0.024081023409962654
+}

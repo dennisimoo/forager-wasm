@@ -1,0 +1,1558 @@
+//! IR → compilable C emitter (roadmap §7), first milestone: goto-based C that
+//! recompiles. Structured emission (reusing `structure`) and typed variables
+//! come later; this closes the loop enough to start the verification harness
+//! (§8, "recompiles" level).
+//!
+//! Pipeline: optimized SSA IR → SSA destruction (φ lowering) → C text.
+//! Every value becomes a `uint64_t`; unmodelled instructions are emitted as
+//! comments (their clobbers were already `Undef`), so the output compiles.
+#![allow(dead_code)]
+
+pub mod llvm;
+pub mod structured;
+
+use crate::ir::types::*;
+use std::collections::BTreeSet;
+use std::fmt::Write;
+
+/// Lower φ-nodes out of SSA by inserting, on every incoming edge, a small block
+/// that copies each φ argument into the φ's value, then jumps to the join.
+/// Inserting on *every* edge (not only critical ones) keeps it simple and
+/// correct: copies always live in a dedicated single-pred/single-succ block.
+pub(crate) fn destruct_ssa(func: &mut IrFunction) {
+    let n = func.blocks.len();
+    let mut next_id = func.blocks.iter().map(|b| b.id).max().unwrap_or(0) + 1;
+    let mut new_blocks: Vec<Block> = Vec::new();
+
+    for s in 0..n {
+        let phis: Vec<(ValueId, Vec<ValueId>)> = func.blocks[s]
+            .stmts
+            .iter()
+            .filter_map(|st| match st {
+                Stmt::Assign { dst, expr: Expr::Phi(args) } => Some((*dst, args.clone())),
+                _ => None,
+            })
+            .collect();
+        if phis.is_empty() {
+            continue;
+        }
+        let preds = func.blocks[s].pred.clone();
+        let s_id = func.blocks[s].id;
+        for (i, &p) in preds.iter().enumerate() {
+            let mid = next_id;
+            next_id += 1;
+            let mut stmts: Vec<Stmt> = phis
+                .iter()
+                .map(|(dst, args)| Stmt::Assign {
+                    dst: *dst,
+                    expr: Expr::Use(args[i]),
+                })
+                .collect();
+            stmts.push(Stmt::Jump(BlockId(s_id)));
+            new_blocks.push(Block {
+                id: mid,
+                addr: 0,
+                stmts,
+                succ: vec![s_id],
+                pred: vec![p],
+            });
+            // Redirect predecessor p's terminator edge s_id -> mid.
+            let pb = func.blocks.iter_mut().find(|b| b.id == p).unwrap();
+            for su in pb.succ.iter_mut() {
+                if *su == s_id {
+                    *su = mid;
+                }
+            }
+            redirect_terminator(pb.stmts.last_mut(), s_id, mid);
+        }
+        // The join's predecessors are now the new copy blocks; drop its φs.
+        func.blocks[s].pred = (0..preds.len() as u32).map(|k| next_id - preds.len() as u32 + k).collect();
+        func.blocks[s]
+            .stmts
+            .retain(|st| !matches!(st, Stmt::Assign { expr: Expr::Phi(_), .. }));
+    }
+    func.blocks.extend(new_blocks);
+}
+
+fn redirect_terminator(last: Option<&mut Stmt>, from: u32, to: u32) {
+    if let Some(st) = last {
+        match st {
+            Stmt::Jump(b) => {
+                if b.0 == from {
+                    b.0 = to;
+                }
+            }
+            Stmt::Branch { taken, fallthrough, .. } => {
+                if taken.0 == from {
+                    taken.0 = to;
+                }
+                if fallthrough.0 == from {
+                    fallthrough.0 = to;
+                }
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for (_, b) in cases.iter_mut() {
+                    if b.0 == from {
+                        b.0 = to;
+                    }
+                }
+                if default.0 == from {
+                    default.0 = to;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Scalar SSE float runtime helpers. XMM scalar values are carried through the
+/// integer IR as bit patterns in `uint64_t`; these reinterpret the bits, compute
+/// with native (IEEE-754) `float`/`double`, and reinterpret back, so the
+/// decompiled floating-point arithmetic is bit-exact with the original binary.
+pub(crate) const FLOAT_HELPERS: &str = concat!(
+    "static inline uint64_t __aret_memory_fence(void){__atomic_thread_fence(__ATOMIC_SEQ_CST);return 0;}\n",
+    "typedef union{uint32_t u;float f;}__fp32;typedef union{uint64_t u;double d;}__fp64;\n",
+    "static inline uint64_t __fp_f32(float f){__fp32 t;t.f=f;return t.u;}\n",
+    "static inline float __fp_g32(uint64_t b){__fp32 t;t.u=(uint32_t)b;return t.f;}\n",
+    "static inline uint64_t __fp_f64(double d){__fp64 t;t.d=d;return t.u;}\n",
+    "static inline double __fp_g64(uint64_t b){__fp64 t;t.u=b;return t.d;}\n",
+    "static inline uint64_t __fp_add32(uint64_t a,uint64_t b){return __fp_f32(__fp_g32(a)+__fp_g32(b));}\n",
+    "static inline uint64_t __fp_sub32(uint64_t a,uint64_t b){return __fp_f32(__fp_g32(a)-__fp_g32(b));}\n",
+    "static inline uint64_t __fp_mul32(uint64_t a,uint64_t b){return __fp_f32(__fp_g32(a)*__fp_g32(b));}\n",
+    "static inline uint64_t __fp_div32(uint64_t a,uint64_t b){return __fp_f32(__fp_g32(a)/__fp_g32(b));}\n",
+    "static inline uint64_t __fp_add64(uint64_t a,uint64_t b){return __fp_f64(__fp_g64(a)+__fp_g64(b));}\n",
+    "static inline uint64_t __fp_sub64(uint64_t a,uint64_t b){return __fp_f64(__fp_g64(a)-__fp_g64(b));}\n",
+    "static inline uint64_t __fp_mul64(uint64_t a,uint64_t b){return __fp_f64(__fp_g64(a)*__fp_g64(b));}\n",
+    "static inline uint64_t __fp_div64(uint64_t a,uint64_t b){return __fp_f64(__fp_g64(a)/__fp_g64(b));}\n",
+    "static inline uint64_t __fp_sqrt32(uint64_t a){return __fp_f32(__builtin_sqrtf(__fp_g32(a)));}\n",
+    "static inline uint64_t __fp_sqrt64(uint64_t a){return __fp_f64(__builtin_sqrt(__fp_g64(a)));}\n",
+    "static inline uint64_t __fp_i32_32(uint64_t i){return __fp_f32((float)(int32_t)i);}\n",
+    "static inline uint64_t __fp_i64_32(uint64_t i){return __fp_f32((float)(int64_t)i);}\n",
+    "static inline uint64_t __fp_i32_64(uint64_t i){return __fp_f64((double)(int32_t)i);}\n",
+    "static inline uint64_t __fp_i64_64(uint64_t i){return __fp_f64((double)(int64_t)i);}\n",
+    "static inline uint64_t __fp_32_i32(uint64_t a){return (uint64_t)(int64_t)(int32_t)__fp_g32(a);}\n",
+    "static inline uint64_t __fp_32_i64(uint64_t a){return (uint64_t)(int64_t)__fp_g32(a);}\n",
+    "static inline uint64_t __fp_64_i32(uint64_t a){return (uint64_t)(int64_t)(int32_t)__fp_g64(a);}\n",
+    "static inline uint64_t __fp_64_i64(uint64_t a){return (uint64_t)(int64_t)__fp_g64(a);}\n",
+    "static inline uint64_t __fp_32_64(uint64_t a){return __fp_f64((double)__fp_g32(a));}\n",
+    "static inline uint64_t __fp_64_32(uint64_t a){return __fp_f32((float)__fp_g64(a));}\n",
+    "static inline uint64_t __fp_lt32(uint64_t a,uint64_t b){return __fp_g32(a)<__fp_g32(b);}\n",
+    "static inline uint64_t __fp_eq32(uint64_t a,uint64_t b){return __fp_g32(a)==__fp_g32(b);}\n",
+    "static inline uint64_t __fp_un32(uint64_t a,uint64_t b){float x=__fp_g32(a),y=__fp_g32(b);return x!=x||y!=y;}\n",
+    "static inline uint64_t __fp_lt64(uint64_t a,uint64_t b){return __fp_g64(a)<__fp_g64(b);}\n",
+    "static inline uint64_t __fp_eq64(uint64_t a,uint64_t b){return __fp_g64(a)==__fp_g64(b);}\n",
+    "static inline uint64_t __fp_un64(uint64_t a,uint64_t b){double x=__fp_g64(a),y=__fp_g64(b);return x!=x||y!=y;}\n",
+    // Packed integer lanes (two 32-bit lanes per 64-bit half), no carry across lanes.
+    "static inline uint64_t __pi_add32(uint64_t a,uint64_t b){uint32_t l=(uint32_t)a+(uint32_t)b,h=(uint32_t)(a>>32)+(uint32_t)(b>>32);return (uint64_t)l|((uint64_t)h<<32);}\n",
+    "static inline uint64_t __pi_sub32(uint64_t a,uint64_t b){uint32_t l=(uint32_t)a-(uint32_t)b,h=(uint32_t)(a>>32)-(uint32_t)(b>>32);return (uint64_t)l|((uint64_t)h<<32);}\n",
+    "static inline uint64_t __pi_eq32(uint64_t a,uint64_t b){uint32_t l=(uint32_t)a==(uint32_t)b?~0u:0,h=(uint32_t)(a>>32)==(uint32_t)(b>>32)?~0u:0;return (uint64_t)l|((uint64_t)h<<32);}\n",
+    "static inline uint64_t __pi_gt32(uint64_t a,uint64_t b){uint32_t l=(int32_t)a>(int32_t)b?~0u:0,h=(int32_t)(a>>32)>(int32_t)(b>>32)?~0u:0;return (uint64_t)l|((uint64_t)h<<32);}\n",
+    "static inline uint64_t __pi_shuf_lo(uint64_t lo,uint64_t hi,uint64_t m){uint64_t a=((m&3)<2?lo:hi)>>(((m&3)&1)*32),b=(((m>>2)&3)<2?lo:hi)>>((((m>>2)&3)&1)*32);return (a&0xffffffff)|((b&0xffffffff)<<32);}\n",
+    // pshuflw/pshufhw: shuffle the four 16-bit words within one 64-bit half per the
+    // immediate (2 bits select each source word) — used by the SSE2 broadcast
+    // idiom (`movd; pshuflw ...,0; pshufd ...,0`).
+    "static inline uint64_t __pi_shufw(uint64_t x,uint32_t imm){uint64_t r=0;for(int i=0;i<4;i++){uint16_t w=(uint16_t)(x>>(((imm>>(i*2))&3)*16));r|=(uint64_t)w<<(i*16);}return r;}\n",
+    "static inline uint64_t __pi_shuf_hi(uint64_t lo,uint64_t hi,uint64_t m){uint64_t a=(((m>>4)&3)<2?lo:hi)>>((((m>>4)&3)&1)*32),b=(((m>>6)&3)<2?lo:hi)>>((((m>>6)&3)&1)*32);return (a&0xffffffff)|((b&0xffffffff)<<32);}\n",
+    "static inline uint64_t __pi_add16(uint64_t a,uint64_t b){uint64_t r=0;for(int i=0;i<64;i+=16)r|=(uint64_t)(uint16_t)((a>>i)+(b>>i))<<i;return r;}\n",
+    // Unpack-low helpers (apply to the high halves to get the unpack-high ops).
+    "static inline uint64_t __pi_unpcklwd_lo(uint64_t d,uint64_t s){return (uint64_t)(uint16_t)d|((uint64_t)(uint16_t)s<<16)|((uint64_t)(uint16_t)(d>>16)<<32)|((uint64_t)(uint16_t)(s>>16)<<48);}\n",
+    "static inline uint64_t __pi_unpcklwd_hi(uint64_t d,uint64_t s){return (uint64_t)(uint16_t)(d>>32)|((uint64_t)(uint16_t)(s>>32)<<16)|((uint64_t)(uint16_t)(d>>48)<<32)|((uint64_t)(uint16_t)(s>>48)<<48);}\n",
+    "static inline uint64_t __pi_unpckldq_lo(uint64_t d,uint64_t s){return (d&0xffffffff)|((s&0xffffffff)<<32);}\n",
+    "static inline uint64_t __pi_unpckldq_hi(uint64_t d,uint64_t s){return (d>>32)|((s>>32)<<32);}\n",
+    "static inline uint64_t __pi_gt16(uint64_t a,uint64_t b){uint64_t r=0;for(int i=0;i<64;i+=16)r|=(uint64_t)((int16_t)(a>>i)>(int16_t)(b>>i)?0xffffu:0)<<i;return r;}\n",
+    // Packed compare, byte/word granularity (one 64-bit half at a time), used by
+    // the SSE2 string scanners (strlen/memchr: `pcmpeqb` + `pmovmskb`).
+    "static inline uint64_t __pi_eq8(uint64_t a,uint64_t b){uint64_t r=0;for(int i=0;i<64;i+=8)r|=(uint64_t)((uint8_t)(a>>i)==(uint8_t)(b>>i)?0xffu:0)<<i;return r;}\n",
+    "static inline uint64_t __pi_eq16(uint64_t a,uint64_t b){uint64_t r=0;for(int i=0;i<64;i+=16)r|=(uint64_t)((uint16_t)(a>>i)==(uint16_t)(b>>i)?0xffffu:0)<<i;return r;}\n",
+    "static inline uint64_t __pi_gt8(uint64_t a,uint64_t b){uint64_t r=0;for(int i=0;i<64;i+=8)r|=(uint64_t)((int8_t)(a>>i)>(int8_t)(b>>i)?0xffu:0)<<i;return r;}\n",
+    // pmovmskb: the high bit of each of the 16 bytes -> a 16-bit mask (low half
+    // bytes 0..7, high half bytes 8..15).
+    "static inline uint32_t __pi_mskb(uint64_t lo,uint64_t hi){uint32_t m=0;for(int i=0;i<8;i++){m|=((uint32_t)((lo>>(i*8+7))&1))<<i;m|=((uint32_t)((hi>>(i*8+7))&1))<<(i+8);}return m;}\n",
+    "static inline uint64_t __pi_muludq(uint64_t a,uint64_t b){return (uint64_t)(uint32_t)a*(uint32_t)b;}\n",
+    "static inline uint64_t __pi_subus16(uint64_t a,uint64_t b){uint64_t r=0;for(int i=0;i<64;i+=16){uint16_t x=(uint16_t)(a>>i),y=(uint16_t)(b>>i);r|=(uint64_t)(uint16_t)(x>y?x-y:0)<<i;}return r;}\n",
+    // Byte/word lane add & sub (wrap per lane), word multiply-low (SSE2 pixel/vectorized code).
+    "static inline uint64_t __pi_add8(uint64_t a,uint64_t b){uint64_t r=0;for(int i=0;i<64;i+=8)r|=(uint64_t)(uint8_t)((a>>i)+(b>>i))<<i;return r;}\n",
+    "static inline uint64_t __pi_sub8(uint64_t a,uint64_t b){uint64_t r=0;for(int i=0;i<64;i+=8)r|=(uint64_t)(uint8_t)((a>>i)-(b>>i))<<i;return r;}\n",
+    "static inline uint64_t __pi_sub16(uint64_t a,uint64_t b){uint64_t r=0;for(int i=0;i<64;i+=16)r|=(uint64_t)(uint16_t)((a>>i)-(b>>i))<<i;return r;}\n",
+    "static inline uint64_t __pi_mullw(uint64_t a,uint64_t b){uint64_t r=0;for(int i=0;i<64;i+=16)r|=(uint64_t)(uint16_t)((uint16_t)(a>>i)*(uint16_t)(b>>i))<<i;return r;}\n",
+    // Packed lane shifts by a scalar count (same count for every lane; count>=width -> 0,
+    // arithmetic saturates the count to width-1). 32-bit and 16-bit lanes.
+    "static inline uint64_t __pi_sll32(uint64_t a,uint64_t c){if(c>31)return 0;uint32_t l=(uint32_t)a<<c,h=(uint32_t)(a>>32)<<c;return (uint64_t)l|((uint64_t)h<<32);}\n",
+    "static inline uint64_t __pi_srl32(uint64_t a,uint64_t c){if(c>31)return 0;uint32_t l=(uint32_t)a>>c,h=(uint32_t)(a>>32)>>c;return (uint64_t)l|((uint64_t)h<<32);}\n",
+    "static inline uint64_t __pi_sra32(uint64_t a,uint64_t c){if(c>31)c=31;int32_t l=(int32_t)(uint32_t)a>>c,h=(int32_t)(uint32_t)(a>>32)>>c;return (uint64_t)(uint32_t)l|((uint64_t)(uint32_t)h<<32);}\n",
+    "static inline uint64_t __pi_sll16(uint64_t a,uint64_t c){if(c>15)return 0;uint64_t r=0;for(int i=0;i<64;i+=16)r|=(uint64_t)(uint16_t)((uint16_t)(a>>i)<<c)<<i;return r;}\n",
+    "static inline uint64_t __pi_srl16(uint64_t a,uint64_t c){if(c>15)return 0;uint64_t r=0;for(int i=0;i<64;i+=16)r|=(uint64_t)(uint16_t)((uint16_t)(a>>i)>>c)<<i;return r;}\n",
+    "static inline uint64_t __pi_sra16(uint64_t a,uint64_t c){if(c>15)c=15;uint64_t r=0;for(int i=0;i<64;i+=16)r|=(uint64_t)(uint16_t)((int16_t)(a>>i)>>c)<<i;return r;}\n",
+    // Pack with saturation: packuswb (word->unsigned byte), packssdw (dword->signed word).
+    // Each takes 4 words (8 dwords) split across the two source 64-bit halves — the low
+    // half of the result comes from the first operand, the high half from the second.
+    "static inline uint64_t __pi_packuswb(uint64_t a,uint64_t b){uint64_t r=0;for(int i=0;i<4;i++){int16_t w=(int16_t)(a>>(i*16));r|=(uint64_t)(uint8_t)(w<0?0:w>255?255:w)<<(i*8);}for(int i=0;i<4;i++){int16_t w=(int16_t)(b>>(i*16));r|=(uint64_t)(uint8_t)(w<0?0:w>255?255:w)<<((i+4)*8);}return r;}\n",
+    "static inline uint64_t __pi_packssdw(uint64_t a,uint64_t b){uint64_t r=0;for(int i=0;i<2;i++){int32_t d=(int32_t)(uint32_t)(a>>(i*32));int16_t w=d<-32768?-32768:d>32767?32767:d;r|=(uint64_t)(uint16_t)w<<(i*16);}for(int i=0;i<2;i++){int32_t d=(int32_t)(uint32_t)(b>>(i*32));int16_t w=d<-32768?-32768:d>32767?32767:d;r|=(uint64_t)(uint16_t)w<<((i+2)*16);}return r;}\n",
+    // Unpack-low bytes (apply to the high 32 bits of each half for the *hi variant).
+    "static inline uint64_t __pi_unpcklbw_lo(uint64_t d,uint64_t s){uint64_t r=0;for(int i=0;i<4;i++){r|=(uint64_t)(uint8_t)(d>>(i*8))<<(i*16);r|=(uint64_t)(uint8_t)(s>>(i*8))<<(i*16+8);}return r;}\n",
+    "static inline uint64_t __pi_unpcklbw_hi(uint64_t d,uint64_t s){uint64_t r=0;for(int i=0;i<4;i++){r|=(uint64_t)(uint8_t)(d>>(i*8+32))<<(i*16);r|=(uint64_t)(uint8_t)(s>>(i*8+32))<<(i*16+8);}return r;}\n",
+    // pshufb (SSSE3): each of the 8 output bytes = dst[ctrl&15] over the full 16-byte
+    // register (dlo|dhi), or 0 when the control byte's bit 7 is set. `ctrl` is one 64-bit
+    // control half; `dlo`/`dhi` are the whole destination.
+    "static inline uint64_t __pi_pshufb(uint64_t dlo,uint64_t dhi,uint64_t ctrl){uint64_t r=0;for(int i=0;i<8;i++){uint8_t c=(uint8_t)(ctrl>>(i*8));uint8_t b=(c&0x80)?0:((c&15)<8?(uint8_t)(dlo>>((c&15)*8)):(uint8_t)(dhi>>(((c&15)-8)*8)));r|=(uint64_t)b<<(i*8);}return r;}\n",
+    // Packed single-precision (4 floats per 128-bit reg, 2 per 64-bit half),
+    // bit-exact via native IEEE-754 float per lane.
+    "static inline uint64_t __ps_add(uint64_t a,uint64_t b){uint32_t l=(uint32_t)__fp_f32(__fp_g32(a)+__fp_g32(b)),h=(uint32_t)__fp_f32(__fp_g32(a>>32)+__fp_g32(b>>32));return (uint64_t)l|((uint64_t)h<<32);}\n",
+    "static inline uint64_t __ps_sub(uint64_t a,uint64_t b){uint32_t l=(uint32_t)__fp_f32(__fp_g32(a)-__fp_g32(b)),h=(uint32_t)__fp_f32(__fp_g32(a>>32)-__fp_g32(b>>32));return (uint64_t)l|((uint64_t)h<<32);}\n",
+    "static inline uint64_t __ps_mul(uint64_t a,uint64_t b){uint32_t l=(uint32_t)__fp_f32(__fp_g32(a)*__fp_g32(b)),h=(uint32_t)__fp_f32(__fp_g32(a>>32)*__fp_g32(b>>32));return (uint64_t)l|((uint64_t)h<<32);}\n",
+    "static inline uint64_t __ps_div(uint64_t a,uint64_t b){uint32_t l=(uint32_t)__fp_f32(__fp_g32(a)/__fp_g32(b)),h=(uint32_t)__fp_f32(__fp_g32(a>>32)/__fp_g32(b>>32));return (uint64_t)l|((uint64_t)h<<32);}\n",
+    "static inline uint64_t __ps_min(uint64_t a,uint64_t b){uint32_t l=__fp_g32(a)<__fp_g32(b)?(uint32_t)a:(uint32_t)b,h=__fp_g32(a>>32)<__fp_g32(b>>32)?(uint32_t)(a>>32):(uint32_t)(b>>32);return (uint64_t)l|((uint64_t)h<<32);}\n",
+    "static inline uint64_t __ps_max(uint64_t a,uint64_t b){uint32_t l=__fp_g32(a)>__fp_g32(b)?(uint32_t)a:(uint32_t)b,h=__fp_g32(a>>32)>__fp_g32(b>>32)?(uint32_t)(a>>32):(uint32_t)(b>>32);return (uint64_t)l|((uint64_t)h<<32);}\n",
+    "static inline uint64_t __ps_sqrt(uint64_t a){uint32_t l=(uint32_t)__fp_f32(__builtin_sqrtf(__fp_g32(a))),h=(uint32_t)__fp_f32(__builtin_sqrtf(__fp_g32(a>>32)));return (uint64_t)l|((uint64_t)h<<32);}\n",
+    "static inline uint64_t __ps_cvtdq(uint64_t a){uint32_t l=(uint32_t)__fp_f32((float)(int32_t)(uint32_t)a),h=(uint32_t)__fp_f32((float)(int32_t)(uint32_t)(a>>32));return (uint64_t)l|((uint64_t)h<<32);}\n",
+    "static inline uint32_t __ps_cmp1(float x,float y,int p){int r;switch(p&7){case 0:r=x==y;break;case 1:r=x<y;break;case 2:r=x<=y;break;case 3:r=(x!=x||y!=y);break;case 4:r=!(x==y);break;case 5:r=!(x<y);break;case 6:r=!(x<=y);break;default:r=!(x!=x||y!=y);}return r?0xffffffffu:0u;}\n",
+    "static inline uint64_t __ps_cmp(uint64_t a,uint64_t b,uint64_t p){uint32_t l=__ps_cmp1(__fp_g32(a),__fp_g32(b),(int)p),h=__ps_cmp1(__fp_g32(a>>32),__fp_g32(b>>32),(int)p);return (uint64_t)l|((uint64_t)h<<32);}\n",
+    "static inline uint64_t __ps_movmsk(uint64_t lo,uint64_t hi){return ((lo>>31)&1)|(((lo>>63)&1)<<1)|(((hi>>31)&1)<<2)|(((hi>>63)&1)<<3);}\n",
+    // Wide integer (64-bit 1-operand mul/div via 128-bit), byte swap, bit scan.
+    // `__int128` only exists on 64-bit targets; on -m32 (where the transpiler's
+    // stack model runs) use bit-exact software equivalents.
+    // x86 `div`/`idiv` raise #DE on a zero divisor *or* a quotient that overflows
+    // the destination; the hardware does NOT silently truncate. Trap so a
+    // transpiled binary crashes deterministically where the original would,
+    // never continuing with a wrong value. (`__builtin_trap` is a guaranteed
+    // abort with no library dependency; the exact signal is immaterial — we do
+    // not model Windows SEH for hardware exceptions anyway.)
+    "static inline void __ix_diverr(void){ __builtin_trap(); }\n",
+    // 32-bit forms: edx:eax / r/m32. `n` is the 64-bit dividend, `d` the divisor.
+    "static inline uint32_t __ix_udiv32(uint64_t n,uint32_t d){ if(!d)__ix_diverr(); uint64_t q=n/d; if(q>0xffffffffull)__ix_diverr(); return (uint32_t)q; }\n",
+    "static inline uint32_t __ix_umod32(uint64_t n,uint32_t d){ if(!d)__ix_diverr(); if(n/d>0xffffffffull)__ix_diverr(); return (uint32_t)(n%d); }\n",
+    "static inline int32_t __ix_idiv32(uint64_t n,uint32_t d){ if(!d)__ix_diverr(); int32_t dd=(int32_t)d; if(dd==-1&&n==0x8000000000000000ull)__ix_diverr(); int64_t q=(int64_t)n/dd; if(q>2147483647ll||q<-2147483648ll)__ix_diverr(); return (int32_t)q; }\n",
+    "static inline int32_t __ix_imod32(uint64_t n,uint32_t d){ if(!d)__ix_diverr(); int32_t dd=(int32_t)d; if(dd==-1&&n==0x8000000000000000ull)__ix_diverr(); int64_t q=(int64_t)n/dd; if(q>2147483647ll||q<-2147483648ll)__ix_diverr(); return (int32_t)((int64_t)n%dd); }\n",
+    "#if defined(__SIZEOF_INT128__)\n",
+    "typedef unsigned __int128 __u128;typedef __int128 __i128;\n",
+    "static inline uint64_t __ix_mul64hi(uint64_t a,uint64_t b){return (uint64_t)(((__u128)a*b)>>64);}\n",
+    "static inline uint64_t __ix_imul64hi(uint64_t a,uint64_t b){return (uint64_t)(((__i128)(int64_t)a*(int64_t)b)>>64);}\n",
+    "static inline uint64_t __ix_udiv(uint64_t hi,uint64_t lo,uint64_t d){if(!d)__ix_diverr();__u128 q=(((__u128)hi<<64)|lo)/d;if(q>(__u128)0xffffffffffffffffull)__ix_diverr();return (uint64_t)q;}\n",
+    "static inline uint64_t __ix_umod(uint64_t hi,uint64_t lo,uint64_t d){if(!d)__ix_diverr();__u128 n=((__u128)hi<<64)|lo;if(n/d>(__u128)0xffffffffffffffffull)__ix_diverr();return (uint64_t)(n%d);}\n",
+    "static inline uint64_t __ix_idiv(uint64_t hi,uint64_t lo,uint64_t d){if(!d)__ix_diverr();__i128 n=(__i128)(((__u128)hi<<64)|lo),q=n/(__i128)(int64_t)d;if(q>(__i128)0x7fffffffffffffffll||q<-(__i128)0x8000000000000000ull)__ix_diverr();return (uint64_t)q;}\n",
+    "static inline uint64_t __ix_imod(uint64_t hi,uint64_t lo,uint64_t d){if(!d)__ix_diverr();__i128 n=(__i128)(((__u128)hi<<64)|lo),q=n/(__i128)(int64_t)d;if(q>(__i128)0x7fffffffffffffffll||q<-(__i128)0x8000000000000000ull)__ix_diverr();return (uint64_t)(n%(__i128)(int64_t)d);}\n",
+    "#else\n",
+    "static inline uint64_t __ix_mul64hi(uint64_t a,uint64_t b){uint64_t al=(uint32_t)a,ah=a>>32,bl=(uint32_t)b,bh=b>>32;uint64_t ll=al*bl,lh=al*bh,hl=ah*bl,hh=ah*bh;uint64_t cr=(ll>>32)+(uint32_t)lh+(uint32_t)hl;return hh+(lh>>32)+(hl>>32)+(cr>>32);}\n",
+    "static inline uint64_t __ix_imul64hi(uint64_t a,uint64_t b){uint64_t hi=__ix_mul64hi(a,b);if((int64_t)a<0)hi-=b;if((int64_t)b<0)hi-=a;return hi;}\n",
+    // NB: the -m32 software 128/64 division below traps on a zero divisor but does
+    // not yet detect 64-bit *quotient overflow* (would need `__ix_divmod128` to
+    // report a set quotient bit >= 64). Only reachable from a 64-bit-source `div`
+    // (absent from 32-bit PEs / the cpudiff corpus); left until 64-bit lifting is
+    // exercised so the check ships tested, not guessed.
+    "static inline void __ix_divmod128(uint64_t hi,uint64_t lo,uint64_t d,uint64_t*qp,uint64_t*rp){uint64_t q=0,r=0;for(int i=127;i>=0;i--){r=(r<<1)|((i>=64?(hi>>(i-64)):(lo>>i))&1);if(d&&r>=d){r-=d;if(i<64)q|=(uint64_t)1<<i;}}*qp=q;*rp=r;}\n",
+    "static inline uint64_t __ix_udiv(uint64_t hi,uint64_t lo,uint64_t d){uint64_t q,r;if(!d)__ix_diverr();__ix_divmod128(hi,lo,d,&q,&r);return q;}\n",
+    "static inline uint64_t __ix_umod(uint64_t hi,uint64_t lo,uint64_t d){uint64_t q,r;if(!d)__ix_diverr();__ix_divmod128(hi,lo,d,&q,&r);return r;}\n",
+    "static inline uint64_t __ix_idiv(uint64_t hi,uint64_t lo,uint64_t d){if(!d)__ix_diverr();int neg=0;uint64_t nh=hi,nl=lo;if((int64_t)hi<0){neg^=1;nl=~lo+1;nh=~hi+(nl==0);}uint64_t dd=d;if((int64_t)d<0){neg^=1;dd=(uint64_t)(-(int64_t)d);}uint64_t q,r;__ix_divmod128(nh,nl,dd,&q,&r);return neg?(uint64_t)(-(int64_t)q):q;}\n",
+    "static inline uint64_t __ix_imod(uint64_t hi,uint64_t lo,uint64_t d){if(!d)__ix_diverr();int neg=(int64_t)hi<0;uint64_t nh=hi,nl=lo;if(neg){nl=~lo+1;nh=~hi+(nl==0);}uint64_t dd=(int64_t)d<0?(uint64_t)(-(int64_t)d):d;uint64_t q,r;__ix_divmod128(nh,nl,dd,&q,&r);return neg?(uint64_t)(-(int64_t)r):r;}\n",
+    "#endif\n",
+    // x86 parity flag: set iff the low byte of the result has an even number of
+    // set bits (`__builtin_parity` returns 1 for odd, so PF is its negation).
+    "static inline uint64_t __ix_pf(uint64_t x){return !__builtin_parity((unsigned)(x&0xff));}\n",
+    // cpuid: run the *real* host cpuid (a user-mode instruction Wine also lets
+    // through), returning the requested result register (0=eax,1=ebx,2=ecx,3=edx)
+    // for (leaf, subleaf). The CRT uses it to pick SSE/AVX code paths; the host's
+    // features are what the transpiled binary actually runs on, so this is exact.
+    "#ifndef __wasm__\n",
+    "#include <cpuid.h>\n",
+    // We mask off the SSE4.1/4.2 and AVX/AVX2/AVX-512 feature bits (plus the
+    // AVX-dependent FMA/F16C and OSXSAVE) so feature dispatchers (notably the CRT's
+    // `__isa_available`) pick the SSE2 code paths, which we lift exactly — the
+    // SSE4.2 string ops (`pcmpistri`/`pcmpestri`) and the VEX-encoded AVX ops
+    // (`vpxor`, `vmovdqu`, …) we do not model. Sound: a CPU with only SSE2 is a
+    // valid configuration and the SSE2 paths compute identically (just scalar/
+    // 16-byte instead of wider).
+    "static inline uint32_t __ix_cpuid(uint32_t leaf,uint32_t sub,uint32_t which){unsigned a=0,b=0,c=0,d=0;__get_cpuid_count(leaf,sub,&a,&b,&c,&d);if(leaf==1)c&=~((1u<<19)|(1u<<20)|(1u<<23)|(1u<<27)|(1u<<28)|(1u<<12)|(1u<<29));if(leaf==7&&sub==0)b&=~((1u<<5)|(1u<<16)|(1u<<17)|(1u<<21)|(1u<<28)|(1u<<30)|(1u<<31));return which==0?a:which==1?b:which==2?c:d;}\n",
+    // xgetbv: read the extended control register (XCR0) -> edx:eax. The CRT reads
+    // it (after cpuid reports OSXSAVE) to confirm OS-enabled AVX state; the binary
+    // only reaches it when the host supports it, so the real instruction is safe.
+    // Encoded as raw bytes (0f 01 d0) so it assembles without -mxsave.
+    "static inline uint64_t __ix_xgetbv(uint32_t ecx){uint32_t a,d;__asm__ __volatile__(\".byte 0x0f,0x01,0xd0\":\"=a\"(a),\"=d\"(d):\"c\"(ecx));return (uint64_t)a|((uint64_t)d<<32);}\n",
+    "#else\n",
+    "static inline uint32_t __ix_cpuid(uint32_t leaf,uint32_t sub,uint32_t which){(void)leaf;(void)sub;(void)which;return 0;}\n",
+    "static inline uint64_t __ix_xgetbv(uint32_t ecx){(void)ecx;return 3;}\n",
+    "#endif\n",
+    "static inline uint64_t __ix_bswap32(uint64_t x){return __builtin_bswap32((uint32_t)x);}\n",
+    "static inline uint64_t __ix_bswap64(uint64_t x){return __builtin_bswap64(x);}\n",
+    "static inline uint64_t __ix_bsf32(uint64_t x){return (uint32_t)x?__builtin_ctz((uint32_t)x):0;}\n",
+    "static inline uint64_t __ix_bsr32(uint64_t x){return (uint32_t)x?31-__builtin_clz((uint32_t)x):0;}\n",
+    "static inline uint64_t __ix_bsf64(uint64_t x){return x?__builtin_ctzll(x):0;}\n",
+    "static inline uint64_t __ix_bsr64(uint64_t x){return x?63-__builtin_clzll(x):0;}\n",
+    "static inline uint64_t __ix_tzcnt32(uint64_t x){return (uint32_t)x?__builtin_ctz((uint32_t)x):32;}\n",
+    "static inline uint64_t __ix_lzcnt32(uint64_t x){return (uint32_t)x?__builtin_clz((uint32_t)x):32;}\n",
+    "static inline uint64_t __ix_tzcnt64(uint64_t x){return x?__builtin_ctzll(x):64;}\n",
+    "static inline uint64_t __ix_lzcnt64(uint64_t x){return x?__builtin_clzll(x):64;}\n",
+    "static inline uint64_t __ix_popcnt32(uint64_t x){return __builtin_popcount((uint32_t)x);}\n",
+    "static inline uint64_t __ix_popcnt64(uint64_t x){return __builtin_popcountll(x);}\n",
+    // x87 FPU: 80-bit extended precision == `long double` on x86-64 Linux, so
+    // these recompile to equivalent x87 code (bit-exact). Loads widen memory
+    // floats/ints to long double; stores narrow back; integer stores truncate
+    // (only emitted when the lifter proved truncation rounding or `fisttp`).
+    "static inline long double __x87_ld32(uint64_t a){return (long double)*(float*)(uintptr_t)a;}\n",
+    "static inline long double __x87_ld64(uint64_t a){return (long double)*(double*)(uintptr_t)a;}\n",
+    "static inline long double __x87_ld80(uint64_t a){return *(long double*)(uintptr_t)a;}\n",
+    "static inline long double __x87_ild16(uint64_t a){return (long double)*(int16_t*)(uintptr_t)a;}\n",
+    "static inline long double __x87_ild32(uint64_t a){return (long double)*(int32_t*)(uintptr_t)a;}\n",
+    "static inline long double __x87_ild64(uint64_t a){return (long double)*(int64_t*)(uintptr_t)a;}\n",
+    "static inline uint64_t __x87_st32(uint64_t a,long double v){*(float*)(uintptr_t)a=(float)v;return 0;}\n",
+    "static inline uint64_t __x87_st64(uint64_t a,long double v){*(double*)(uintptr_t)a=(double)v;return 0;}\n",
+    "static inline uint64_t __x87_st80(uint64_t a,long double v){*(long double*)(uintptr_t)a=v;return 0;}\n",
+    "static inline uint64_t __x87_ist16(uint64_t a,long double v){*(int16_t*)(uintptr_t)a=(int16_t)(long long)v;return 0;}\n",
+    "static inline uint64_t __x87_ist32(uint64_t a,long double v){*(int32_t*)(uintptr_t)a=(int32_t)(long long)v;return 0;}\n",
+    "static inline uint64_t __x87_ist64(uint64_t a,long double v){*(int64_t*)(uintptr_t)a=(long long)v;return 0;}\n",
+    "static inline long double __x87_add(long double a,long double b){return a+b;}\n",
+    "static inline long double __x87_sub(long double a,long double b){return a-b;}\n",
+    "static inline long double __x87_mul(long double a,long double b){return a*b;}\n",
+    "static inline long double __x87_div(long double a,long double b){return a/b;}\n",
+    "static inline long double __x87_abs(long double a){return a<0?-a:a;}\n",
+    "static inline long double __x87_neg(long double a){return -a;}\n",
+    "static inline long double __x87_sqrt(long double a){return __builtin_sqrtl(a);}\n",
+    "static inline long double __x87_rint(long double a){return __builtin_rintl(a);}\n",
+    "static inline long double __x87_trunc(long double a){return __builtin_truncl(a);}\n",
+    "static inline long double __x87_floor(long double a){return __builtin_floorl(a);}\n",
+    "static inline long double __x87_ceil(long double a){return __builtin_ceill(a);}\n",
+    "static inline long double __x87_fmod(long double a,long double b){return __builtin_fmodl(a,b);}\n",
+    "static inline long double __x87_one(void){return 1.0L;}\n",
+    "static inline long double __x87_zero(void){return 0.0L;}\n",
+    "static inline uint64_t __x87_lt(long double a,long double b){return a<b;}\n",
+    "static inline uint64_t __x87_eq(long double a,long double b){return a==b;}\n",
+    "static inline uint64_t __x87_un(long double a,long double b){return a!=a||b!=b;}\n",
+    // `fxam`: classify st(0) into the FPU condition codes. C3/C2/C0 encode the
+    // IEEE class (NaN=C0, Inf=C2|C0, zero=C3, normal=C2, denormal=C3|C2) and C1
+    // is the sign. Bits at hardware positions (C0=8, C1=9, C2=10, C3=14) so a
+    // later `fnstsw ax` reads them like the `fcom` idiom does.
+    "static inline uint64_t __x87_fxam(long double x){uint64_t s=0;if(__builtin_signbitl(x))s|=(1u<<9);if(__builtin_isnan(x))s|=(1u<<8);else if(__builtin_isinf(x))s|=(1u<<10)|(1u<<8);else if(x==0.0L)s|=(1u<<14);else if(__builtin_isnormal(x))s|=(1u<<10);else s|=(1u<<14)|(1u<<10);return s;}\n",
+    // fp return channel: the x87 ABI returns floats in st(0). A fp-returning
+    // function stores its st(0) here at `ret`; a caller reads it back after the
+    // call. Backed by one shared global (defined in aret_hle.c) so the value
+    // crosses translation-unit boundaries between chunks.
+    "extern long double __aret_x87_ret;\n",
+    "extern int __aret_x87_ret_valid;\n",
+    "static inline uint64_t __x87_retstore(long double v){__aret_x87_ret=v;__aret_x87_ret_valid=1;return 0;}\n",
+    "static inline long double __x87_retload(void){__aret_x87_ret_valid=0;return __aret_x87_ret;}\n",
+    // `rep movs`: copy `n` elements from `s` to `d`, element by element, matching
+    // hardware `rep movs` exactly. `back` = DF: 0 forward (low→high), 1 backward
+    // (high→low, the `std; rep movs` overlap-copy idiom). Not `memcpy` (which is
+    // forward only). The caller advances edi/esi by the signed total.
+    "static inline uint64_t __rep_movs8(uint64_t d,uint64_t s,uint64_t n,uint64_t back){uint8_t* p=(uint8_t*)(uintptr_t)d;const uint8_t* q=(const uint8_t*)(uintptr_t)s;long st=back?-1:1;for(uint64_t i=0;i<n;i++){*p=*q;p+=st;q+=st;}return 0;}\n",
+    "static inline uint64_t __rep_movs16(uint64_t d,uint64_t s,uint64_t n,uint64_t back){uint16_t* p=(uint16_t*)(uintptr_t)d;const uint16_t* q=(const uint16_t*)(uintptr_t)s;long st=back?-1:1;for(uint64_t i=0;i<n;i++){*p=*q;p+=st;q+=st;}return 0;}\n",
+    "static inline uint64_t __rep_movs32(uint64_t d,uint64_t s,uint64_t n,uint64_t back){uint32_t* p=(uint32_t*)(uintptr_t)d;const uint32_t* q=(const uint32_t*)(uintptr_t)s;long st=back?-1:1;for(uint64_t i=0;i<n;i++){*p=*q;p+=st;q+=st;}return 0;}\n",
+    "static inline uint64_t __rep_movs64(uint64_t d,uint64_t s,uint64_t n,uint64_t back){uint64_t* p=(uint64_t*)(uintptr_t)d;const uint64_t* q=(const uint64_t*)(uintptr_t)s;long st=back?-1:1;for(uint64_t i=0;i<n;i++){*p=*q;p+=st;q+=st;}return 0;}\n",
+    // `rep stos`: fill `n` elements at `d` with the low bytes of `v`. `back` = DF
+    // (0 forward, 1 backward). The fill value is identical everywhere, so only the
+    // covered region — and the resulting edi — differ by direction.
+    "static inline uint64_t __rep_stos8(uint64_t d,uint64_t v,uint64_t n,uint64_t back){uint8_t* p=(uint8_t*)(uintptr_t)d;long st=back?-1:1;for(uint64_t i=0;i<n;i++){*p=(uint8_t)v;p+=st;}return 0;}\n",
+    "static inline uint64_t __rep_stos16(uint64_t d,uint64_t v,uint64_t n,uint64_t back){uint16_t* p=(uint16_t*)(uintptr_t)d;long st=back?-1:1;for(uint64_t i=0;i<n;i++){*p=(uint16_t)v;p+=st;}return 0;}\n",
+    "static inline uint64_t __rep_stos32(uint64_t d,uint64_t v,uint64_t n,uint64_t back){uint32_t* p=(uint32_t*)(uintptr_t)d;long st=back?-1:1;for(uint64_t i=0;i<n;i++){*p=(uint32_t)v;p+=st;}return 0;}\n",
+    "static inline uint64_t __rep_stos64(uint64_t d,uint64_t v,uint64_t n,uint64_t back){uint64_t* p=(uint64_t*)(uintptr_t)d;long st=back?-1:1;for(uint64_t i=0;i<n;i++){*p=v;p+=st;}return 0;}\n",
+    // rep(ne) scas: scan `n` elements at `p` for `v`, returning the count consumed.
+    // `repe` (1) stops on the first mismatch, `repne` (0) on the first match; both
+    // stop when the count runs out. `back` = DF (0 forward, 1 backward). (edi/ecx
+    // updates and flags are applied by the caller from this count.)
+    "static inline uint64_t __rep_scas8(uint64_t d,uint64_t v,uint64_t n,uint64_t repe,uint64_t back){const uint8_t* p=(const uint8_t*)(uintptr_t)d;uint8_t x=(uint8_t)v;long st=back?-1:1;uint64_t k=0;while(n!=0){int eq=(*p==x);p+=st;k++;n--;if(repe?!eq:eq)break;}return k;}\n",
+    "static inline uint64_t __rep_scas16(uint64_t d,uint64_t v,uint64_t n,uint64_t repe,uint64_t back){const uint16_t* p=(const uint16_t*)(uintptr_t)d;uint16_t x=(uint16_t)v;long st=back?-1:1;uint64_t k=0;while(n!=0){int eq=(*p==x);p+=st;k++;n--;if(repe?!eq:eq)break;}return k;}\n",
+    "static inline uint64_t __rep_scas32(uint64_t d,uint64_t v,uint64_t n,uint64_t repe,uint64_t back){const uint32_t* p=(const uint32_t*)(uintptr_t)d;uint32_t x=(uint32_t)v;long st=back?-1:1;uint64_t k=0;while(n!=0){int eq=(*p==x);p+=st;k++;n--;if(repe?!eq:eq)break;}return k;}\n",
+    // rep(ne) cmps: compare `n` elements at [esi] vs [edi], returning the count
+    // consumed. `repe` (1, F3 — the memcmp/strcmp idiom) stops on the first
+    // mismatch, `repne` (0, F2) on the first match; both stop when the count runs
+    // out. `back` = DF (0 forward, 1 backward). (esi/edi/ecx updates and flags are
+    // applied by the caller from this count.)
+    "static inline uint64_t __rep_cmps8(uint64_t s,uint64_t d,uint64_t n,uint64_t repe,uint64_t back){const uint8_t* a=(const uint8_t*)(uintptr_t)s;const uint8_t* b=(const uint8_t*)(uintptr_t)d;long st=back?-1:1;uint64_t k=0;while(n!=0){int eq=(*a==*b);a+=st;b+=st;k++;n--;if(repe?!eq:eq)break;}return k;}\n",
+    "static inline uint64_t __rep_cmps16(uint64_t s,uint64_t d,uint64_t n,uint64_t repe,uint64_t back){const uint16_t* a=(const uint16_t*)(uintptr_t)s;const uint16_t* b=(const uint16_t*)(uintptr_t)d;long st=back?-1:1;uint64_t k=0;while(n!=0){int eq=(*a==*b);a+=st;b+=st;k++;n--;if(repe?!eq:eq)break;}return k;}\n",
+    "static inline uint64_t __rep_cmps32(uint64_t s,uint64_t d,uint64_t n,uint64_t repe,uint64_t back){const uint32_t* a=(const uint32_t*)(uintptr_t)s;const uint32_t* b=(const uint32_t*)(uintptr_t)d;long st=back?-1:1;uint64_t k=0;while(n!=0){int eq=(*a==*b);a+=st;b+=st;k++;n--;if(repe?!eq:eq)break;}return k;}\n",
+    // ---- Runtime x87 FPU-stack model: the fallback used for functions whose
+    // static depth analysis bailed. The stack is ordinary runtime state, so no
+    // compile-time depth is needed — correct by construction. Named `__x87rt_`
+    // (not `__x87_`) so the optimiser treats them as IMPURE (they mutate the
+    // stack): never dropped or reordered. Per-TU state is sound because the x87
+    // stack is empty at every call boundary (ABI). `st(0)` = s[p-1].
+    // Single SHARED stack (defined in aret_hle.c) — the runtime FPU stack is the
+    // real x87 stack: values a runtime-mode callee leaves in st(0) are visible to
+    // its runtime-mode caller, exactly as on hardware. So no per-function reset,
+    // and cross-chunk calls share it.
+    // Integer conversions observe MXCSR, unlike the pure arithmetic helpers.
+    "extern uint32_t __aret_mxcsr;\n",
+    "static inline uint64_t __ssert_getcsr(void){return __aret_mxcsr;}\n",
+    "static inline uint64_t __ssert_setcsr(uint64_t v){if(v&~UINT64_C(0xffff))aret_unmodelled(\"reserved MXCSR bits\");__aret_mxcsr=(uint32_t)v;return 0;}\n",
+    "static inline void __ssert_exception(unsigned f){__aret_mxcsr|=f;if(!(__aret_mxcsr&(f<<7)))aret_unmodelled(\"unmasked SSE conversion exception\");}\n",
+    "static inline uint64_t __ssert_cvt(double x,unsigned w){double r;switch((__aret_mxcsr>>13)&3){case 1:r=__builtin_floor(x);break;case 2:r=__builtin_ceil(x);break;case 3:r=__builtin_trunc(x);break;default:{double l=__builtin_floor(x),d=x-l;r=(d<0.5)?l:(d>0.5)?l+1:(__builtin_fmod(l,2.0)==0)?l:l+1;break;}}double lim=w==32?2147483648.0:9223372036854775808.0;if(!__builtin_isfinite(x)||r < -lim||r >= lim){__ssert_exception(1);return w==32?UINT64_C(0xffffffff80000000):UINT64_C(0x8000000000000000);}if(r!=x)__ssert_exception(32);return w==32?(uint64_t)(int64_t)(int32_t)r:(uint64_t)(int64_t)r;}\n",
+    "static inline uint64_t __ssert_cvt32_i32(uint64_t b){float x=__fp_g32(b);if((__aret_mxcsr&64)&&((b&0x7f800000)==0))x=0;return __ssert_cvt((double)x,32);}\n",
+    "static inline uint64_t __ssert_cvt32_i64(uint64_t b){float x=__fp_g32(b);if((__aret_mxcsr&64)&&((b&0x7f800000)==0))x=0;return __ssert_cvt((double)x,64);}\n",
+    "static inline uint64_t __ssert_cvt64_i32(uint64_t b){double x=__fp_g64(b);if((__aret_mxcsr&64)&&((b&UINT64_C(0x7ff0000000000000))==0))x=0;return __ssert_cvt(x,32);}\n",
+    "static inline uint64_t __ssert_cvt64_i64(uint64_t b){double x=__fp_g64(b);if((__aret_mxcsr&64)&&((b&UINT64_C(0x7ff0000000000000))==0))x=0;return __ssert_cvt(x,64);}\n",
+    "extern uint64_t __aret_sse_regs[32];\n",
+    "static inline uint64_t __aret_sse_get(uint64_t i){return __aret_sse_regs[i];}\n",
+    "static inline uint64_t __aret_sse_set(uint64_t i,uint64_t v){__aret_sse_regs[i]=v;return 0;}\n",
+    "extern long double __x87rt_s[16];\n",
+    "extern int __x87rt_p;\n",
+    "extern int __x87rt_rc;\n",
+    "extern unsigned short __x87rt_cw,__x87rt_tags,__x87rt_sw,__x87rt_opcode,__x87rt_cs,__x87rt_ds;extern unsigned __x87rt_top;extern uint32_t __x87rt_ip,__x87rt_dp;\n",
+    // Bounds-checked slot access: `st(i)` = s[p-1-i]. An out-of-range access means
+    // the runtime stack is inconsistent (e.g. a value an unrecognised callee left
+    // in st(0) was never pushed) — TRAP rather than read stale data, keeping the
+    // fallback SOUND (correct, or a loud abort; never silently wrong).
+    //
+    // The abort routes through `aret_x87_stack_error` rather than a bare
+    // `__builtin_trap` so the failure is diagnostic as well as loud: it flushes
+    // stdout (a bare trap discards the buffered output, making a run that got far
+    // look like it produced nothing), names the op and the depth, and dumps the
+    // execution trace. No new link dependency — `__x87rt_s`/`__x87rt_p` are already
+    // defined in the HLE runtime, so anything reaching this path links it.
+    // Declared noreturn: `__builtin_trap` was, so without it the compiler would
+    // consider the out-of-range access after the call reachable — the guard must
+    // terminate the path exactly as before, not merely abort at runtime.
+    "extern void aret_x87_stack_error(const char*,int,int) __attribute__((noreturn));\n",
+    "static inline long double* __x87rt_at(int i){unsigned k=(__x87rt_top+i)&7;if(i<0||i>=8||((__x87rt_tags>>(2*k))&3)==3)aret_x87_stack_error(\"st(i) access\",i,__x87rt_p);return &__x87rt_s[k];}\n",
+    "static inline unsigned __x87rt_class(long double v){if(v==0)return 1;if(!__builtin_isfinite(v))return 2;int e;__builtin_frexpl(v,&e);return e< -16381?2:0;}\n",
+    "static inline void __x87rt_put(long double* p,long double v){unsigned k=(unsigned)(p-__x87rt_s);*p=v;__x87rt_tags=(__x87rt_tags&~(3u<<(2*k)))|(__x87rt_class(v)<<(2*k));}\n",
+    "static inline void __x87rt_pop(void){(void)__x87rt_at(0);__x87rt_tags|=3u<<(2*__x87rt_top);__x87rt_top=(__x87rt_top+1)&7;--__x87rt_p;}\n",
+    "static inline void __x87rt_psh(long double v){unsigned k=(__x87rt_top-1)&7;if((( __x87rt_tags>>(2*k))&3)!=3)aret_x87_stack_error(\"push\",-1,__x87rt_p);__x87rt_top=k;++__x87rt_p;__x87rt_put(&__x87rt_s[k],v);}\n",
+    "static inline uint64_t __x87rt_ld32(uint64_t a){__x87rt_psh((long double)*(float*)(uintptr_t)a);return 0;}\n",
+    "static inline uint64_t __x87rt_ld64(uint64_t a){__x87rt_psh((long double)*(double*)(uintptr_t)a);return 0;}\n",
+    // x86 extended memory is ten bytes, regardless of the host long double ABI.
+    "static inline long double __x87rt_decode80(uint64_t a){const uint8_t* p=(const uint8_t*)(uintptr_t)a;uint64_t m=0;for(int i=0;i<8;i++)m|=(uint64_t)p[i]<<(8*i);unsigned se=p[8]|((unsigned)p[9]<<8),e=se&0x7fff;long double v;if(e==0x7fff)v=(m==UINT64_C(0x8000000000000000))?__builtin_infl():__builtin_nanl(\"\");else v=__builtin_ldexpl((long double)m,(e?e:1)-16383-63);return (se&0x8000)?-v:v;}\n",
+    "static inline uint64_t __x87rt_ld80(uint64_t a){__x87rt_psh(__x87rt_decode80(a));return 0;}\n",
+    "static inline uint64_t __x87rt_ild16(uint64_t a){__x87rt_psh((long double)*(int16_t*)(uintptr_t)a);return 0;}\n",
+    "static inline uint64_t __x87rt_ild32(uint64_t a){__x87rt_psh((long double)*(int32_t*)(uintptr_t)a);return 0;}\n",
+    "static inline uint64_t __x87rt_ild64(uint64_t a){__x87rt_psh((long double)*(int64_t*)(uintptr_t)a);return 0;}\n",
+    "static inline uint64_t __x87rt_ldi(int i){long double v=*__x87rt_at(i);__x87rt_psh(v);return 0;}\n",
+    "static inline uint64_t __x87rt_ld1(void){__x87rt_psh(1.0L);return 0;}\n",
+    "static inline uint64_t __x87rt_ldz(void){__x87rt_psh(0.0L);return 0;}\n",
+    "static inline uint64_t __x87rt_st32(uint64_t a,int pp){*(float*)(uintptr_t)a=(float)*__x87rt_at(0);if(pp)__x87rt_pop();return 0;}\n",
+    "static inline uint64_t __x87rt_st64(uint64_t a,int pp){*(double*)(uintptr_t)a=(double)*__x87rt_at(0);if(pp)__x87rt_pop();return 0;}\n",
+    "static inline void __x87rt_encode80(uint64_t a,long double v){uint8_t* p=(uint8_t*)(uintptr_t)a;unsigned sign=__builtin_signbit(v)?0x8000:0,e=0;uint64_t m=0;v=__builtin_fabsl(v);if(__builtin_isnan(v)){e=0x7fff;m=UINT64_C(0xc000000000000000);}else if(__builtin_isinf(v)){e=0x7fff;m=UINT64_C(0x8000000000000000);}else if(v!=0){int x;long double f=__builtin_frexpl(v,&x);int be=x+16382;if(be>=0x7fff){e=0x7fff;m=UINT64_C(0x8000000000000000);}else{long double scaled=be>0?__builtin_ldexpl(f,64):__builtin_ldexpl(v,16445);long double hi=__builtin_floorl(__builtin_ldexpl(scaled,-32)),lo=scaled-__builtin_ldexpl(hi,32);m=((uint64_t)(uint32_t)hi<<32)|(uint32_t)lo;long double frac=lo-__builtin_floorl(lo);int up=__x87rt_rc==1?(sign&&frac>0):__x87rt_rc==2?(!sign&&frac>0):__x87rt_rc==3?0:(frac>0.5L||(frac==0.5L&&(m&1)));e=be>0?be:0;if(up&&++m==0){m=UINT64_C(0x8000000000000000);++e;}if(!e&&(m>>63))e=1;}}for(int i=0;i<8;i++)p[i]=(uint8_t)(m>>(8*i));unsigned se=sign|e;p[8]=(uint8_t)se;p[9]=(uint8_t)(se>>8);}\n",
+    "static inline uint64_t __x87rt_st80(uint64_t a,int pp){__x87rt_encode80(a,*__x87rt_at(0));if(pp)__x87rt_pop();return 0;}\n",
+    "static inline long double __x87rt_rnd(long double v){switch(__x87rt_rc){case 1:return __builtin_floorl(v);case 2:return __builtin_ceill(v);case 3:return __builtin_truncl(v);default:return __builtin_rintl(v);}}\n",
+    "static inline uint64_t __x87rt_ist16(uint64_t a,int pp){*(int16_t*)(uintptr_t)a=(int16_t)(long long)__x87rt_rnd(*__x87rt_at(0));if(pp)__x87rt_pop();return 0;}\n",
+    "static inline uint64_t __x87rt_ist32(uint64_t a,int pp){*(int32_t*)(uintptr_t)a=(int32_t)(long long)__x87rt_rnd(*__x87rt_at(0));if(pp)__x87rt_pop();return 0;}\n",
+    "static inline uint64_t __x87rt_ist64(uint64_t a,int pp){*(int64_t*)(uintptr_t)a=(int64_t)__x87rt_rnd(*__x87rt_at(0));if(pp)__x87rt_pop();return 0;}\n",
+    "static inline uint64_t __x87rt_sti(int i,int pp){__x87rt_put(__x87rt_at(i),*__x87rt_at(0));if(pp)__x87rt_pop();return 0;}\n",
+    "static inline long double __x87rt_op(int o,long double a,long double b){switch(o){case 0:return a+b;case 1:return a-b;case 2:return b-a;case 3:return a*b;case 4:return a/b;default:return b/a;}}\n",
+    "static inline uint64_t __x87rt_ar(int o,int ai,int bi,int pp){long double* a=__x87rt_at(ai);long double b=*__x87rt_at(bi);__x87rt_put(a,__x87rt_op(o,*a,b));if(pp)__x87rt_pop();return 0;}\n",
+    "static inline uint64_t __x87rt_am32(int o,uint64_t a){long double* t=__x87rt_at(0);__x87rt_put(t,__x87rt_op(o,*t,(long double)*(float*)(uintptr_t)a));return 0;}\n",
+    "static inline uint64_t __x87rt_am64(int o,uint64_t a){long double* t=__x87rt_at(0);__x87rt_put(t,__x87rt_op(o,*t,(long double)*(double*)(uintptr_t)a));return 0;}\n",
+    "static inline uint64_t __x87rt_ami16(int o,uint64_t a){long double* t=__x87rt_at(0);__x87rt_put(t,__x87rt_op(o,*t,(long double)*(int16_t*)(uintptr_t)a));return 0;}\n",
+    "static inline uint64_t __x87rt_ami32(int o,uint64_t a){long double* t=__x87rt_at(0);__x87rt_put(t,__x87rt_op(o,*t,(long double)*(int32_t*)(uintptr_t)a));return 0;}\n",
+    "static inline uint64_t __x87rt_xch(int i){long double* a=__x87rt_at(0);long double* b=__x87rt_at(i);long double t=*a;__x87rt_put(a,*b);__x87rt_put(b,t);return 0;}\n",
+    "static inline uint64_t __x87rt_chs(void){long double* t=__x87rt_at(0);__x87rt_put(t,-*t);return 0;}\n",
+    "static inline uint64_t __x87rt_abs(void){long double* t=__x87rt_at(0);__x87rt_put(t,__builtin_fabsl(*t));return 0;}\n",
+    "static inline uint64_t __x87rt_sqrt(void){long double* t=__x87rt_at(0);__x87rt_put(t,__builtin_sqrtl(*t));return 0;}\n",
+    "static inline uint64_t __x87rt_rndint(void){long double* t=__x87rt_at(0);__x87rt_put(t,__x87rt_rnd(*t));return 0;}\n",
+    "static inline uint64_t __x87rt_ldcw(uint64_t a){__x87rt_cw=*(uint16_t*)(uintptr_t)a;__x87rt_rc=(__x87rt_cw>>10)&3;return 0;}\n",
+    "static inline uint64_t __x87rt_stcw(uint64_t a){*(uint16_t*)(uintptr_t)a=__x87rt_cw;return 0;}\n",
+    // fp-return handoff for runtime-mode functions (shares the static channel).
+    // reset at entry (clean stack), retstore at ret (publish st(0) if fp-returning),
+    // pushret after a recognised fp-returning call. Together with the bounds trap
+    // above, an unrecognised fp return surfaces as an underflow trap, not garbage.
+    "static inline uint64_t __x87rt_reset(void){__x87rt_p=0;__x87rt_top=0;__x87rt_tags=0xffff;__x87rt_cw=0x37f;__x87rt_rc=0;__x87rt_sw=0;__x87rt_ip=__x87rt_dp=0;__x87rt_opcode=0;__x87rt_cs=__x87rt_ds=0;return 0;}\n",
+    "static inline uint64_t __x87rt_pushret(void){__x87rt_psh(__aret_x87_ret);__aret_x87_ret_valid=0;return 0;}\n",
+    // Wrap a call in runtime mode: clear the channel-valid flag before, then push
+    // the channel onto the stack after IF a callee wrote it (fp return via channel:
+    // static-fp or host libm). A runtime-mode fp callee instead leaves its result
+    // on the shared stack (flag stays clear) → no double push. Handles indirect
+    // (computed) fp-returning calls the static analysis cannot classify.
+    "static inline uint64_t __x87rt_precall(void){__aret_x87_ret_valid=0;return 0;}\n",
+    "static inline uint64_t __x87rt_postcall(void){if(__aret_x87_ret_valid){__x87rt_psh(__aret_x87_ret);__aret_x87_ret_valid=0;}return 0;}\n",
+    "static inline uint64_t __x87rt_retstore(void){if(__x87rt_p>0){__aret_x87_ret=*__x87rt_at(0);__x87rt_pop();}return 0;}\n",
+    "static inline uint64_t __x87rt_free(void){if(__x87rt_p>0)__x87rt_pop();return 0;}\n",
+    // ---- increment 2: comparisons, status word, transcendentals ----
+    "extern unsigned short __x87rt_sw;\n",
+    "static inline void __x87rt_setsw(long double a,long double b){int u=(a!=a||b!=b);__x87rt_sw=(unsigned short)((__x87rt_sw&~0x4700u)|((((a<b)||u)?1:0)<<8)|((u?1:0)<<10)|((((a==b)||u)?1:0)<<14));}\n",
+    "static inline uint64_t __x87rt_com(int i,int pp){__x87rt_setsw(*__x87rt_at(0),*__x87rt_at(i));if(pp)__x87rt_pop();return 0;}\n",
+    "static inline uint64_t __x87rt_comm32(uint64_t a,int pp){__x87rt_setsw(*__x87rt_at(0),(long double)*(float*)(uintptr_t)a);if(pp)__x87rt_pop();return 0;}\n",
+    "static inline uint64_t __x87rt_comm64(uint64_t a,int pp){__x87rt_setsw(*__x87rt_at(0),(long double)*(double*)(uintptr_t)a);if(pp)__x87rt_pop();return 0;}\n",
+    "static inline uint64_t __x87rt_tst(void){__x87rt_setsw(*__x87rt_at(0),0.0L);return 0;}\n",
+    "static inline uint64_t __x87rt_fxam(void){long double x=*__x87rt_at(0);unsigned short s=0;if(__builtin_signbitl(x))s|=(1u<<9);if(__builtin_isnan(x))s|=(1u<<8);else if(__builtin_isinf(x))s|=(1u<<10)|(1u<<8);else if(x==0.0L)s|=(1u<<14);else if(__builtin_isnormal(x))s|=(1u<<10);else s|=(1u<<14)|(1u<<10);__x87rt_sw=(__x87rt_sw&~0x4700u)|s;return 0;}\n",
+    "static inline uint64_t __x87rt_getsw(void){return (__x87rt_sw&~0x3800u)|(__x87rt_top<<11);}\n",
+    "static inline uint64_t __x87rt_lt(int i){return *__x87rt_at(0)<*__x87rt_at(i);}\n",
+    "static inline uint64_t __x87rt_eq(int i){return *__x87rt_at(0)==*__x87rt_at(i);}\n",
+    "static inline uint64_t __x87rt_un(int i){long double a=*__x87rt_at(0),b=*__x87rt_at(i);return a!=a||b!=b;}\n",
+    "static inline uint64_t __x87rt_cmov(int c,int i){if(c)__x87rt_put(__x87rt_at(0),*__x87rt_at(i));return 0;}\n",
+    "static inline uint64_t __x87rt_yl2x(void){long double* y=__x87rt_at(1);__x87rt_put(y,*y*__builtin_log2l(*__x87rt_at(0)));__x87rt_pop();return 0;}\n",
+    "static inline uint64_t __x87rt_yl2xp1(void){long double* y=__x87rt_at(1);__x87rt_put(y,*y*__builtin_log2l(*__x87rt_at(0)+1.0L));__x87rt_pop();return 0;}\n",
+    "static inline uint64_t __x87rt_2xm1(void){long double* t=__x87rt_at(0);__x87rt_put(t,__builtin_exp2l(*t)-1.0L);return 0;}\n",
+    "static inline uint64_t __x87rt_scale(void){long double* t=__x87rt_at(0);__x87rt_put(t,__builtin_ldexpl(*t,(int)__builtin_truncl(*__x87rt_at(1))));return 0;}\n",
+    "static inline uint64_t __x87rt_sin(void){long double* t=__x87rt_at(0);__x87rt_put(t,__builtin_sinl(*t));__x87rt_sw&=~(1u<<10);return 0;}\n",
+    "static inline uint64_t __x87rt_cos(void){long double* t=__x87rt_at(0);__x87rt_put(t,__builtin_cosl(*t));__x87rt_sw&=~(1u<<10);return 0;}\n",
+    "static inline uint64_t __x87rt_sincos(void){long double x=*__x87rt_at(0);__x87rt_put(__x87rt_at(0),__builtin_sinl(x));__x87rt_psh(__builtin_cosl(x));__x87rt_sw&=~(1u<<10);return 0;}\n",
+    "static inline uint64_t __x87rt_ptan(void){long double* t=__x87rt_at(0);__x87rt_put(t,__builtin_tanl(*t));__x87rt_psh(1.0L);__x87rt_sw&=~(1u<<10);return 0;}\n",
+    "static inline uint64_t __x87rt_patan(void){long double* y=__x87rt_at(1);__x87rt_put(y,__builtin_atan2l(*y,*__x87rt_at(0)));__x87rt_pop();return 0;}\n",
+    "static inline uint64_t __x87rt_prem(void){long double* t=__x87rt_at(0);__x87rt_put(t,__builtin_fmodl(*t,*__x87rt_at(1)));__x87rt_sw&=~(1u<<10);return 0;}\n",
+    "static inline uint64_t __x87rt_ldpi(void){__x87rt_psh(3.14159265358979323846L);return 0;}\n",
+    "static inline uint64_t __x87rt_ldl2e(void){__x87rt_psh(1.44269504088896340736L);return 0;}\n",
+    "static inline uint64_t __x87rt_ldl2t(void){__x87rt_psh(3.32192809488736234787L);return 0;}\n",
+    "static inline uint64_t __x87rt_ldlg2(void){__x87rt_psh(0.30102999566398119521L);return 0;}\n",
+    "static inline uint64_t __x87rt_ldln2(void){__x87rt_psh(0.69314718055994530942L);return 0;}\n",
+    "static inline uint64_t __x87rt_note(uint64_t ip,uint64_t op,uint64_t dp,uint64_t memory){__x87rt_ip=(uint32_t)ip;__x87rt_opcode=(unsigned short)(op&0x7ff);__x87rt_cs=0x23;if(memory){__x87rt_dp=(uint32_t)dp;__x87rt_ds=0x2b;}return 0;}\n",
+    "static inline uint16_t __x87rt_read16(const uint8_t*p){return p[0]|((uint16_t)p[1]<<8);}\n",
+    "static inline uint32_t __x87rt_read32(const uint8_t*p){return __x87rt_read16(p)|((uint32_t)__x87rt_read16(p+2)<<16);}\n",
+    "static inline void __x87rt_write16(uint8_t*p,uint16_t v){p[0]=(uint8_t)v;p[1]=(uint8_t)(v>>8);}\n",
+    "static inline void __x87rt_write32(uint8_t*p,uint32_t v){__x87rt_write16(p,(uint16_t)v);__x87rt_write16(p+2,(uint16_t)(v>>16));}\n",
+    "static inline uint64_t __x87rt_stenv(uint64_t a,uint64_t n){uint8_t*p=(uint8_t*)(uintptr_t)a;uint16_t sw=(uint16_t)__x87rt_getsw();if(n==28){__x87rt_write32(p,0xffff0000u|__x87rt_cw);__x87rt_write32(p+4,0xffff0000u|sw);__x87rt_write32(p+8,0xffff0000u|__x87rt_tags);__x87rt_write32(p+12,__x87rt_ip);__x87rt_write32(p+16,__x87rt_cs|((uint32_t)__x87rt_opcode<<16));__x87rt_write32(p+20,__x87rt_dp);__x87rt_write32(p+24,0xffff0000u|__x87rt_ds);}else if(n==14){__x87rt_write16(p,__x87rt_cw);__x87rt_write16(p+2,sw);__x87rt_write16(p+4,__x87rt_tags);__x87rt_write16(p+6,(uint16_t)__x87rt_ip);__x87rt_write16(p+8,__x87rt_cs);__x87rt_write16(p+10,(uint16_t)__x87rt_dp);__x87rt_write16(p+12,__x87rt_ds);}else aret_x87_stack_error(\"environment size\",-1,__x87rt_p);__x87rt_cw|=63;return 0;}\n",
+    "static inline uint64_t __x87rt_ldenv(uint64_t a,uint64_t n){const uint8_t*p=(const uint8_t*)(uintptr_t)a;__x87rt_cw=__x87rt_read16(p);__x87rt_rc=(__x87rt_cw>>10)&3;if(n==28){__x87rt_sw=__x87rt_read16(p+4);__x87rt_tags=__x87rt_read16(p+8);__x87rt_ip=__x87rt_read32(p+12);__x87rt_cs=__x87rt_read16(p+16);__x87rt_opcode=__x87rt_read16(p+18)&0x7ff;__x87rt_dp=__x87rt_read32(p+20);__x87rt_ds=__x87rt_read16(p+24);}else if(n==14){__x87rt_sw=__x87rt_read16(p+2);__x87rt_tags=__x87rt_read16(p+4);__x87rt_ip=__x87rt_read16(p+6);__x87rt_cs=__x87rt_read16(p+8);__x87rt_dp=__x87rt_read16(p+10);__x87rt_ds=__x87rt_read16(p+12);}else aret_x87_stack_error(\"environment size\",-1,__x87rt_p);__x87rt_top=(__x87rt_sw>>11)&7;__x87rt_p=0;for(unsigned i=0;i<8;i++)if(((__x87rt_tags>>(2*i))&3)!=3)++__x87rt_p;return 0;}\n",
+    "static inline uint64_t __x87rt_clear(void){__x87rt_sw&=~0x80ffu;return 0;}\n",
+
+);
+
+/// The runtime-helper preamble, included only when the body references it.
+pub(crate) fn float_preamble(body: &str) -> &'static str {
+    if body.contains("__ssert_") || body.contains("__aret_sse_") || body.contains("__fp_") || body.contains("__pi_") || body.contains("__ix_") || body.contains("__x87_") || body.contains("__x87rt_") || body.contains("__rep_") {
+        FLOAT_HELPERS
+    } else {
+        ""
+    }
+}
+
+/// Count instructions that could not be lifted. The lifter represents an
+/// unmodelled instruction either as `Stmt::Asm` or as an `asm:`-named call
+/// (`asm_fallback`, which also clobbers the written registers to `Undef`). A
+/// non-zero count means the decompilation is incomplete and may be incorrect.
+pub(crate) fn count_unlifted(func: &IrFunction) -> usize {
+    fn is_asm_call(e: &Expr) -> bool {
+        matches!(e, Expr::Call { target: CallTarget::Named(n), .. } if n.starts_with("asm:"))
+    }
+    let mut n = 0;
+    for b in &func.blocks {
+        for s in &b.stmts {
+            match s {
+                Stmt::Asm(_) => n += 1,
+                Stmt::CallStmt(e) | Stmt::Assign { expr: e, .. } if is_asm_call(e) => n += 1,
+                _ => {}
+            }
+        }
+    }
+    n
+}
+
+pub(crate) fn ctype(bits: u8) -> &'static str {
+    match bits {
+        8 => "uint8_t",
+        16 => "uint16_t",
+        32 => "uint32_t",
+        _ => "uint64_t",
+    }
+}
+
+fn ty_ctype(t: &Ty) -> &'static str {
+    match t {
+        Ty::Int { bits, .. } => ctype(*bits),
+        _ => "uint64_t",
+    }
+}
+
+fn const_c(v: i128) -> String {
+    if v < 0 {
+        format!("(uint64_t)({})", v)
+    } else if v > 9 {
+        format!("0x{:x}ULL", v as u128)
+    } else {
+        format!("{}", v)
+    }
+}
+
+/// Name a recovered stack-frame slot.
+pub(crate) fn frame_name(d: i64) -> String {
+    if d == 0 {
+        "saved_bp".into()
+    } else if d > 0 {
+        format!("arg_{:x}", d)
+    } else {
+        format!("local_{:x}", -d)
+    }
+}
+
+thread_local! {
+    /// The current function's recovered struct layouts (set per function by the
+    /// emitter). When a memory address matches a clean struct field, it is
+    /// emitted as `((struct S*)base)->field_k` — byte-identical to the raw cast.
+    static STRUCT_INFO: std::cell::RefCell<Option<crate::types::StructInfo>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Set (or clear) the struct layouts consulted by `lvalue_c`.
+pub(crate) fn set_struct_info(si: Option<crate::types::StructInfo>) {
+    STRUCT_INFO.with(|c| *c.borrow_mut() = si);
+}
+
+/// Render a memory lvalue: a recovered struct field access when the base is a
+/// struct pointer, else the raw width-typed cast. The two are byte-identical
+/// (packed, exact-offset layout), so this never changes semantics.
+pub(crate) fn lvalue_c(addr: &Expr, width_bits: u8) -> String {
+    let hit = STRUCT_INFO
+        .with(|c| c.borrow().as_ref().and_then(|si| si.lookup(addr, (width_bits / 8) as u32)));
+    match hit {
+        Some((name, base, off)) => format!("((struct {}*)(v{}))->field_{:x}", name, base, off),
+        None => format!("(*({}*)({}))", ctype(width_bits), expr_c(addr)),
+    }
+}
+
+pub(crate) fn expr_c(e: &Expr) -> String {
+    match e {
+        Expr::Const(v, _) => const_c(*v),
+        Expr::Use(v) => format!("v{}", v.0),
+        Expr::Undef => "0 /*undef*/".into(),
+        Expr::Read(Location::Frame(d)) => frame_name(*d),
+        Expr::Read(_) => "0 /*reg*/".into(), // other reads don't remain post-SSA
+        Expr::Load { addr, ty } => lvalue_c(addr, int_bits(ty)),
+        Expr::Unary(op, x) => match op {
+            UnOp::Neg => format!("(-({}))", expr_c(x)),
+            UnOp::Not => format!("(~({}))", expr_c(x)),
+            // Sign-extension must actually sign-extend: emit a width-aware signed
+            // cast (the source width is carried by the masked value or typed
+            // load it wraps). Rendering it as identity zero-extends, which is
+            // wrong for negative narrow values (e.g. `movsx`).
+            UnOp::SignExtend => format!("({})", signed_cast(x)),
+            // Zero-extension / truncation: the operand is already masked to its
+            // width, so the value is correct as-is.
+            _ => format!("({})", expr_c(x)),
+        },
+        Expr::Binary(op, a, b) => binary_c(*op, a, b),
+        Expr::Cast { to, expr } => format!("(({})({}))", ty_ctype(to), expr_c(expr)),
+        Expr::Addr(Location::Frame(d)) => format!("(uint64_t)(&{})", frame_name(*d)),
+        Expr::Addr(_) => "0 /*addr*/".into(),
+        Expr::Call { target, args, .. } => {
+            let a: Vec<String> = args.iter().map(expr_c).collect();
+            match target {
+                CallTarget::Direct(addr) => format!("sub_{:x}({})", addr, a.join(", ")),
+                CallTarget::Named(n) if n.starts_with("asm:") => {
+                    // An unmodelled instruction in expression position. In the
+                    // runnable transpile, fail loud (abort) rather than substitute
+                    // 0 for an unknown effect — the comma keeps it an expression.
+                    // The read-only decompile keeps the readable comment form.
+                    if shared_stack() {
+                        format!("(aret_unmodelled({:?}), 0)", n.strip_prefix("asm:").unwrap_or(n))
+                    } else {
+                        format!("0 /*{}*/", n)
+                    }
+                }
+                CallTarget::Named(n) if shared_stack() && libc_arity(n).is_some() => {
+                    // A real libc function (e.g. `memcpy` synthesised from `rep movs`)
+                    // called from a transpiled chunk, which has no `<string.h>`
+                    // prototype in scope. Our operands are `uint64_t`, so without a
+                    // prototype the compiler passes each as a *64-bit* pair on the
+                    // 32-bit target — and libc reads its first arg's high word as the
+                    // second arg, shifting everything (memcpy then sees src=high(dst),
+                    // n=low(src) → a wild copy and crash). Narrow every argument to a
+                    // single 32-bit word, which is the correct i386 ABI for these
+                    // (pointers/size_t/int are all 32-bit here).
+                    let na: Vec<String> = a.iter().map(|x| format!("(uint32_t)({x})")).collect();
+                    format!("{}({})", n, na.join(", "))
+                }
+                // Relay wrapping (--relay): an HLE shim call becomes
+                // `aret_relay("Name", (uint32_t)(esp), aret_Name(esp))`. The wrapper
+                // returns the shim's value unchanged, so the expression's meaning is
+                // identical; the only effect is a runtime-gated log line. Needs the
+                // esp argument (a[0]) to read the call's stack args, so it only wraps
+                // the shims that take one.
+                CallTarget::Named(n)
+                    if relay_enabled() && is_relayable_shim(n) && !a.is_empty() =>
+                {
+                    format!(
+                        "aret_relay(\"{}\", (uint32_t)({}), {}({}))",
+                        n.strip_prefix("aret_").unwrap_or(n),
+                        a[0],
+                        n,
+                        a.join(", ")
+                    )
+                }
+                CallTarget::Named(n) => format!("{}({})", n, a.join(", ")),
+                CallTarget::Indirect(e) => {
+                    // Shared-stack/transpile mode: a function pointer holds the
+                    // *original* code address, so dispatch through the VA->function
+                    // table (`aret_call`) instead of jumping to an unmapped VA.
+                    if shared_stack() && !a.is_empty() {
+                        format!("aret_call((uint32_t)({}), {})", expr_c(e), a.join(", "))
+                    } else {
+                        // Call through a function pointer: cast the computed target
+                        // to a function-pointer type taking the (over-approximated)
+                        // SysV argument registers and returning a 64-bit value.
+                        let params = if a.is_empty() {
+                            "void".to_string()
+                        } else {
+                            vec!["uint64_t"; a.len()].join(",")
+                        };
+                        format!("((uint64_t(*)({}))({}))({})", params, expr_c(e), a.join(", "))
+                    }
+                }
+            }
+        }
+        Expr::Select { cond, then_, else_ } => {
+            format!("({} ? {} : {})", expr_c(cond), expr_c(then_), expr_c(else_))
+        }
+        Expr::Phi(_) => "0 /*phi*/".into(),
+    }
+}
+
+pub(crate) fn int_bits(t: &Ty) -> u8 {
+    match t {
+        Ty::Int { bits, .. } => *bits,
+        _ => 64,
+    }
+}
+
+/// Size of the synthesised per-call stack-frame array, and the entry offset of
+/// rsp/rbp within it (leaving room above for stack-passed args / saved slots and
+/// below for the function's locals).
+const FRAME_SIZE: usize = 16384;
+const FRAME_TOP: usize = FRAME_SIZE - 2048;
+
+thread_local! {
+    /// Shared machine-stack mode (UBT M3): used by the transpiler so that the
+    /// entry rsp/rbp come from a `__esp` parameter (a pointer into one global
+    /// stack shared across functions) instead of a private per-call `__frame`
+    /// array. This is what lets stack-passed arguments cross function calls. Off
+    /// by default, so the verify/decompile paths are unchanged.
+    static SHARED_STACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// SEH scope-table mode: set when the program imports `_except_handler3`. Gates the
+    /// setjmp injected at each SEH-establish (`mov fs:[0],esp`) so a program that uses
+    /// __try/__except can transfer to its __except block, while every other program stays
+    /// byte-identical (no injection, no marker). Off by default.
+    static SEH_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Entry VAs of functions with GNU/Itanium C++ EH metadata (an `.eh_frame` LSDA).
+    /// ir::build injects the establish/setpc/pop hooks only in these; empty on any binary
+    /// without such metadata ⇒ no injection, byte-identical. Populated by the builder.
+    static GNU_EH_FUNCS: std::cell::RefCell<std::collections::HashSet<u64>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+
+    /// VAs whose lifted frame must be raw shared-stack memory for GNU EH: the EH functions
+    /// AND their landing-pad continuations (which run as separate functions against the
+    /// establisher's frame and must read its locals through real memory, not named SSA).
+    static GNU_EH_FRAMES: std::cell::RefCell<std::collections::HashSet<u64>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+
+    /// Execution-trace mode (`--trace`, doc 81 §I1): when on, each function's body is
+    /// prefixed with an `aret_trace_push(va, esp, regs…)` recording its entry into an
+    /// in-memory ring buffer, dumped by the runtime only on `aret_unmodelled`/an
+    /// unhandled fault. A diagnostic build for tracking late corruptions to their cause
+    /// (the call chain + register state leading to the crash). Off by default so the
+    /// default product is byte-identical (no push calls emitted). Purely additive.
+    static TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Import-relay mode (`--relay`, doc 81 §4 execution diff): when on, every HLE
+    /// shim call `aret_X(esp)` is wrapped in `aret_relay("X", esp, aret_X(esp))`,
+    /// which — at runtime, only if `ARET_RELAY` is set — logs the API name, its first
+    /// argument words read off the modelled stack, and the return value, in a format
+    /// that lines up with Wine's `WINEDEBUG=+relay`. The point is to diff the two
+    /// traces and find the FIRST divergence between our HLE and Wine on a real binary,
+    /// instead of walking a null object back by hand. Off by default → byte-identical.
+    static RELAY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enable/disable execution-trace emission (`--trace`) for the current thread.
+pub fn set_trace(on: bool) {
+    TRACE.with(|c| c.set(on));
+}
+
+pub(crate) fn trace_enabled() -> bool {
+    TRACE.with(|c| c.get())
+}
+
+/// Enable/disable import-relay emission (`--relay`) for the current thread.
+pub fn set_relay(on: bool) {
+    RELAY.with(|c| c.set(on));
+}
+
+pub(crate) fn relay_enabled() -> bool {
+    RELAY.with(|c| c.get())
+}
+
+/// Runtime helpers that are emitted as `aret_*`/`__*` Named calls into lifted bodies
+/// but are NOT Win32/CRT imports — excluded from the relay so the trace is API calls,
+/// not internal plumbing. Over-inclusion elsewhere is harmless (the wrapper returns
+/// its value unchanged and the differ ignores unknown names), so this list only needs
+/// to cover the ones that would be noise or recurse.
+pub(crate) fn is_relayable_shim(n: &str) -> bool {
+    if !n.starts_with("aret_") {
+        return false;
+    }
+    !matches!(
+        n,
+        "aret_call"
+            | "aret_relay"
+            | "aret_unmodelled"
+            | "aret_unimpl"
+            | "aret_partial"
+            | "aret_noop"
+            | "aret_trace_push"
+    )
+}
+
+/// Enable/disable shared machine-stack emission for the current thread.
+pub fn set_shared_stack(on: bool) {
+    SHARED_STACK.with(|c| c.set(on));
+}
+
+pub(crate) fn shared_stack() -> bool {
+    SHARED_STACK.with(|c| c.get())
+}
+
+/// Enable/disable SEH scope-table (`_except_handler3`) injection for the current thread.
+pub fn set_seh_active(on: bool) {
+    SEH_ACTIVE.with(|c| c.set(on));
+}
+
+pub(crate) fn seh_active() -> bool {
+    SEH_ACTIVE.with(|c| c.get())
+}
+
+/// Set the entry VAs of GNU C++ EH functions (the builder computes them once from
+/// `gnu_eh_entries`). Empty clears it.
+pub fn set_gnu_eh_funcs(funcs: std::collections::HashSet<u64>) {
+    GNU_EH_FUNCS.with(|c| *c.borrow_mut() = funcs);
+}
+
+/// Whether `va` is the entry of a GNU C++ EH function (gates the establish/setpc/pop
+/// injection in ir::build).
+pub(crate) fn is_gnu_eh_func(va: u64) -> bool {
+    GNU_EH_FUNCS.with(|c| c.borrow().contains(&va))
+}
+
+/// Set the VAs whose frame must be raw shared-stack memory for GNU EH (EH functions +
+/// their landing-pad continuations). Empty clears it.
+pub fn set_gnu_eh_frames(frames: std::collections::HashSet<u64>) {
+    GNU_EH_FRAMES.with(|c| *c.borrow_mut() = frames);
+}
+
+/// Whether `va`'s lifted frame must be raw memory (an EH function or a landing pad).
+pub(crate) fn is_gnu_eh_frame(va: u64) -> bool {
+    GNU_EH_FRAMES.with(|c| c.borrow().contains(&va))
+}
+
+/// Render the function's value declarations. Frame-base values (entry rsp/rbp)
+/// are pointed at a real per-call `__frame` array so generic stack accesses
+/// (arrays, rsp-relative spills) hit real memory instead of dereferencing an
+/// uninitialised frame register. Returns the lines (with leading indent).
+pub(crate) fn value_decls(values: &BTreeSet<u32>, frame_base: &[u32], fp80: &[u32]) -> String {
+    use std::collections::HashSet;
+    if values.is_empty() {
+        return String::new();
+    }
+    let fb: HashSet<u32> = frame_base.iter().copied().collect();
+    let fp: HashSet<u32> = fp80.iter().copied().collect();
+    let used_fb = values.iter().any(|v| fb.contains(v));
+    let shared = shared_stack();
+    let mut out = String::new();
+    if used_fb && !shared {
+        // Plain automatic array (per-call, so recursion gets a fresh frame).
+        let _ = writeln!(out, "    uint8_t __frame[{}];", FRAME_SIZE);
+    }
+    // x87 FPU values are 80-bit extended precision → `long double`.
+    let ld: Vec<String> = values
+        .iter()
+        .filter(|v| fp.contains(v))
+        .map(|v| format!("v{} = 0", v))
+        .collect();
+    if !ld.is_empty() {
+        let _ = writeln!(out, "    long double {};", ld.join(", "));
+    }
+    let decls: Vec<String> = values
+        .iter()
+        .filter(|v| !fp.contains(v))
+        .map(|v| {
+            if fb.contains(v) {
+                // Shared stack: entry rsp/rbp come from the `__esp` parameter (a
+                // pointer into the single global stack) so pushed arguments cross
+                // calls. Private frame: a fresh per-call array.
+                if shared {
+                    format!("v{} = __esp", v)
+                } else {
+                    format!("v{} = (uint64_t)(__frame + {})", v, FRAME_TOP)
+                }
+            } else {
+                format!("v{} = 0", v)
+            }
+        })
+        .collect();
+    if !decls.is_empty() {
+        let _ = writeln!(out, "    uint64_t {};", decls.join(", "));
+    }
+    out
+}
+
+/// Signed-cast an operand, sign-extending from its apparent width. A value
+/// masked to a sub-word width (`x & 0xff/0xffff/0xffffffff`) is sign-extended
+/// from that width (`(int64_t)(int32_t)x`), not treated as a positive 64-bit
+/// number — otherwise signed comparisons of negative 32-bit values are wrong.
+fn signed_cast(e: &Expr) -> String {
+    match e {
+        // A bare constant carries its width in its type: sign-extend from it. The
+        // optimizer folds `const & 0xffffffff` → `const` (dropping the mask that
+        // the `Binary(And, …)` arm below keys on), so without this a 32-bit
+        // constant with bit 31 set (e.g. a signed-division magic like 0xb21642c9)
+        // would be read as a large *positive* 64-bit value in a signed `imul`,
+        // flipping the product's high word — a silent miscompile of magic-number
+        // modulo (found via sqlite mingw: `h % 23` gave a negative bucket index).
+        Expr::Const(c, ty) => {
+            let w = int_bits(ty);
+            if (1..64).contains(&w) {
+                let m = (1u128 << w) - 1;
+                let v = (*c as u128) & m;
+                let signed: i128 = if (v >> (w - 1)) & 1 == 1 {
+                    v as i128 - (1i128 << w)
+                } else {
+                    v as i128
+                };
+                return format!("(int64_t)({})", signed);
+            }
+        }
+        // A value masked to a sub-word width is sign-extended from that width.
+        Expr::Binary(BinOp::And, x, m) => {
+            if let Expr::Const(c, _) = m.as_ref() {
+                let st = match *c {
+                    0xff => Some("int8_t"),
+                    0xffff => Some("int16_t"),
+                    0xffffffff => Some("int32_t"),
+                    _ => None,
+                };
+                if let Some(t) = st {
+                    return format!("(int64_t)({})({})", t, expr_c(x));
+                }
+            }
+        }
+        // A sub-word memory load is read through a signed pointer so its sign bit
+        // extends correctly (the default `(*(uintN_t*)…)` would zero-extend).
+        Expr::Load { addr, ty } => {
+            let b = int_bits(ty);
+            if b < 64 {
+                return format!("(int64_t)(*({}*)({}))", sctype(b), expr_c(addr));
+            }
+        }
+        _ => {}
+    }
+    format!("(int64_t)({})", expr_c(e))
+}
+
+/// Signed C integer type name for a width in bits.
+fn sctype(bits: u8) -> &'static str {
+    match bits {
+        1..=8 => "int8_t",
+        9..=16 => "int16_t",
+        17..=32 => "int32_t",
+        _ => "int64_t",
+    }
+}
+
+/// If `e` is sign-extended from a sub-64-bit width — a `& 0xff/0xffff/0xffffffff`
+/// mask or a sub-word load — return that width in bits; else `None`. Used to
+/// recover the width of a signed comparison so a constant sibling operand can be
+/// sign-extended from the *same* width.
+fn signed_width(e: &Expr) -> Option<u8> {
+    match e {
+        Expr::Binary(BinOp::And, _, m) => match m.as_ref() {
+            Expr::Const(0xff, _) => Some(8),
+            Expr::Const(0xffff, _) => Some(16),
+            Expr::Const(0xffffffff, _) => Some(32),
+            _ => None,
+        },
+        Expr::Load { ty, .. } => {
+            let b = int_bits(ty);
+            if b < 64 {
+                Some(b)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Render `e` truncated to `w` bits for an *equality* comparison: a constant is
+/// masked to `w` (so a sign-extended `-1` = `0xffffffffffffffff` becomes the
+/// 32-bit `0xffffffff` that the masked operand can actually equal); a non-constant
+/// is explicitly `& maskW` so both sides compare their low `w` bits, matching a
+/// `cmp r{w}` flag computation. A full-width (`w == 64`) compare is unchanged.
+fn mask_w(e: &Expr, w: u8) -> String {
+    if !(1..64).contains(&w) {
+        return expr_c(e);
+    }
+    let m: u64 = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+    match e {
+        Expr::Const(c, _) => const_c(((*c as u128) & (m as u128)) as i128),
+        _ => format!("({} & 0x{:x}ULL)", expr_c(e), m),
+    }
+}
+
+/// Render `e` as a signed `int64_t` interpreted at `w` bits. A constant is
+/// sign-extended from `w` (so a 32-bit `0xfff0b9d9` is `-1000999`, not the
+/// zero-extended `+4293913049` that silently breaks `cmp r32, imm32; jge`);
+/// non-constant operands defer to `signed_cast`, which derives their own width.
+fn signed_cast_w(e: &Expr, w: u8) -> String {
+    if let Expr::Const(c, _) = e {
+        if (1..64).contains(&w) {
+            let m = (1u128 << w) - 1;
+            let v = (*c as u128) & m;
+            let signed: i128 = if (v >> (w - 1)) & 1 == 1 {
+                v as i128 - (1i128 << w)
+            } else {
+                v as i128
+            };
+            return format!("(int64_t)({})", signed);
+        }
+    }
+    signed_cast(e)
+}
+
+fn binary_c(op: BinOp, a: &Expr, b: &Expr) -> String {
+    use BinOp::*;
+    let u = |x: &Expr| format!("(uint64_t)({})", expr_c(x));
+    // Signed comparison/division: interpret both operands at a common width, so a
+    // constant operand sign-extends from the same width as its (often masked)
+    // sibling rather than being read as a large positive 64-bit value.
+    let s = |o: &str| {
+        let w = signed_width(a).or_else(|| signed_width(b)).unwrap_or(64);
+        format!("({} {} {})", signed_cast_w(a, w), o, signed_cast_w(b, w))
+    };
+    let un = |o: &str| format!("({} {} {})", u(a), o, u(b));
+    let plain = |o: &str| format!("({} {} {})", expr_c(a), o, expr_c(b));
+    // Equality at a common width: a `cmp r32, imm` sets ZF from a 32-bit compare,
+    // so a sign-extended immediate (-1 → 0xffffffffffffffff) must be truncated to
+    // the operand width recovered from a masked sibling — otherwise it never
+    // equals the 32-bit operand (0xffffffff), e.g. a `dec; jne -1` loop counter
+    // never terminates.
+    let eq = |o: &str| {
+        let w = signed_width(a).or_else(|| signed_width(b)).unwrap_or(64);
+        format!("({} {} {})", mask_w(a, w), o, mask_w(b, w))
+    };
+    match op {
+        Add => plain("+"),
+        Sub => plain("-"),
+        Mul => plain("*"),
+        And => plain("&"),
+        Or => plain("|"),
+        Xor => plain("^"),
+        // Left operand cast to 64-bit: a small/constant operand is otherwise an
+        // `int`, and `1 << 32` (shift ≥ width) is undefined behaviour in C.
+        Shl => format!("({} << {})", u(a), expr_c(b)),
+        Eq => eq("=="),
+        Ne => eq("!="),
+        Shr => format!("({} >> {})", u(a), expr_c(b)),
+        Sar => format!("({} >> {})", signed_cast(a), expr_c(b)),
+        UDiv => un("/"),
+        UMod => un("%"),
+        Ult => un("<"),
+        Ule => un("<="),
+        Ugt => un(">"),
+        Uge => un(">="),
+        SDiv => s("/"),
+        SMod => s("%"),
+        Slt => s("<"),
+        Sle => s("<="),
+        Sgt => s(">"),
+        Sge => s(">="),
+    }
+}
+
+/// Collect every `ValueId` referenced anywhere (defs, uses, φ args) so they can
+/// all be declared (including undef versions that are read but never assigned).
+pub(crate) fn collect_values(func: &IrFunction, out: &mut BTreeSet<u32>) {
+    fn walk(e: &Expr, out: &mut BTreeSet<u32>) {
+        match e {
+            Expr::Use(v) => {
+                out.insert(v.0);
+            }
+            Expr::Phi(args) => {
+                for v in args {
+                    out.insert(v.0);
+                }
+            }
+            Expr::Load { addr, .. } => walk(addr, out),
+            Expr::Unary(_, x) | Expr::Cast { expr: x, .. } => walk(x, out),
+            Expr::Binary(_, a, b) => {
+                walk(a, out);
+                walk(b, out);
+            }
+            Expr::Call { target, args, .. } => {
+                if let CallTarget::Indirect(x) = target {
+                    walk(x, out);
+                }
+                for a in args {
+                    walk(a, out);
+                }
+            }
+            Expr::Select { cond, then_, else_ } => {
+                walk(cond, out);
+                walk(then_, out);
+                walk(else_, out);
+            }
+            _ => {}
+        }
+    }
+    for b in &func.blocks {
+        for s in &b.stmts {
+            if let Stmt::Assign { dst, .. } = s {
+                out.insert(dst.0);
+            }
+            match s {
+                Stmt::Set { expr, .. }
+                | Stmt::Assign { expr, .. }
+                | Stmt::CallStmt(expr) => walk(expr, out),
+                Stmt::Store { addr, value, .. } => {
+                    walk(addr, out);
+                    walk(value, out);
+                }
+                Stmt::Branch { cond, .. } => walk(cond, out),
+                Stmt::Switch { value, .. } => walk(value, out),
+                Stmt::Return(Some(e)) => walk(e, out),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Collect recovered stack-frame slot displacements (for declaration).
+pub(crate) fn collect_frame_vars(func: &IrFunction, out: &mut BTreeSet<i64>) {
+    fn walk(e: &Expr, out: &mut BTreeSet<i64>) {
+        match e {
+            Expr::Read(Location::Frame(d)) | Expr::Addr(Location::Frame(d)) => {
+                out.insert(*d);
+            }
+            Expr::Load { addr, .. } => walk(addr, out),
+            Expr::Unary(_, x) | Expr::Cast { expr: x, .. } => walk(x, out),
+            Expr::Binary(_, a, b) => {
+                walk(a, out);
+                walk(b, out);
+            }
+            Expr::Call { target, args, .. } => {
+                // An indirect call's target is itself an expression (e.g. a frame
+                // slot holding a function pointer) — walk it too, or its frame
+                // slots go undeclared.
+                if let CallTarget::Indirect(e) = target {
+                    walk(e, out);
+                }
+                for a in args {
+                    walk(a, out);
+                }
+            }
+            Expr::Select { cond, then_, else_ } => {
+                walk(cond, out);
+                walk(then_, out);
+                walk(else_, out);
+            }
+            _ => {}
+        }
+    }
+    for b in &func.blocks {
+        for s in &b.stmts {
+            if let Stmt::Set { dst: Location::Frame(d), .. } = s {
+                out.insert(*d);
+            }
+            match s {
+                Stmt::Set { expr, .. }
+                | Stmt::Assign { expr, .. }
+                | Stmt::CallStmt(expr) => walk(expr, out),
+                Stmt::Store { addr, value, .. } => {
+                    walk(addr, out);
+                    walk(value, out);
+                }
+                Stmt::Branch { cond, .. } => walk(cond, out),
+                Stmt::Return(Some(e)) => walk(e, out),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Split recovered frame slots into `(params, locals)`. Parameters are the
+/// positive slots at/after the first argument (`saved_bp` at 0, return address
+/// at one pointer, first argument at two pointers); everything else is a local.
+pub(crate) fn frame_params_locals(func: &IrFunction) -> (Vec<i64>, Vec<i64>) {
+    let mut fv = BTreeSet::new();
+    collect_frame_vars(func, &mut fv);
+    let ptr = (func.bits.max(32) / 8) as i64;
+    let first_arg = 2 * ptr;
+    let mut params = Vec::new();
+    let mut locals = Vec::new();
+    for d in fv {
+        if d >= first_arg {
+            params.push(d);
+        } else {
+            locals.push(d);
+        }
+    }
+    (params, locals)
+}
+
+/// The function's C signature. With `with_params`, recovered frame arguments
+/// become real parameters; otherwise `(void)`.
+pub(crate) fn signature(func: &IrFunction, with_params: bool) -> String {
+    // Shared machine-stack mode: every function takes the caller's stack pointer
+    // plus the volatile general registers (so both stack- and register-passed
+    // arguments cross calls). The register parameters are a fixed list.
+    if shared_stack() {
+        let mut p = vec!["uint64_t __esp".to_string()];
+        for v in &func.reg_params {
+            p.push(format!("uint64_t v{}", v));
+        }
+        return format!("uint64_t sub_{:x}({})", func.entry, p.join(", "));
+    }
+    if !with_params {
+        return format!("uint64_t sub_{:x}(void)", func.entry);
+    }
+    let mut p: Vec<String> = Vec::new();
+    // Register-passed parameters first (64-bit ABIs), in convention order.
+    for v in &func.reg_params {
+        p.push(format!("uint64_t v{}", v));
+    }
+    // Then stack/frame parameters.
+    let (params, _) = frame_params_locals(func);
+    for d in params {
+        p.push(format!("uint64_t {}", frame_name(d)));
+    }
+    if p.is_empty() {
+        format!("uint64_t sub_{:x}(void)", func.entry)
+    } else {
+        format!("uint64_t sub_{:x}({})", func.entry, p.join(", "))
+    }
+}
+
+/// Declaration line for frame slots that are *not* parameters (or all of them
+/// when `with_params` is false).
+pub(crate) fn frame_decls(func: &IrFunction, with_params: bool) -> Option<String> {
+    let (params, locals) = frame_params_locals(func);
+    let set: Vec<i64> = if with_params {
+        locals
+    } else {
+        params.into_iter().chain(locals).collect()
+    };
+    if set.is_empty() {
+        return None;
+    }
+    let decls: Vec<String> = set.iter().map(|d| format!("{} = 0", frame_name(*d))).collect();
+    Some(format!("    uint64_t {};", decls.join(", ")))
+}
+
+/// Collect direct call targets, to forward-declare them.
+pub(crate) fn collect_callees(func: &IrFunction, out: &mut BTreeSet<u64>) {
+    fn walk(e: &Expr, out: &mut BTreeSet<u64>) {
+        match e {
+            Expr::Call { target: CallTarget::Direct(a), args, .. } => {
+                out.insert(*a);
+                for x in args {
+                    walk(x, out);
+                }
+            }
+            Expr::Call { args, .. } => {
+                for x in args {
+                    walk(x, out);
+                }
+            }
+            Expr::Load { addr, .. } => walk(addr, out),
+            Expr::Unary(_, x) | Expr::Cast { expr: x, .. } => walk(x, out),
+            Expr::Binary(_, a, b) => {
+                walk(a, out);
+                walk(b, out);
+            }
+            Expr::Select { cond, then_, else_ } => {
+                walk(cond, out);
+                walk(then_, out);
+                walk(else_, out);
+            }
+            _ => {}
+        }
+    }
+    for b in &func.blocks {
+        for s in &b.stmts {
+            match s {
+                Stmt::Set { expr, .. } | Stmt::Assign { expr, .. } | Stmt::CallStmt(expr) => {
+                    walk(expr, out)
+                }
+                Stmt::Store { addr, value, .. } => {
+                    walk(addr, out);
+                    walk(value, out);
+                }
+                Stmt::Return(Some(e)) => walk(e, out),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn stmt_c(s: &Stmt, out: &mut String) {
+    match s {
+        Stmt::Assign { dst, expr } => {
+            let _ = writeln!(out, "    v{} = {};", dst.0, expr_c(expr));
+        }
+        Stmt::Set { dst: Location::Frame(d), expr } => {
+            let _ = writeln!(out, "    {} = {};", frame_name(*d), expr_c(expr));
+        }
+        Stmt::Set { .. } => {}
+        Stmt::Store { addr, value, ty } => {
+            let _ = writeln!(out, "    {} = {};", lvalue_c(addr, int_bits(ty)), expr_c(value));
+        }
+        Stmt::Branch { cond, taken, fallthrough } => {
+            let _ = writeln!(out, "    if ({}) goto B{};", expr_c(cond), taken.0);
+            let _ = writeln!(out, "    goto B{};", fallthrough.0);
+        }
+        Stmt::Jump(b) => {
+            let _ = writeln!(out, "    goto B{};", b.0);
+        }
+        Stmt::Switch { value, cases, default } => {
+            let _ = writeln!(out, "    switch ({}) {{", expr_c(value));
+            for (k, b) in cases {
+                let _ = writeln!(out, "        case {}: goto B{};", k, b.0);
+            }
+            let _ = writeln!(out, "        default: goto B{};", default.0);
+            let _ = writeln!(out, "    }}");
+        }
+        Stmt::Return(Some(e)) => {
+            let _ = writeln!(out, "    return {};", expr_c(e));
+        }
+        Stmt::Return(None) => {
+            let _ = writeln!(out, "    return 0;");
+        }
+        Stmt::CallStmt(e) => {
+            let _ = writeln!(out, "    (void)({});", expr_c(e));
+        }
+        Stmt::Asm(t) => {
+            let _ = writeln!(out, "    /* asm: {} */", t);
+        }
+        Stmt::Nop => {}
+    }
+}
+
+/// Emit one function as compilable C (goto form). `forward` receives the
+/// forward declarations this function needs (callees).
+pub fn emit_function(func: &IrFunction, forward: &mut BTreeSet<u64>, with_params: bool) -> String {
+    let struct_defs = {
+        let si = crate::types::struct_info(func);
+        let defs = si.defs();
+        set_struct_info(Some(si));
+        defs
+    };
+    let mut f = func.clone();
+    destruct_ssa(&mut f);
+
+    let mut values = BTreeSet::new();
+    collect_values(&f, &mut values);
+    collect_callees(&f, forward);
+    if with_params {
+        for p in &f.reg_params {
+            values.remove(p); // declared as parameters, not locals
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str(&struct_defs);
+    let unlifted = count_unlifted(&f);
+    if unlifted > 0 {
+        let _ = writeln!(
+            out,
+            "// WARNING: {} unmodelled instruction(s) — decompilation INCOMPLETE, result may be incorrect",
+            unlifted
+        );
+    }
+    let _ = writeln!(out, "{} {{", signature(&f, with_params));
+    out.push_str(&value_decls(&values, &f.frame_base_values, &f.fp80_values));
+    if let Some(fd) = frame_decls(&f, with_params) {
+        let _ = writeln!(out, "{}", fd);
+    }
+    // Enter at the function's entry block.
+    let entry_id = f
+        .blocks
+        .iter()
+        .find(|b| b.addr == f.entry)
+        .map(|b| b.id)
+        .unwrap_or(0);
+    let _ = writeln!(out, "    goto B{};", entry_id);
+    for b in &f.blocks {
+        let _ = writeln!(out, "B{}:;", b.id);
+        for s in &b.stmts {
+            stmt_c(s, &mut out);
+        }
+        // A block with no terminator falls through; guard with a return.
+        if !ends_in_terminator(b) {
+            let _ = writeln!(out, "    return 0;");
+        }
+    }
+    let _ = writeln!(out, "}}");
+    set_struct_info(None);
+    out
+}
+
+/// Make every direct call to a function *defined in this unit* pass exactly the
+/// number of arguments that callee's emitted signature declares, so the unit
+/// recompiles even though the lifter over-approximates each call to the six
+/// SysV integer argument registers.
+///
+/// Register arguments are kept (truncated, or zero-padded, to the callee's
+/// recovered register-parameter count); recovered frame parameters are passed
+/// as zero. Calls to a callee *not* defined here are left untouched — their
+/// forward declaration uses an empty parameter list (`sub_x();`) and so accepts
+/// any arity. This also subsumes recursive self-calls, whose prototype is the
+/// function's own definition.
+pub(crate) fn fixup_call_arity(funcs: &mut [IrFunction]) {
+    use std::collections::HashMap;
+    // entry -> (register params, total params incl. frame).
+    let arity: HashMap<u64, (usize, usize)> = funcs
+        .iter()
+        .map(|f| (f.entry, (f.reg_params.len(), param_count(f))))
+        .collect();
+    for f in funcs.iter_mut() {
+        for b in &mut f.blocks {
+            for s in &mut b.stmts {
+                map_top_exprs(s, &mut |e| fixup_call_expr(e, &arity));
+            }
+        }
+    }
+}
+
+fn fixup_call_expr(e: &mut Expr, arity: &std::collections::HashMap<u64, (usize, usize)>) {
+    match e {
+        Expr::Call { target, args, .. } => {
+            for a in args.iter_mut() {
+                fixup_call_expr(a, arity);
+            }
+            match target {
+                CallTarget::Indirect(x) => fixup_call_expr(x, arity),
+                CallTarget::Direct(addr) => {
+                    if let Some(&(nreg, ntot)) = arity.get(addr) {
+                        args.truncate(nreg);
+                        while args.len() < ntot {
+                            args.push(Expr::Const(0, Ty::int(64)));
+                        }
+                    }
+                }
+                // A named import has no recovered signature, but well-known libc
+                // functions have a fixed arity; trimming the over-approximated
+                // argument registers to it removes noise (`strlen(s)` not
+                // `strlen(s, …)`). The call has no prototype, so this is safe.
+                CallTarget::Named(n) => {
+                    if let Some(k) = libc_arity(n) {
+                        if args.len() > k {
+                            args.truncate(k);
+                        }
+                    }
+                }
+            }
+        }
+        Expr::Load { addr, .. } => fixup_call_expr(addr, arity),
+        Expr::Unary(_, x) | Expr::Cast { expr: x, .. } => fixup_call_expr(x, arity),
+        Expr::Binary(_, a, b) => {
+            fixup_call_expr(a, arity);
+            fixup_call_expr(b, arity);
+        }
+        Expr::Select { cond, then_, else_ } => {
+            fixup_call_expr(cond, arity);
+            fixup_call_expr(then_, arity);
+            fixup_call_expr(else_, arity);
+        }
+        _ => {}
+    }
+}
+
+/// Fixed argument count of a common libc function, if known. The name may be a
+/// raw import symbol (possibly with a `@plt`/version suffix), so match the stem.
+fn libc_arity(name: &str) -> Option<usize> {
+    let stem = name
+        .split(['@', '+'])
+        .next()
+        .unwrap_or(name)
+        .trim_start_matches("__")
+        .trim_end_matches("_chk");
+    Some(match stem {
+        "strlen" | "free" | "puts" | "fflush" | "fclose" | "perror" | "abort" | "exit"
+        | "_exit" | "rewind" | "atoi" | "atol" | "strdup" | "clearerr" | "fileno"
+        | "malloc" | "isatty" | "umask" | "close" | "unlink" | "rmdir" | "chdir" => 1,
+        "strcmp" | "strcpy" | "strcat" | "fopen" | "fputs" | "fdopen" | "getenv" | "setenv"
+        | "rename" | "fseek" | "dup2" | "kill" | "access" | "stat" | "lstat" | "fstat"
+        | "strchr" | "strrchr" | "strstr" => 2,
+        "memcpy" | "memset" | "memmove" | "strncmp" | "strncpy" | "strncat" | "read"
+        | "write" | "memchr" | "fgets" | "lseek" => 3,
+        "fread" | "fwrite" => 4,
+        _ => return None,
+    })
+}
+
+/// Apply `f` to each top-level expression of a statement.
+fn map_top_exprs(s: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
+    match s {
+        Stmt::Set { expr, .. } | Stmt::Assign { expr, .. } | Stmt::CallStmt(expr) => f(expr),
+        Stmt::Store { addr, value, .. } => {
+            f(addr);
+            f(value);
+        }
+        Stmt::Branch { cond, .. } => f(cond),
+        Stmt::Switch { value, .. } => f(value),
+        Stmt::Return(Some(e)) => f(e),
+        _ => {}
+    }
+}
+
+/// Number of recovered parameters of `func` (register + frame).
+pub(crate) fn param_count(func: &IrFunction) -> usize {
+    func.reg_params.len() + frame_params_locals(func).0.len()
+}
+
+fn ends_in_terminator(b: &Block) -> bool {
+    matches!(
+        b.stmts.last(),
+        Some(Stmt::Jump(_) | Stmt::Branch { .. } | Stmt::Return(_) | Stmt::Switch { .. })
+    )
+}
+
+/// Emit a complete compilable C translation unit for the given functions.
+pub fn emit_unit(funcs: &[IrFunction]) -> String {
+    // Always emit real parameter signatures; an interprocedural fixup then makes
+    // every call to a function defined here match its callee's arity, so the
+    // unit recompiles (call-site arguments — roadmap §15.4 #2).
+    let mut funcs = funcs.to_vec();
+    fixup_call_arity(&mut funcs);
+    let with_params = true;
+    let mut body = String::new();
+    let mut forward: BTreeSet<u64> = BTreeSet::new();
+    let defined: BTreeSet<u64> = funcs.iter().map(|f| f.entry).collect();
+    for f in &funcs {
+        body.push_str(&emit_function(f, &mut forward, with_params));
+        body.push('\n');
+    }
+    let mut out = String::new();
+    out.push_str("#include <stdint.h>\n\n");
+    out.push_str(float_preamble(&body));
+    // Forward-declare every function (defined or external) with an empty
+    // parameter list, so a call that precedes its callee's definition still has
+    // a compatible prototype. The empty list is compatible with the real,
+    // parameterised definition emitted below.
+    for a in forward.union(&defined) {
+        let _ = writeln!(out, "uint64_t sub_{:x}();", a);
+    }
+    out.push('\n');
+    out.push_str(&body);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emits_and_lowers_phi() {
+        // Diamond with a phi -> after destruction, no Phi remains and copy
+        // blocks are inserted.
+        let rax = Location::Reg(RegId(0));
+        let mut f = IrFunction {
+            entry: 0,
+            name: "t".into(),
+            bits: 64,
+            reg_params: vec![],
+            frame_base_values: vec![],
+            fp80_values: vec![],
+            entry_values: vec![],
+            blocks: vec![
+                Block { id: 0, addr: 0, stmts: vec![Stmt::Set { dst: rax.clone(), expr: Expr::konst(1, 32) }, Stmt::Branch { cond: Expr::konst(1, 8), taken: BlockId(1), fallthrough: BlockId(2) }], succ: vec![1, 2], pred: vec![] },
+                Block { id: 1, addr: 1, stmts: vec![Stmt::Set { dst: rax.clone(), expr: Expr::konst(2, 32) }, Stmt::Jump(BlockId(3)) ], succ: vec![3], pred: vec![0] },
+                Block { id: 2, addr: 2, stmts: vec![Stmt::Jump(BlockId(3))], succ: vec![3], pred: vec![0] },
+                Block { id: 3, addr: 3, stmts: vec![Stmt::Return(Some(Expr::Read(rax.clone())))], succ: vec![], pred: vec![1, 2] },
+            ],
+            next_value: 0,
+            next_temp: 0,
+        };
+        crate::ssa::to_ssa(&mut f);
+        crate::opt::optimize(&mut f);
+        let mut fwd = BTreeSet::new();
+        let c = emit_function(&f, &mut fwd, true);
+        assert!(c.contains("uint64_t sub_0(void)"));
+        assert!(!c.contains("phi"), "phi must be lowered, got:\n{}", c);
+        assert!(c.contains("return"));
+    }
+}

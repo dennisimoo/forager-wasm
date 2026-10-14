@@ -1,0 +1,42 @@
+{
+  "original": {
+    "start": {
+      "frames": 3450,
+      "time": 238495.30000001192
+    },
+    "end": {
+      "frames": 3609,
+      "time": 248499.90000000596,
+      "room": 8,
+      "errors": []
+    },
+    "fps": 15.892689362902537
+  },
+  "asynchronous": {
+    "start": {
+      "frames": 3660,
+      "time": 251674.30000001192
+    },
+    "end": {
+      "frames": 3820,
+      "time": 261686.20000001788,
+      "room": 8,
+      "errors": []
+    },
+    "fps": 15.98098263065999
+  },
+  "stats": "{\"result\":{\"type\":\"string\",\"value\":\"{\\\"frames\\\":209,\\\"polls\\\":2492,\\\"waitMs\\\":7467.59999987483,\\\"pending\\\":1,\\\"maxPending\\\":1}\"}}\n",
+  "restored": {
+    "start": {
+      "frames": 3873,
+      "time": 265003.40000000596
+    },
+    "end": {
+      "frames": 4034,
+      "time": 275016.59999999404,
+      "room": 8,
+      "errors": []
+    },
+    "fps": 16.07877601567847
+  }
+}

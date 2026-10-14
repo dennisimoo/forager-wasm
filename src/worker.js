@@ -1,11 +1,14 @@
-const gamePath = "/assets/game.unx";
+const largeFiles = new Map([
+  ["/native-build/diagnostic-O1.wasm", "application/wasm"],
+  ["/web-game/data.win", "application/octet-stream"],
+]);
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     let response;
 
-    if (url.pathname === gamePath) {
+    if (largeFiles.has(url.pathname)) {
       if (!["GET", "HEAD"].includes(request.method)) {
         return new Response("Method not allowed", {
           status: 405,
@@ -14,17 +17,17 @@ export default {
       }
       const object =
         request.method === "HEAD"
-          ? await env.GAME_ASSETS.head(gamePath.slice(1))
-          : await env.GAME_ASSETS.get(gamePath.slice(1));
+          ? await env.GAME_ASSETS.head(url.pathname.slice(1))
+          : await env.GAME_ASSETS.get(url.pathname.slice(1));
       if (!object) {
         response = new Response("Game file not found", { status: 404 });
       } else {
         const headers = new Headers();
         object.writeHttpMetadata(headers);
-        headers.set("Content-Type", "application/octet-stream");
+        headers.set("Content-Type", largeFiles.get(url.pathname));
         headers.set("Content-Length", String(object.size));
         headers.set("ETag", object.httpEtag);
-        headers.set("Cache-Control", "public, max-age=31536000");
+        headers.set("Cache-Control", "no-cache");
         response = new Response(
           request.method === "HEAD" ? null : object.body,
           { headers },
@@ -43,7 +46,7 @@ export default {
     headers.set("Cross-Origin-Resource-Policy", "same-origin");
     headers.set(
       "Link",
-      '<https://github.com/dennisimoo/forager-wasm>; rel="source"',
+      '<https://github.com/dennisimoo/forager-wasm/tree/codex/forager-4.1.9>; rel="source"',
     );
     return new Response(response.body, {
       status: response.status,
