@@ -1,8 +1,8 @@
 {
-  "version": "359f3a1760c6fbab1f8de4a03749e7578e17b141731b63f19ccae528a1ceb0fc",
+  "version": "cb0063c83b3ac1071f8336edd79754e5262dc3f5bee217426db7925f19030bd9",
   "bytes": {
-    "butterscotch.wasm": 1900719,
-    "assets/game.unx": 81444192,
+    "butterscotch.wasm": 1901045,
+    "assets/game.unx": 81444448,
     "assets/options.ini": 110,
     "assets/icon.png": 5183,
     "assets/audiogroup1.dat": 25142035,

@@ -1,0 +1,12 @@
+BEFORE
+Game: BRIDGE blocked axis=0 travelDir=-1 p=719.50
+Game: BRIDGE blocked axis=0 travelDir=-1 p=719.75
+Game: BRIDGE blocked axis=0 travelDir=1 p=719.50
+Game: BRIDGE blocked axis=0 travelDir=1 p=719.75
+Game: BRIDGE blocked axis=1 travelDir=-1 p=719.50
+Game: BRIDGE blocked axis=1 travelDir=-1 p=719.75
+Game: BRIDGE blocked axis=1 travelDir=1 p=719.50
+Game: BRIDGE blocked axis=1 travelDir=1 p=719.75
+Game: BRIDGE checks=792 failures=8
+AFTER
+Game: BRIDGE checks=792 failures=0

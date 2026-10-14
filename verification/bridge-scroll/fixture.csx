@@ -1,0 +1,12 @@
+using UndertaleModLib.Compiler;
+EnsureDataLoaded();
+var group = new CodeImportGroup(Data);
+group.QueueReplace("gml_Object_objBridge_Create_0", "");
+group.QueueReplace("gml_Object_objBridge_CleanUp_0", "");
+group.QueueReplace("gml_Object_objBridge_Destroy_0", "");
+group.QueueReplace("gml_Script_WaterCollision", GetDecompiledText("gml_Script_WaterCollision").Replace("room == rmGame", "true"));
+group.QueueReplace("gml_Script_TileCollision", GetDecompiledText("gml_Script_TileCollision").Replace("room != rmGame", "false"));
+group.QueueReplace("gml_Script_EntityWaterCollision", GetDecompiledText("gml_Script_EntityWaterCollision").Replace("room == rmGame", "true"));
+var gml = System.IO.File.ReadAllText("verification/bridge-scroll/crossing.gml");
+group.QueueReplace("gml_Object_InitController_Create_0", gml);
+group.Import();
