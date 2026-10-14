@@ -1,0 +1,14 @@
+{
+  "world_before": {
+    "room": 6,
+    "overlayAlpha": 0.88
+  },
+  "skills": {
+    "room": 7,
+    "overlayAlpha": 0.0
+  },
+  "world_after": {
+    "room": 6,
+    "overlayAlpha": 0.7
+  }
+}
