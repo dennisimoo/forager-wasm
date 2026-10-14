@@ -1,0 +1,5 @@
+VM: Initialized with 0 functions mapped
+PASS: deleting a list array releases its reference
+PASS: collision membership follows movement, activation, and destruction
+VM: Reset complete
+PASS: smoke shape and all sparkle sizes register; particles expire and reuse pools

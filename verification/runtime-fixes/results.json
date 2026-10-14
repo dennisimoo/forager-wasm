@@ -1,0 +1,24 @@
+{
+  "input_events": 2002,
+  "key_held_after": false,
+  "mouse_held_after": false,
+  "key_release_events": 1,
+  "mouse_release_events": 1,
+  "particle_shapes": [12, 9],
+  "sparkle_sizes": [0, 1, 2],
+  "memory_stress": {
+    "iterations": 500000,
+    "before_peak_kib": 252904,
+    "after_peak_kib": 135404
+  },
+  "persistent_room_collision": {
+    "before": "FAIL",
+    "after": "PASS"
+  },
+  "bridges": {
+    "horizontal_failures": 0,
+    "vertical_failures": 0
+  },
+  "wasm_build": "Emscripten 6.0.12, Release",
+  "verification_scope": "Focused native checks and browser fixture; full progression and hardware FPS not tested."
+}

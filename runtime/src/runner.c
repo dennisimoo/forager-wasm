@@ -1709,6 +1709,9 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
         // Event iteration is forward (oldest first), so a persistent instance runs after the room's own instances.
         int32_t savedCount = (int32_t) arrlen(savedState->instances);
         repeat(savedCount, i) {
+            // The old room grid was freed; re-index restored instances in this grid.
+            arrsetlen(savedState->instances[i]->collisionCells, 0);
+            savedState->instances[i]->spatialGridDirty = false;
             arrput(runner->instances, savedState->instances[i]);
             Runner_addInstanceToObjectLists(runner, savedState->instances[i]);
         }

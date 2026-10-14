@@ -430,7 +430,8 @@ typedef struct {
 typedef struct {
     bool used;
 
-    int32_t sprite;       // sprite asset index, -1 when the type has no sprite (draws nothing)
+    int32_t sprite;       // sprite asset index, -1 when using a built-in shape
+    int32_t shape;        // built-in shape 0..13; -1 when using a sprite
     bool spriteAnimate;   // advance the subimage as the particle ages
     bool spriteStretch;   // stretch one full animation cycle across the particle's whole life
     bool spriteRandom;    // start from a random subimage
@@ -823,6 +824,9 @@ struct Runner {
     // Particle systems own their emitters and live particles; types are global and can be streamed by
     // any system's emitters. Both pools reuse destroyed slots, matching the ds_* id behaviour.
     ParticleSystem* particleSystemPool; // stb_ds array of ParticleSystem
+    int32_t builtinParticleSprites[14]; // cached sprite id + 1, zero until loaded
+    int32_t sparkleSystem; // system id + 1, zero until created
+    int32_t sparkleTypes[3]; // type id + 1 for each effect size
     ParticleType* particleTypePool; // stb_ds array of ParticleType
     AudioEmitter* audioEmitters; // stb_ds array, index = audio emitter id
 

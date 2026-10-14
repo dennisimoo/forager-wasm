@@ -73,7 +73,7 @@ This compiles `runtime/`, updates the files in `public/`, and refreshes the load
 
 ## Status
 
-This is a community test build. Browser checks confirmed fresh Classic-game startup, movement, harvesting, inventory, audio output, saved-slot thumbnails, and persistent save/reload. Runtime fixes also address recipe lists and HUD text alignment. The lighting controller resets its overlay on room entry so world lighting does not darken the skills screen. Full building/crafting progression and every late-game feature have not been verified. Actual Chromebook and MacBook hardware testing remains outstanding.
+This is a community test build. Browser checks confirmed fresh Classic-game startup, movement, harvesting, inventory, audio output, saved-slot thumbnails, and persistent save/reload. Runtime fixes also address recipe lists, HUD text alignment, array cleanup, collision-grid updates, and queued input releases. Built-in particle textures and the player/droid sparkle effect are supported. The lighting controller resets its overlay on room entry so world lighting does not darken the skills screen. Full building/crafting progression and every late-game feature have not been verified. Actual Chromebook and MacBook hardware testing remains outstanding.
 
 ## Credits
 

@@ -9,7 +9,6 @@
 #include <emscripten/wasmfs.h>
 #include <GL/gl.h>
 
-#define MAX_KEY_QUEUE 64
 
 enum {
     INPUTTYPE_KEY,
@@ -22,8 +21,7 @@ struct {
     bool down;
 } typedef InputEntry;
 
-static InputEntry gInputQueue[MAX_KEY_QUEUE];
-static int gInputCount;
+static InputEntry* gInputQueue = nullptr;
 
 
 static Runner* gRunner = nullptr;
@@ -162,43 +160,19 @@ bool platformInit(int32_t reqW, int32_t reqH, MAYBE_UNUSED const char *title, MA
 }
 
 void onKeyUp(int keyCode) {
-    if (gInputCount == MAX_KEY_QUEUE)
-        return;
-
-    int entryIndex = gInputCount++;
-    gInputQueue[entryIndex].inputType = INPUTTYPE_KEY;
-    gInputQueue[entryIndex].key = keyCode;
-    gInputQueue[entryIndex].down = false;
+    arrput(gInputQueue, ((InputEntry) { INPUTTYPE_KEY, keyCode, false }));
 }
 
 void onKeyDown(int keyCode) {
-    if (gInputCount == MAX_KEY_QUEUE)
-        return;
-
-    int entryIndex = gInputCount++;
-    gInputQueue[entryIndex].inputType = INPUTTYPE_KEY;
-    gInputQueue[entryIndex].key = keyCode;
-    gInputQueue[entryIndex].down = true;
+    arrput(gInputQueue, ((InputEntry) { INPUTTYPE_KEY, keyCode, true }));
 }
 
 void onMouseUp(int button) {
-    if (gInputCount == MAX_KEY_QUEUE)
-        return;
-
-    int entryIndex = gInputCount++;
-    gInputQueue[entryIndex].inputType = INPUTTYPE_MOUSE_BUTTON;
-    gInputQueue[entryIndex].key = button;
-    gInputQueue[entryIndex].down = false;
+    arrput(gInputQueue, ((InputEntry) { INPUTTYPE_MOUSE_BUTTON, button, false }));
 }
 
 void onMouseDown(int button) {
-    if (gInputCount == MAX_KEY_QUEUE)
-        return;
-
-    int entryIndex = gInputCount++;
-    gInputQueue[entryIndex].inputType = INPUTTYPE_MOUSE_BUTTON;
-    gInputQueue[entryIndex].key = button;
-    gInputQueue[entryIndex].down = true;
+    arrput(gInputQueue, ((InputEntry) { INPUTTYPE_MOUSE_BUTTON, button, true }));
 }
 
 void onMouseMove(double x, double y) {
@@ -207,6 +181,8 @@ void onMouseMove(double x, double y) {
 }
 
 void platformExit(void) {
+    arrfree(gInputQueue);
+    gInputQueue = nullptr;
     gInitialized = false;
     emscripten_webgl_destroy_context(gWebGLContextHandle);
 }
@@ -259,7 +235,7 @@ void *platformGetProcAddress(MAYBE_UNUSED const char *name) {
 
 bool platformHandleEvents(void) {
     int inputIndex = 0;
-    while (gInputCount != inputIndex) {
+    while (arrlen(gInputQueue) != inputIndex) {
         InputEntry entry = gInputQueue[inputIndex];
 
         switch (entry.inputType) {
@@ -284,7 +260,7 @@ bool platformHandleEvents(void) {
         inputIndex++;
     }
 
-    gInputCount = 0;
+    arrsetlen(gInputQueue, 0);
     
     return gRequestedRunnerExit;
 }

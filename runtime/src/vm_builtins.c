@@ -40,6 +40,7 @@
 #include "miniz.h"
 #if defined(ENABLE_MODERN_GL) || defined(ENABLE_LEGACY_GL)
 #include "image_decoder.h"
+#include "../vendor/gamemaker-particles/images.h"
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -5271,7 +5272,7 @@ static RValue builtin_ds_list_delete(VMContext* ctx, RValue* args, int32_t argCo
     DsList* list = dsListGet(runner, id);
     if (list == nullptr) return RValue_makeUndefined();
     if (0 > pos || pos >= (int32_t) arrlen(list->items)) return RValue_makeUndefined();
-    if (list->items[pos].type == RVALUE_STRING) RValue_free(&list->items[pos]);
+    RValue_free(&list->items[pos]);
     arrdel(list->items, pos);
     return RValue_makeUndefined();
 }
@@ -20521,6 +20522,35 @@ static uint32_t particleColourAt(const ParticleType* type, GMLReal ageFraction) 
     return particleColourLerp(type->colourMiddle, type->colourEnd, (ageFraction - 0.5) * 2.0);
 }
 
+// Built-in shapes use GameMaker's original textures, uploaded once per runner.
+static int32_t particleShapeSprite(Runner* runner, int32_t shape) {
+    if (shape < 0 || shape >= 14) return -1;
+    if (runner->builtinParticleSprites[shape]) return runner->builtinParticleSprites[shape] - 1;
+#if defined(ENABLE_MODERN_GL) || defined(ENABLE_LEGACY_GL)
+    Renderer* renderer = runner->renderer;
+    if (!renderer || !renderer->vtable->surfaceSetPixels || !renderer->vtable->createSpriteFromSurface) return -1;
+    unsigned int begin = builtinParticlePngOffsets[shape];
+    int w, h;
+    uint8_t* rgba = ImageDecoder_decodeToRgba(builtinParticlePngs + begin,
+        builtinParticlePngOffsets[shape + 1] - begin, false, &w, &h);
+    if (!rgba) return -1;
+    int32_t surface = Renderer_createSurface(renderer, w, h);
+    int32_t sprite = -1;
+    if (surface >= 0) {
+        if (renderer->vtable->surfaceSetPixels(renderer, surface, rgba)) {
+            // The HTML5 runner's particle texture entry crops to 63x63, centered at 32.
+            sprite = renderer->vtable->createSpriteFromSurface(renderer, surface, 0, 0, 63, 63, false, false, 32, 32);
+        }
+        renderer->vtable->surfaceFree(renderer, surface);
+    }
+    free(rgba);
+    if (sprite >= 0) runner->builtinParticleSprites[shape] = sprite + 1;
+    return sprite;
+#else
+    return -1;
+#endif
+}
+
 // Not static: backs both part_system_drawit and the system's entry in the depth-sorted draw list.
 void Particles_drawSystem(Runner* runner, int32_t systemId) {
     ParticleSystem* system = Particles_systemGet(runner, systemId);
@@ -20544,7 +20574,9 @@ void Particles_drawSystem(Runner* runner, int32_t systemId) {
     repeat(count, i) {
         Particle* particle = &system->particles[i];
         ParticleType* type = particleTypeGetLive(runner, particle->typeId);
-        if (type == nullptr || 0 > type->sprite) continue;
+        if (type == nullptr) continue;
+        int32_t sprite = type->sprite >= 0 ? type->sprite : particleShapeSprite(runner, type->shape);
+        if (sprite < 0) continue;
 
         int32_t age = particle->lifeTotal - particle->life;
         GMLReal ageFraction = (GMLReal) age / (GMLReal) particle->lifeTotal;
@@ -20590,7 +20622,7 @@ void Particles_drawSystem(Runner* runner, int32_t systemId) {
         GMLReal angle = particle->angle + type->angWiggle * particleWiggleAngle(age, particle->seed);
         if (type->angRelative) angle += particle->direction;
 
-        Renderer_drawSpriteExt(renderer, type->sprite, subimg,
+        Renderer_drawSpriteExt(renderer, sprite, subimg,
                                (float) (system->originX + particle->x), (float) (system->originY + particle->y),
                                (float) (type->scaleX * size), (float) (type->scaleY * size),
                                (float) angle, colour, (float) alpha);
@@ -20623,6 +20655,13 @@ void Particles_freeAll(Runner* runner) {
     runner->particleSystemPool = nullptr;
     arrfree(runner->particleTypePool);
     runner->particleTypePool = nullptr;
+    for (int32_t shape = 0; shape < 14; shape++) {
+        if (runner->builtinParticleSprites[shape] && runner->renderer && runner->renderer->vtable->deleteSprite)
+            runner->renderer->vtable->deleteSprite(runner->renderer, runner->builtinParticleSprites[shape] - 1);
+    }
+    memset(runner->builtinParticleSprites, 0, sizeof(runner->builtinParticleSprites));
+    memset(runner->sparkleTypes, 0, sizeof(runner->sparkleTypes));
+    runner->sparkleSystem = 0;
 }
 
 // ===[ Systems ]===
@@ -20836,9 +20875,57 @@ static RValue builtin_part_type_sprite(VMContext* ctx, RValue* args, MAYBE_UNUSE
     ParticleType* type = particleTypeGet(ctx->runner, RValue_toInt32(args[0]));
     if (type == nullptr) return RValue_makeUndefined();
     type->sprite = RValue_toInt32(args[1]);
+    type->shape = -1;
     type->spriteAnimate = RValue_toBool(args[2]);
     type->spriteStretch = RValue_toBool(args[3]);
     type->spriteRandom = RValue_toBool(args[4]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_shape(VMContext* ctx, RValue* args, int32_t argCount) {
+    REQUIRE_ARGC_AT_LEAST("part_type_shape", 2, RValue_makeUndefined());
+    ParticleType* type = particleTypeGet(ctx->runner, RValue_toInt32(args[0]));
+    int32_t shape = RValue_toInt32(args[1]);
+    if (type && shape >= 0 && shape < 14) {
+        type->shape = shape;
+        type->sprite = -1;
+        type->spriteAnimate = type->spriteStretch = type->spriteRandom = false;
+    }
+    return RValue_makeUndefined();
+}
+
+// Forager uses effect kind 7 (sparkles). Match the standard three sizes and
+// lifetimes, sharing types and the system so repeated effects do not grow pools.
+static RValue builtin_effect_create_above(VMContext* ctx, RValue* args, int32_t argCount) {
+    REQUIRE_ARGC_AT_LEAST("effect_create_above", 5, RValue_makeUndefined());
+    if (RValue_toInt32(args[0]) != 7) {
+        logWarn("Particles: unsupported built-in effect kind %d\n", RValue_toInt32(args[0]));
+        return RValue_makeUndefined();
+    }
+    Runner* runner = ctx->runner;
+    int32_t size = RValue_toInt32(args[3]);
+    if (size != 0 && size != 2) size = 1;
+    if (!Particles_systemGet(runner, runner->sparkleSystem - 1)) {
+        RValue id = builtin_part_system_create(ctx, nullptr, 0);
+        runner->sparkleSystem = RValue_toInt32(id) + 1;
+        Particles_systemGet(runner, runner->sparkleSystem - 1)->depth = -15000;
+    }
+    if (!particleTypeGet(runner, runner->sparkleTypes[size] - 1)) {
+        RValue id = builtin_part_type_create(ctx, nullptr, 0);
+        runner->sparkleTypes[size] = RValue_toInt32(id) + 1;
+        ParticleType* type = particleTypeGet(runner, runner->sparkleTypes[size] - 1);
+        int32_t speed = Runner_getEffectiveGameSpeed(runner);
+        GMLReal factor = speed > 30 ? 30.0 / speed : 1.0;
+        const GMLReal sizes[] = {0.4, 0.75, 1.2};
+        const GMLReal shrink[] = {-0.02, -0.03, -0.04};
+        type->shape = 9;
+        type->sizeMin = type->sizeMax = sizes[size];
+        type->sizeIncr = shrink[size] * factor;
+        type->angMax = 360;
+        type->lifeMin = type->lifeMax = (int32_t) ((20 + size * 5) / factor + 0.5);
+    }
+    particleSpawnAt(runner, Particles_systemGet(runner, runner->sparkleSystem - 1),
+        runner->sparkleTypes[size] - 1, RValue_toReal(args[1]), RValue_toReal(args[2]), RValue_toColour(args[4]), true);
     return RValue_makeUndefined();
 }
 
@@ -24567,6 +24654,8 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "part_type_clear", builtin_part_type_clear);
     VM_registerBuiltin(ctx, "part_type_exists", builtin_part_type_exists);
     VM_registerBuiltin(ctx, "part_type_sprite", builtin_part_type_sprite);
+    VM_registerBuiltin(ctx, "part_type_shape", builtin_part_type_shape);
+    VM_registerBuiltin(ctx, "effect_create_above", builtin_effect_create_above);
     VM_registerBuiltin(ctx, "part_type_size", builtin_part_type_size);
     VM_registerBuiltin(ctx, "part_type_scale", builtin_part_type_scale);
     VM_registerBuiltin(ctx, "part_type_speed", builtin_part_type_speed);

@@ -1,0 +1,6 @@
+GameMaker particle textures
+Copyright 2021-2022 YoYo Games Ltd.
+Apache License 2.0
+Source: https://raw.githubusercontent.com/YoYoGames/GameMaker-HTML5/60e51be51ce7f3d52025ef18106cf172b8e22a00/scripts/particles/
+
+images.h embeds the original unmodified PNG files IDR_GIF2.png through IDR_GIF15.png.
