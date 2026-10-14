@@ -1,7 +1,7 @@
 {
-  "version": "4460a669e0f9402d08695b641a14e547d94ab242cf1047607b26e8c48a0b03db",
+  "version": "359f3a1760c6fbab1f8de4a03749e7578e17b141731b63f19ccae528a1ceb0fc",
   "bytes": {
-    "butterscotch.wasm": 1836326,
+    "butterscotch.wasm": 1900719,
     "assets/game.unx": 81444192,
     "assets/options.ini": 110,
     "assets/icon.png": 5183,

@@ -1,0 +1,244 @@
+diff --git a/src/backends/web.c b/src/backends/web.c
+index 781611c..2b3411a 100644
+--- a/src/backends/web.c
++++ b/src/backends/web.c
+@@ -12 +11,0 @@
+-#define MAX_KEY_QUEUE 64
+@@ -25,2 +24 @@ struct {
+-static InputEntry gInputQueue[MAX_KEY_QUEUE];
+-static int gInputCount;
++static InputEntry* gInputQueue = nullptr;
+@@ -165,7 +163 @@ void onKeyUp(int keyCode) {
+-    if (gInputCount == MAX_KEY_QUEUE)
+-        return;
+-
+-    int entryIndex = gInputCount++;
+-    gInputQueue[entryIndex].inputType = INPUTTYPE_KEY;
+-    gInputQueue[entryIndex].key = keyCode;
+-    gInputQueue[entryIndex].down = false;
++    arrput(gInputQueue, ((InputEntry) { INPUTTYPE_KEY, keyCode, false }));
+@@ -175,7 +167 @@ void onKeyDown(int keyCode) {
+-    if (gInputCount == MAX_KEY_QUEUE)
+-        return;
+-
+-    int entryIndex = gInputCount++;
+-    gInputQueue[entryIndex].inputType = INPUTTYPE_KEY;
+-    gInputQueue[entryIndex].key = keyCode;
+-    gInputQueue[entryIndex].down = true;
++    arrput(gInputQueue, ((InputEntry) { INPUTTYPE_KEY, keyCode, true }));
+@@ -185,7 +171 @@ void onMouseUp(int button) {
+-    if (gInputCount == MAX_KEY_QUEUE)
+-        return;
+-
+-    int entryIndex = gInputCount++;
+-    gInputQueue[entryIndex].inputType = INPUTTYPE_MOUSE_BUTTON;
+-    gInputQueue[entryIndex].key = button;
+-    gInputQueue[entryIndex].down = false;
++    arrput(gInputQueue, ((InputEntry) { INPUTTYPE_MOUSE_BUTTON, button, false }));
+@@ -195,7 +175 @@ void onMouseDown(int button) {
+-    if (gInputCount == MAX_KEY_QUEUE)
+-        return;
+-
+-    int entryIndex = gInputCount++;
+-    gInputQueue[entryIndex].inputType = INPUTTYPE_MOUSE_BUTTON;
+-    gInputQueue[entryIndex].key = button;
+-    gInputQueue[entryIndex].down = true;
++    arrput(gInputQueue, ((InputEntry) { INPUTTYPE_MOUSE_BUTTON, button, true }));
+@@ -209,0 +184,2 @@ void platformExit(void) {
++    arrfree(gInputQueue);
++    gInputQueue = nullptr;
+@@ -262 +238 @@ bool platformHandleEvents(void) {
+-    while (gInputCount != inputIndex) {
++    while (arrlen(gInputQueue) != inputIndex) {
+@@ -287 +263 @@ bool platformHandleEvents(void) {
+-    gInputCount = 0;
++    arrsetlen(gInputQueue, 0);
+diff --git a/src/runner.c b/src/runner.c
+index 3b8e264..203cdcd 100644
+--- a/src/runner.c
++++ b/src/runner.c
+@@ -1711,0 +1712,3 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
++            // The old room grid was freed; re-index restored instances in this grid.
++            arrsetlen(savedState->instances[i]->collisionCells, 0);
++            savedState->instances[i]->spatialGridDirty = false;
+diff --git a/src/runner.h b/src/runner.h
+index 1e49ec5..4fff696 100644
+--- a/src/runner.h
++++ b/src/runner.h
+@@ -433 +433,2 @@ typedef struct {
+-    int32_t sprite;       // sprite asset index, -1 when the type has no sprite (draws nothing)
++    int32_t sprite;       // sprite asset index, -1 when using a built-in shape
++    int32_t shape;        // built-in shape 0..13; -1 when using a sprite
+@@ -825,0 +827,3 @@ struct Runner {
++    int32_t builtinParticleSprites[14]; // cached sprite id + 1, zero until loaded
++    int32_t sparkleSystem; // system id + 1, zero until created
++    int32_t sparkleTypes[3]; // type id + 1 for each effect size
+diff --git a/src/spatial_grid.c b/src/spatial_grid.c
+index 67cac0b..8173d4c 100644
+--- a/src/spatial_grid.c
++++ b/src/spatial_grid.c
+@@ -37,4 +37,2 @@ void SpatialGrid_removeInstance(SpatialGrid* grid, Instance* instance) {
+-    int32_t totalCells = (int32_t)grid->gridWidth * (int32_t)grid->gridHeight;
+-    bool removedAny = false;
+-
+-    // First remove from any cells named in this instance's cached tracking data.
++    // syncGrid records every occupied cell. Room changes discard those records
++    // together with the old grid, so removal only visits this instance's cells.
+@@ -42,27 +40,6 @@ void SpatialGrid_removeInstance(SpatialGrid* grid, Instance* instance) {
+-        uint32_t gridCoordinates = instance->collisionCells[i];
+-        int32_t gridX = SpatialGrid_unpackGridX(gridCoordinates);
+-        int32_t gridY = SpatialGrid_unpackGridY(gridCoordinates);
+-        int32_t cellIndex = SpatialGrid_cellIndex(grid, gridX, gridY);
+-        if (cellIndex < 0 || cellIndex >= totalCells) continue;
+-
+-        Instance** cell = grid->grid[cellIndex];
+-        int32_t cellLen = (int32_t) arrlen(cell);
+-        for (int32_t j = 0; j < cellLen;) {
+-            if (cell[j] == instance) {
+-                if (j < cellLen - 1) memmove(&cell[j], &cell[j + 1], (size_t) (cellLen - 1 - j) * sizeof(Instance*));
+-                arrsetlen(cell, cellLen - 1);
+-                removedAny = true;
+-                cellLen--;
+-            } else {
+-                j++;
+-            }
+-        }
+-    }
+-
+-    // Some room transitions and destructions can leave stale grid entries even when
+-    // collisionCells was cleared or never populated for the current grid. Fall back to
+-    // a full-grid scan so the instance pointer is not left dangling in the spatial hash.
+-    repeat(totalCells, cellIndex) {
+-        Instance** cell = grid->grid[cellIndex];
+-        int32_t cellLen = (int32_t) arrlen(cell);
+-        for (int32_t j = 0; j < cellLen;) {
++        uint32_t coordinates = instance->collisionCells[i];
++        int32_t gx = SpatialGrid_unpackGridX(coordinates);
++        int32_t gy = SpatialGrid_unpackGridY(coordinates);
++        require(gx < grid->gridWidth && gy < grid->gridHeight);
++        Instance** cell = grid->grid[SpatialGrid_cellIndex(grid, gx, gy)];
++        for (int32_t j = 0; j < arrlen(cell);) {
+@@ -70,4 +47 @@ void SpatialGrid_removeInstance(SpatialGrid* grid, Instance* instance) {
+-                if (j < cellLen - 1) memmove(&cell[j], &cell[j + 1], (size_t) (cellLen - 1 - j) * sizeof(Instance*));
+-                arrsetlen(cell, cellLen - 1);
+-                removedAny = true;
+-                cellLen--;
++                arrdel(cell, j);
+@@ -79,5 +53,2 @@ void SpatialGrid_removeInstance(SpatialGrid* grid, Instance* instance) {
+-
+-    if (removedAny) {
+-        arrsetlen(instance->collisionCells, 0);
+-        instance->spatialGridDirty = false;
+-    }
++    arrsetlen(instance->collisionCells, 0);
++    instance->spatialGridDirty = false;
+@@ -137 +107,0 @@ void SpatialGrid_markInstanceAsDirty(SpatialGrid* grid, Instance* dirtyInstance)
+-        // Guard against stale entries left behind by room transitions or earlier clears of collisionCells.
+diff --git a/src/vm_builtins.c b/src/vm_builtins.c
+index 4fa76b9..e0a8480 100644
+--- a/src/vm_builtins.c
++++ b/src/vm_builtins.c
+@@ -42,0 +43 @@
++#include "../vendor/gamemaker-particles/images.h"
+@@ -5274 +5275 @@ static RValue builtin_ds_list_delete(VMContext* ctx, RValue* args, int32_t argCo
+-    if (list->items[pos].type == RVALUE_STRING) RValue_free(&list->items[pos]);
++    RValue_free(&list->items[pos]);
+@@ -20523,0 +20525,29 @@ static uint32_t particleColourAt(const ParticleType* type, GMLReal ageFraction)
++// Built-in shapes use GameMaker's original textures, uploaded once per runner.
++static int32_t particleShapeSprite(Runner* runner, int32_t shape) {
++    if (shape < 0 || shape >= 14) return -1;
++    if (runner->builtinParticleSprites[shape]) return runner->builtinParticleSprites[shape] - 1;
++#if defined(ENABLE_MODERN_GL) || defined(ENABLE_LEGACY_GL)
++    Renderer* renderer = runner->renderer;
++    if (!renderer || !renderer->vtable->surfaceSetPixels || !renderer->vtable->createSpriteFromSurface) return -1;
++    unsigned int begin = builtinParticlePngOffsets[shape];
++    int w, h;
++    uint8_t* rgba = ImageDecoder_decodeToRgba(builtinParticlePngs + begin,
++        builtinParticlePngOffsets[shape + 1] - begin, false, &w, &h);
++    if (!rgba) return -1;
++    int32_t surface = Renderer_createSurface(renderer, w, h);
++    int32_t sprite = -1;
++    if (surface >= 0) {
++        if (renderer->vtable->surfaceSetPixels(renderer, surface, rgba)) {
++            // The HTML5 runner's particle texture entry crops to 63x63, centered at 32.
++            sprite = renderer->vtable->createSpriteFromSurface(renderer, surface, 0, 0, 63, 63, false, false, 32, 32);
++        }
++        renderer->vtable->surfaceFree(renderer, surface);
++    }
++    free(rgba);
++    if (sprite >= 0) runner->builtinParticleSprites[shape] = sprite + 1;
++    return sprite;
++#else
++    return -1;
++#endif
++}
++
+@@ -20547 +20577,3 @@ void Particles_drawSystem(Runner* runner, int32_t systemId) {
+-        if (type == nullptr || 0 > type->sprite) continue;
++        if (type == nullptr) continue;
++        int32_t sprite = type->sprite >= 0 ? type->sprite : particleShapeSprite(runner, type->shape);
++        if (sprite < 0) continue;
+@@ -20593 +20625 @@ void Particles_drawSystem(Runner* runner, int32_t systemId) {
+-        Renderer_drawSpriteExt(renderer, type->sprite, subimg,
++        Renderer_drawSpriteExt(renderer, sprite, subimg,
+@@ -20625,0 +20658,7 @@ void Particles_freeAll(Runner* runner) {
++    for (int32_t shape = 0; shape < 14; shape++) {
++        if (runner->builtinParticleSprites[shape] && runner->renderer && runner->renderer->vtable->deleteSprite)
++            runner->renderer->vtable->deleteSprite(runner->renderer, runner->builtinParticleSprites[shape] - 1);
++    }
++    memset(runner->builtinParticleSprites, 0, sizeof(runner->builtinParticleSprites));
++    memset(runner->sparkleTypes, 0, sizeof(runner->sparkleTypes));
++    runner->sparkleSystem = 0;
+@@ -20838,0 +20878 @@ static RValue builtin_part_type_sprite(VMContext* ctx, RValue* args, MAYBE_UNUSE
++    type->shape = -1;
+@@ -20844,0 +20885,47 @@ static RValue builtin_part_type_sprite(VMContext* ctx, RValue* args, MAYBE_UNUSE
++static RValue builtin_part_type_shape(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("part_type_shape", 2, RValue_makeUndefined());
++    ParticleType* type = particleTypeGet(ctx->runner, RValue_toInt32(args[0]));
++    int32_t shape = RValue_toInt32(args[1]);
++    if (type && shape >= 0 && shape < 14) {
++        type->shape = shape;
++        type->sprite = -1;
++        type->spriteAnimate = type->spriteStretch = type->spriteRandom = false;
++    }
++    return RValue_makeUndefined();
++}
++
++// Forager uses effect kind 7 (sparkles). Match the standard three sizes and
++// lifetimes, sharing types and the system so repeated effects do not grow pools.
++static RValue builtin_effect_create_above(VMContext* ctx, RValue* args, int32_t argCount) {
++    REQUIRE_ARGC_AT_LEAST("effect_create_above", 5, RValue_makeUndefined());
++    if (RValue_toInt32(args[0]) != 7) {
++        logWarn("Particles: unsupported built-in effect kind %d\n", RValue_toInt32(args[0]));
++        return RValue_makeUndefined();
++    }
++    Runner* runner = ctx->runner;
++    int32_t size = RValue_toInt32(args[3]);
++    if (size != 0 && size != 2) size = 1;
++    if (!Particles_systemGet(runner, runner->sparkleSystem - 1)) {
++        RValue id = builtin_part_system_create(ctx, nullptr, 0);
++        runner->sparkleSystem = RValue_toInt32(id) + 1;
++        Particles_systemGet(runner, runner->sparkleSystem - 1)->depth = -15000;
++    }
++    if (!particleTypeGet(runner, runner->sparkleTypes[size] - 1)) {
++        RValue id = builtin_part_type_create(ctx, nullptr, 0);
++        runner->sparkleTypes[size] = RValue_toInt32(id) + 1;
++        ParticleType* type = particleTypeGet(runner, runner->sparkleTypes[size] - 1);
++        int32_t speed = Runner_getEffectiveGameSpeed(runner);
++        GMLReal factor = speed > 30 ? 30.0 / speed : 1.0;
++        const GMLReal sizes[] = {0.4, 0.75, 1.2};
++        const GMLReal shrink[] = {-0.02, -0.03, -0.04};
++        type->shape = 9;
++        type->sizeMin = type->sizeMax = sizes[size];
++        type->sizeIncr = shrink[size] * factor;
++        type->angMax = 360;
++        type->lifeMin = type->lifeMax = (int32_t) ((20 + size * 5) / factor + 0.5);
++    }
++    particleSpawnAt(runner, Particles_systemGet(runner, runner->sparkleSystem - 1),
++        runner->sparkleTypes[size] - 1, RValue_toReal(args[1]), RValue_toReal(args[2]), RValue_toColour(args[4]), true);
++    return RValue_makeUndefined();
++}
++
+@@ -24569,0 +24657,2 @@ void VMBuiltins_registerAll(VMContext* ctx) {
++    VM_registerBuiltin(ctx, "part_type_shape", builtin_part_type_shape);
++    VM_registerBuiltin(ctx, "effect_create_above", builtin_effect_create_above);
