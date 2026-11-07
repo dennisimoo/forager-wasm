@@ -2398,7 +2398,10 @@ static void flattenCollisionEvents(Runner* runner) {
     }
 }
 
-// Populates objectsWithAnyEventOfType[eventType] from the resolved event table: for each event type, the deduplicated list of concrete object indices that respond to ANY subtype of that event. Walks the inverted bySlot index per slot and dedups via a scratch byte set.
+// Populates objectsWithAnyEventOfType[eventType] from the resolved event table.
+// Collect responders by object index, not by the first collision target they handle:
+// a projectile must not jump ahead of a lower-index target and destroy itself
+// before that target receives its collision event.
 // Used by collision dispatch to skip non-collision objects in the outer loop, mirroring how the native obj_has_event table partitions instance iteration by event class.
 static void populateObjectsWithAnyEventOfType(Runner* runner) {
     int32_t objectCount = (int32_t) runner->dataWin->objt.count;
@@ -2421,10 +2424,11 @@ static void populateObjectsWithAnyEventOfType(Runner* runner) {
             repeat(entryCount, i) {
                 int32_t obj = entries[i].concreteObjectId;
                 if (obj < 0 || obj >= objectCount) continue;
-                if (seen[obj]) continue;
                 seen[obj] = 1;
-                arrput(runner->objectsWithAnyEventOfType[t], obj);
             }
+        }
+        repeat(objectCount, obj) {
+            if (seen[obj]) arrput(runner->objectsWithAnyEventOfType[t], obj);
         }
     }
 

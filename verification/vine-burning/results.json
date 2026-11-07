@@ -1,0 +1,29 @@
+{
+  "baseCommit": "3730d4ff51e4e395b831a901d1f77f1f3bed4a8c",
+  "emscripten": "6.0.12",
+  "wasmSha256": "8d59fe09558cbbfa6150f1dd7a7c9d9e0c8d86153c3ca588a08b15529cf86cc2",
+  "native": {
+    "before": [
+      "Game: VINES ignition FAIL",
+      "Game: VINES countdown FAIL destroyed=0"
+    ],
+    "after": ["Game: VINES ignition PASS", "Game: VINES countdown PASS"]
+  },
+  "chromium": {
+    "before": {
+      "mode": "before",
+      "lines": [
+        "Game: VINES ignition FAIL",
+        "Game: VINES countdown FAIL destroyed=0"
+      ],
+      "errors": []
+    },
+    "after": {
+      "mode": "after",
+      "lines": ["Game: VINES ignition PASS", "Game: VINES countdown PASS"],
+      "errors": []
+    }
+  },
+  "existingNativeRegression": "PASS",
+  "formatCheck": "PASS"
+}
