@@ -6,3 +6,11 @@ build/
 .dev.vars
 *.log
 .DS_Store
+
+# Forager game files are never committed or hosted
+public/assets/
+*.unx
+*.win
+*.ios
+*.droid
+audiogroup*.dat

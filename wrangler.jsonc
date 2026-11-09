@@ -8,10 +8,4 @@
     "binding": "ASSETS",
     "run_worker_first": true,
   },
-  "r2_buckets": [
-    {
-      "binding": "GAME_ASSETS",
-      "bucket_name": "forager-wasm-assets",
-    },
-  ],
 }

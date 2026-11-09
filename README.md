@@ -1,16 +1,22 @@
 # Forager WASM
 
-<p align="center"><img src="public/ui/logo.png" alt="Forager" width="380"></p>
+**[Open the runner](https://forager-wasm.4dennisk.workers.dev)**
 
-**[Play Forager](https://forager-wasm.4dennisk.workers.dev)**
+An unofficial runner that plays **Forager 2.0** in a browser, using a modified [Butterscotch](https://github.com/ButterscotchRunner/Butterscotch) WebAssembly runtime.
 
-Run **Forager 2.0.0** in a browser using a modified [Butterscotch](https://github.com/ButterscotchRunner/Butterscotch) WebAssembly runner.
+**No game files are included or hosted.** You need your own copy of Forager. When the page opens, pick your Forager install folder (Steam: right-click Forager → Manage → Browse local files) or drag it onto the page. The runner needs:
 
-The game starts automatically behind a blue loading screen with the original logo, a progress bar, and download percentage. No game installation is needed on the player's computer.
+- `game.unx` (Linux), `data.win` (Windows) or `game.ios` (macOS, inside `Forager.app/Contents/Resources`)
+- `audiogroup1.dat`
+- optionally `options.ini` and the `local/` translation files
+
+The files are copied into the browser's private storage (OPFS) on your computer and loaded from there on later visits. They are never uploaded. "Remove saved files" deletes them.
+
+Forager is owned by HopFrog. This project is not affiliated with or endorsed by HopFrog.
 
 ## Run locally
 
-Requires Node.js 22 or newer. The game data and compiled WASM runner are included.
+Requires Node.js 22 or newer.
 
 ```sh
 git clone https://github.com/dennisimoo/forager-wasm.git
@@ -19,7 +25,7 @@ npm ci
 npm run dev
 ```
 
-Open **http://localhost:8767** in current Chrome or Firefox. The server supplies the isolation headers required by the runner; opening the HTML file directly will not work.
+Open **http://localhost:8767** in current Chrome or Firefox, then choose your Forager folder. The server supplies the isolation headers the runner needs; opening the HTML file directly will not work.
 
 | Action               | Control           |
 | -------------------- | ----------------- |
@@ -28,38 +34,26 @@ Open **http://localhost:8767** in current Chrome or Firefox. The server supplies
 | Inventory and menu   | Esc               |
 | Zoom / scroll menus  | Mouse wheel       |
 
-Downloaded game files are cached in the browser and reused on reload. Rebuilding the runner refreshes the cache version automatically.
-
 Saves stay in the browser's storage for that site. Changing domains, clearing site data, or using a different browser gives you separate saves.
 
 ## Deploy to Cloudflare
 
-The Worker serves the launcher and WASM runner. R2 stores `assets/game.unx`, which exceeds Cloudflare's 25 MiB static-file limit. The complete file is also included in this GitHub repository.
-
-Sign into a Cloudflare account with R2 enabled, then run:
+The Worker serves only the launcher and the WASM runner.
 
 ```sh
 npx wrangler login
-npx wrangler r2 bucket create forager-wasm-assets
-npm run upload:game
 npm run deploy
 ```
-
-Wrangler prints the permanent `workers.dev` URL. Share that URL; the local server and temporary tunnel are no longer needed. You can attach a custom domain in Cloudflare afterward.
-
-For later updates, run `npm run deploy`. Run `npm run upload:game` again only when the game data changes. Keep the same hostname to preserve players' browser saves.
 
 ## What is included
 
 ```text
-public/       Launcher, compiled WASM, original game assets
+public/       Launcher and compiled WASM runner (no game files)
 src/          Cloudflare Worker
 scripts/      Local server and WASM build script
 runtime/      Complete modified Butterscotch source
 patches/      Runtime changes against the upstream base commit
 ```
-
-The Worker streams the large game file from R2 and serves all files through the same origin with `COOP`, `COEP`, and `CORP` headers.
 
 ## Rebuild the runner
 
@@ -78,6 +72,6 @@ This is a community test build. Browser checks confirmed fresh Classic-game star
 
 ## Credits
 
-Forager belongs to its original creators. Game assets retain their original rights.
+Forager belongs to HopFrog. This repository contains no Forager game files.
 
 The modified Butterscotch runner and launcher/hosting code use **GNU AGPL v3**. See [LICENSE](LICENSE) and [third-party notices](THIRD_PARTY_NOTICES.md). Complete runner source is included in `runtime/`.
